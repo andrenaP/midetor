@@ -1,0 +1,418 @@
+use crossterm::{
+    cursor::Show,
+    event::{self, Event},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout},
+    style::{Color, Style},
+    widgets::{Block, Borders, Paragraph},
+    Terminal,
+};
+use rusqlite::Connection;
+use std::fs;
+use std::io::{self, stdout, Write};
+use std::path::Path;
+use std::process::Command;
+use thiserror::Error;
+use tui_textarea::{Input, Key, TextArea};
+
+#[derive(Error, Debug)]
+pub enum EditorError {
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("Database error: {0}")]
+    Database(#[from] rusqlite::Error),
+    #[error("File not found in database: {0}")]
+    FileNotFound(String),
+    #[error("Markdown scanner error: {0}")]
+    Scanner(String),
+}
+
+struct App {
+    db: Connection,
+    file_path: String,
+    base_dir: String,
+    textarea: TextArea<'static>,
+    mode: Mode,
+    tags: Vec<String>,
+    backlinks: Vec<(String, i64)>,
+    view: View,
+    command: String,
+    status: String,
+    file_id: i64,
+    should_quit: bool,
+}
+
+#[derive(PartialEq)]
+enum Mode {
+    Normal,
+    Insert,
+    Command,
+}
+
+#[derive(PartialEq)]
+enum View {
+    Editor,
+    Info,
+}
+
+impl App {
+    fn new(file_path: &str, base_dir: &str) -> Result<Self, EditorError> {
+        let db = Connection::open("markdown_data.db")?;
+        db.execute("PRAGMA foreign_keys = ON;", [])?;
+
+        let content = fs::read_to_string(file_path).unwrap_or_default();
+        let mut textarea = TextArea::new(content.lines().map(|s| s.to_string()).collect());
+        textarea.set_block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Markdown Editor")
+                .style(Style::default().fg(Color::White)),
+        );
+        textarea.set_cursor_line_style(Style::default());
+        textarea.set_cursor_style(Style::default().bg(Color::White).fg(Color::Black));
+
+        let file_id = App::get_file_id(&db, file_path)?;
+        let tags = App::load_tags(&db, file_id)?;
+        let backlinks = App::load_backlinks(&db, file_id)?;
+
+        Ok(App {
+            db,
+            file_path: file_path.to_string(),
+            base_dir: base_dir.to_string(),
+            textarea,
+            mode: Mode::Normal,
+            tags,
+            backlinks,
+            view: View::Editor,
+            command: String::new(),
+            status: "Normal".to_string(),
+            file_id,
+            should_quit: false,
+        })
+    }
+
+    fn get_file_id(db: &Connection, path: &str) -> Result<i64, EditorError> {
+        let mut stmt = db.prepare("SELECT id FROM files WHERE path = ?")?;
+        stmt.query_row([path], |row| row.get(0))
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => EditorError::FileNotFound(path.to_string()),
+                e => EditorError::Database(e),
+            })
+    }
+
+    fn load_tags(db: &Connection, file_id: i64) -> Result<Vec<String>, EditorError> {
+        let mut stmt = db.prepare(
+            "SELECT t.tag FROM tags t
+             JOIN file_tags ft ON t.id = ft.tag_id
+             WHERE ft.file_id = ?",
+        )?;
+        let tags = stmt
+            .query_map([file_id], |row| row.get(0))?
+            .collect::<Result<Vec<String>, _>>()?;
+        Ok(tags)
+    }
+
+    fn load_backlinks(db: &Connection, file_id: i64) -> Result<Vec<(String, i64)>, EditorError> {
+        let mut stmt = db.prepare(
+            "SELECT backlink, backlink_id FROM backlinks
+             WHERE file_id = ?",
+        )?;
+        let backlinks = stmt
+            .query_map([file_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(backlinks)
+    }
+
+    fn save_file(&mut self) -> Result<(), EditorError> {
+        fs::write(&self.file_path, self.textarea.lines().join("\n"))?;
+
+        // Convert file_path and base_dir to absolute paths
+        let abs_file_path = fs::canonicalize(&self.file_path)?;
+        let abs_base_dir = fs::canonicalize(&self.base_dir)?;
+
+        let output = Command::new("markdown-scanner")
+            .arg(&abs_file_path)
+            .arg(&abs_base_dir)
+            .output()?;
+
+        if !output.status.success() {
+            let error_msg = String::from_utf8_lossy(&output.stderr).into_owned();
+            return Err(EditorError::Scanner(error_msg));
+        }
+
+        self.status = "Saved".to_string();
+        Ok(())
+    }
+
+    fn follow_backlink(&mut self, index: usize) -> Result<(), EditorError> {
+        if index < self.backlinks.len() {
+            let backlink_id = self.backlinks[index].1;
+            let mut stmt = self.db.prepare("SELECT path FROM files WHERE id = ?")?;
+            let path: String = stmt.query_row([backlink_id], |row| row.get(0))?;
+            self.file_path = path;
+            self.file_id = backlink_id;
+            let content = fs::read_to_string(&self.file_path).unwrap_or_default();
+            self.textarea = TextArea::new(content.lines().map(|s| s.to_string()).collect());
+            self.textarea.set_block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Markdown Editor")
+                    .style(Style::default().fg(Color::White)),
+            );
+            self.textarea.set_cursor_line_style(Style::default());
+            self.textarea
+                .set_cursor_style(Style::default().bg(Color::White).fg(Color::Black));
+            self.tags = App::load_tags(&self.db, self.file_id)?;
+            self.backlinks = App::load_backlinks(&self.db, self.file_id)?;
+            self.view = View::Editor;
+            self.status = format!("Opened {}", self.file_path);
+        }
+        Ok(())
+    }
+
+    fn show_tag_files(&mut self, tag: &str) -> Result<(), EditorError> {
+        let mut stmt = self.db.prepare(
+            "SELECT f.path FROM files f
+             JOIN file_tags ft ON f.id = ft.file_id
+             JOIN tags t ON ft.tag_id = t.id
+             WHERE t.tag = ?",
+        )?;
+        let paths = stmt
+            .query_map([tag], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        self.status = format!("Files with tag '{}': {}", tag, paths.join(", "));
+        self.view = View::Info;
+        Ok(())
+    }
+
+    fn handle_input(
+        &mut self,
+        event: ratatui::crossterm::event::KeyEvent,
+    ) -> Result<(), EditorError> {
+        match self.mode {
+            Mode::Normal => {
+                let input = Input::from(event);
+                match input {
+                    Input {
+                        key: Key::Char('i'),
+                        ..
+                    } => {
+                        self.mode = Mode::Insert;
+                        self.status = "Insert".to_string();
+                    }
+                    Input {
+                        key: Key::Char(':'),
+                        ..
+                    } => {
+                        self.mode = Mode::Command;
+                        self.command.clear();
+                        self.status = "Command".to_string();
+                    }
+                    Input {
+                        key: Key::Char('j'),
+                        ..
+                    } => {
+                        self.textarea.input(input);
+                    }
+                    Input {
+                        key: Key::Char('k'),
+                        ..
+                    } => {
+                        self.textarea.input(input);
+                    }
+                    Input {
+                        key: Key::Char('h'),
+                        ..
+                    } => {
+                        self.textarea.input(input);
+                    }
+                    Input {
+                        key: Key::Char('l'),
+                        ..
+                    } => {
+                        self.textarea.input(input);
+                    }
+                    Input {
+                        key: Key::Enter, ..
+                    } => {
+                        if self.view == View::Editor {
+                            let line = self.textarea.lines()[self.textarea.cursor().0].clone();
+                            if let Some(index) = self
+                                .backlinks
+                                .iter()
+                                .position(|(text, _)| line.contains(text))
+                            {
+                                self.follow_backlink(index)?;
+                            } else if let Some(tag) =
+                                self.tags.iter().find(|tag| line.contains(&**tag)).cloned()
+                            {
+                                self.show_tag_files(&tag)?;
+                            }
+                        } else {
+                            self.view = View::Editor;
+                            self.status = "Normal".to_string();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Mode::Insert => match event.code {
+                ratatui::crossterm::event::KeyCode::Esc => {
+                    self.mode = Mode::Normal;
+                    self.status = "Normal".to_string();
+                }
+                _ => {
+                    let input = Input::from(event);
+                    self.textarea.input(input);
+                }
+            },
+            Mode::Command => match event.code {
+                ratatui::crossterm::event::KeyCode::Esc => {
+                    self.mode = Mode::Normal;
+                    self.status = "Normal".to_string();
+                    self.command.clear();
+                }
+                ratatui::crossterm::event::KeyCode::Enter => {
+                    match self.command.as_str() {
+                        "w" => self.save_file()?,
+                        "q" => self.should_quit = true,
+                        "wq" => {
+                            self.save_file()?;
+                            self.should_quit = true;
+                        }
+                        _ => self.status = format!("Unknown command: {}", self.command),
+                    }
+                    self.mode = Mode::Normal;
+                    self.command.clear();
+                }
+                ratatui::crossterm::event::KeyCode::Char(c) => {
+                    self.command.push(c);
+                }
+                ratatui::crossterm::event::KeyCode::Backspace => {
+                    self.command.pop();
+                }
+                _ => {}
+            },
+        }
+        Ok(())
+    }
+
+    fn render(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    ) -> Result<(), EditorError> {
+        terminal.draw(|f| {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Min(1),    // Editor or info area
+                    Constraint::Length(1), // Status line
+                    Constraint::Length(1), // Command line
+                ])
+                .split(f.area());
+
+            match self.view {
+                View::Editor => {
+                    f.render_widget(&self.textarea, chunks[0]);
+                }
+                View::Info => {
+                    let info = Paragraph::new(self.status.clone())
+                        .block(Block::default().borders(Borders::ALL).title("Info"))
+                        .style(Style::default().fg(Color::White));
+                    f.render_widget(info, chunks[0]);
+                }
+            }
+
+            let status = Paragraph::new(format!("-- {} --", self.status))
+                .style(Style::default().fg(Color::Yellow));
+            f.render_widget(status, chunks[1]);
+
+            let command = Paragraph::new(if self.mode == Mode::Command {
+                format!(":{}", self.command)
+            } else {
+                String::new()
+            })
+            .style(Style::default().fg(Color::White));
+            f.render_widget(command, chunks[2]);
+        })?;
+        Ok(())
+    }
+}
+
+fn main() -> Result<(), EditorError> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() != 3 {
+        eprintln!("Usage: {} <file_path> <base_dir>", args[0]);
+        return Ok(());
+    }
+
+    // Ensure terminal cleanup on exit
+    struct TerminalGuard;
+    impl Drop for TerminalGuard {
+        fn drop(&mut self) {
+            let _ = disable_raw_mode();
+            let _ = execute!(stdout(), LeaveAlternateScreen, Show);
+            // Run stty echo to ensure terminal echo is restored
+            let _ = Command::new("stty").arg("echo").status();
+        }
+    }
+    let _guard = TerminalGuard;
+
+    enable_raw_mode()?;
+    let mut stdout = stdout();
+    execute!(stdout, EnterAlternateScreen, Show)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let mut app = App::new(&args[1], &args[2])?;
+
+    while !app.should_quit {
+        app.render(&mut terminal)?;
+        if let Event::Key(event) = event::read()? {
+            let mut modifiers = ratatui::crossterm::event::KeyModifiers::NONE;
+            if event
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL)
+            {
+                modifiers |= ratatui::crossterm::event::KeyModifiers::CONTROL;
+            }
+            if event
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::SHIFT)
+            {
+                modifiers |= ratatui::crossterm::event::KeyModifiers::SHIFT;
+            }
+            if event
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::ALT)
+            {
+                modifiers |= ratatui::crossterm::event::KeyModifiers::ALT;
+            }
+            let ratatui_event = ratatui::crossterm::event::KeyEvent::new(
+                match event.code {
+                    crossterm::event::KeyCode::Char(c) => {
+                        ratatui::crossterm::event::KeyCode::Char(c)
+                    }
+                    crossterm::event::KeyCode::Enter => ratatui::crossterm::event::KeyCode::Enter,
+                    crossterm::event::KeyCode::Backspace => {
+                        ratatui::crossterm::event::KeyCode::Backspace
+                    }
+                    crossterm::event::KeyCode::Esc => ratatui::crossterm::event::KeyCode::Esc,
+                    crossterm::event::KeyCode::Left => ratatui::crossterm::event::KeyCode::Left,
+                    crossterm::event::KeyCode::Right => ratatui::crossterm::event::KeyCode::Right,
+                    crossterm::event::KeyCode::Up => ratatui::crossterm::event::KeyCode::Up,
+                    crossterm::event::KeyCode::Down => ratatui::crossterm::event::KeyCode::Down,
+                    _ => continue, // Ignore unsupported keys
+                },
+                modifiers,
+            );
+            app.handle_input(ratatui_event)?;
+        }
+    }
+
+    Ok(())
+}
