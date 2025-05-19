@@ -13,8 +13,7 @@ use ratatui::{
 };
 use rusqlite::Connection;
 use std::fs;
-use std::io::{self, stdout, Write};
-use std::path::Path;
+use std::io::{self, stdout};
 use std::process::Command;
 use thiserror::Error;
 use tui_textarea::{Input, Key, TextArea};
@@ -130,13 +129,9 @@ impl App {
     fn save_file(&mut self) -> Result<(), EditorError> {
         fs::write(&self.file_path, self.textarea.lines().join("\n"))?;
 
-        // Convert file_path and base_dir to absolute paths
-        let abs_file_path = fs::canonicalize(&self.file_path)?;
-        let abs_base_dir = fs::canonicalize(&self.base_dir)?;
-
         let output = Command::new("markdown-scanner")
-            .arg(&abs_file_path)
-            .arg(&abs_base_dir)
+            .arg(&self.file_path)
+            .arg(&self.base_dir)
             .output()?;
 
         if !output.status.success() {
@@ -216,25 +211,25 @@ impl App {
                         key: Key::Char('j'),
                         ..
                     } => {
-                        self.textarea.input(input);
+                        self.textarea.move_cursor(tui_textarea::CursorMove::Down);
                     }
                     Input {
                         key: Key::Char('k'),
                         ..
                     } => {
-                        self.textarea.input(input);
+                        self.textarea.move_cursor(tui_textarea::CursorMove::Up);
                     }
                     Input {
                         key: Key::Char('h'),
                         ..
                     } => {
-                        self.textarea.input(input);
+                        self.textarea.move_cursor(tui_textarea::CursorMove::Back);
                     }
                     Input {
                         key: Key::Char('l'),
                         ..
                     } => {
-                        self.textarea.input(input);
+                        self.textarea.move_cursor(tui_textarea::CursorMove::Forward);
                     }
                     Input {
                         key: Key::Enter, ..
