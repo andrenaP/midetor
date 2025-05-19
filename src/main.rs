@@ -9,7 +9,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Style},
     widgets::{Block, Borders, Paragraph},
-    Terminal,
+    Frame, Terminal,
 };
 use rusqlite::Connection;
 use std::fs;
@@ -76,7 +76,6 @@ impl App {
         );
         textarea.set_cursor_line_style(Style::default());
         textarea.set_cursor_style(Style::default().bg(Color::White).fg(Color::Black));
-        textarea.set_undo_limit(100); // Enable undo with a limit of 100 changes
 
         let file_id = App::get_file_id(&db, file_path)?;
         let tags = App::load_tags(&db, file_id)?;
@@ -219,7 +218,6 @@ impl App {
         self.textarea.set_cursor_line_style(Style::default());
         self.textarea
             .set_cursor_style(Style::default().bg(Color::White).fg(Color::Black));
-        self.textarea.set_undo_limit(100); // Enable undo with a limit of 100 changes
         self.tags = App::load_tags(&self.db, self.file_id)?;
         self.backlinks = App::load_backlinks(&self.db, self.file_id)?;
         self.view = View::Editor;
@@ -446,41 +444,43 @@ impl App {
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     ) -> Result<(), EditorError> {
-        terminal.draw(|f| {
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Min(1),    // Editor or info area
-                    Constraint::Length(1), // Status line
-                    Constraint::Length(1), // Command line
-                ])
-                .split(f.area());
-
-            match self.view {
-                View::Editor => {
-                    f.render_widget(&self.textarea, chunks[0]);
-                }
-                View::Info => {
-                    let info = Paragraph::new(self.status.clone())
-                        .block(Block::default().borders(Borders::ALL).title("Info"))
-                        .style(Style::default().fg(Color::White));
-                    f.render_widget(info, chunks[0]);
-                }
-            }
-
-            let status = Paragraph::new(format!("-- {} --", self.status))
-                .style(Style::default().fg(Color::Yellow));
-            f.render_widget(status, chunks[1]);
-
-            let command = Paragraph::new(if self.mode == Mode::Command {
-                format!(":{}", self.command)
-            } else {
-                String::new()
-            })
-            .style(Style::default().fg(Color::White));
-            f.render_widget(command, chunks[2]);
-        })?;
+        terminal.draw(|f| self.draw(f))?;
         Ok(())
+    }
+
+    fn draw(&mut self, f: &mut Frame) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(1),    // Editor or info area
+                Constraint::Length(1), // Status line
+                Constraint::Length(1), // Command line
+            ])
+            .split(f.area());
+
+        match self.view {
+            View::Editor => {
+                f.render_widget(&self.textarea, chunks[0]);
+            }
+            View::Info => {
+                let info = Paragraph::new(self.status.clone())
+                    .block(Block::default().borders(Borders::ALL).title("Info"))
+                    .style(Style::default().fg(Color::White));
+                f.render_widget(info, chunks[0]);
+            }
+        }
+
+        let status = Paragraph::new(format!("-- {} --", self.status))
+            .style(Style::default().fg(Color::Yellow));
+        f.render_widget(status, chunks[1]);
+
+        let command = Paragraph::new(if self.mode == Mode::Command {
+            format!(":{}", self.command)
+        } else {
+            String::new()
+        })
+        .style(Style::default().fg(Color::White));
+        f.render_widget(command, chunks[2]);
     }
 }
 
@@ -514,27 +514,9 @@ fn main() -> Result<(), EditorError> {
     while !app.should_quit {
         app.render(&mut terminal)?;
         if let Event::Key(event) = event::read()? {
-            let mut modifiers = ratatui::crossterm::event::KeyModifiers::NONE;
-            if event
-                .modifiers
-                .contains(crossterm::event::KeyModifiers::CONTROL)
-            {
-                modifiers |= ratatui::crossterm::event::KeyModifiers::CONTROL;
-            }
-            if event
-                .modifiers
-                .contains(crossterm::event::KeyModifiers::SHIFT)
-            {
-                modifiers |= ratatui::crossterm::event::KeyModifiers::SHIFT;
-            }
-            if event
-                .modifiers
-                .contains(crossterm::event::KeyModifiers::ALT)
-            {
-                modifiers |= ratatui::crossterm::event::KeyModifiers::ALT;
-            }
-            let ratatui_event = ratatui::crossterm::event::KeyEvent::new(
-                match event.code {
+            // Convert crossterm::event::KeyEvent to ratatui::crossterm::event::KeyEvent
+            let ratatui_event = ratatui::crossterm::event::KeyEvent {
+                code: match event.code {
                     crossterm::event::KeyCode::Char(c) => {
                         ratatui::crossterm::event::KeyCode::Char(c)
                     }
@@ -547,10 +529,29 @@ fn main() -> Result<(), EditorError> {
                     crossterm::event::KeyCode::Right => ratatui::crossterm::event::KeyCode::Right,
                     crossterm::event::KeyCode::Up => ratatui::crossterm::event::KeyCode::Up,
                     crossterm::event::KeyCode::Down => ratatui::crossterm::event::KeyCode::Down,
-                    _ => continue, // Ignore unsupported keys
+                    other => {
+                        eprintln!("Unsupported key: {:?}", other);
+                        continue;
+                    }
                 },
-                modifiers,
-            );
+                modifiers: ratatui::crossterm::event::KeyModifiers::from_bits(
+                    event.modifiers.bits(),
+                )
+                .unwrap_or(ratatui::crossterm::event::KeyModifiers::NONE),
+                kind: match event.kind {
+                    crossterm::event::KeyEventKind::Press => {
+                        ratatui::crossterm::event::KeyEventKind::Press
+                    }
+                    crossterm::event::KeyEventKind::Release => {
+                        ratatui::crossterm::event::KeyEventKind::Release
+                    }
+                    crossterm::event::KeyEventKind::Repeat => {
+                        ratatui::crossterm::event::KeyEventKind::Repeat
+                    }
+                },
+                state: ratatui::crossterm::event::KeyEventState::from_bits(event.state.bits())
+                    .unwrap_or(ratatui::crossterm::event::KeyEventState::empty()),
+            };
             app.handle_input(ratatui_event)?;
         }
     }
