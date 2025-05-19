@@ -14,6 +14,7 @@ use ratatui::{
 use rusqlite::Connection;
 use std::fs;
 use std::io::{self, stdout};
+use std::path::Path;
 use std::process::Command;
 use thiserror::Error;
 use tui_textarea::{Input, Key, TextArea};
@@ -43,6 +44,8 @@ struct App {
     status: String,
     file_id: i64,
     should_quit: bool,
+    history: Vec<(String, i64)>, // (file_path, file_id)
+    history_index: usize,        // Current position in history
 }
 
 #[derive(PartialEq)]
@@ -73,6 +76,7 @@ impl App {
         );
         textarea.set_cursor_line_style(Style::default());
         textarea.set_cursor_style(Style::default().bg(Color::White).fg(Color::Black));
+        textarea.set_undo_limit(100); // Enable undo with a limit of 100 changes
 
         let file_id = App::get_file_id(&db, file_path)?;
         let tags = App::load_tags(&db, file_id)?;
@@ -91,6 +95,8 @@ impl App {
             status: "Normal".to_string(),
             file_id,
             should_quit: false,
+            history: vec![(file_path.to_string(), file_id)],
+            history_index: 0,
         })
     }
 
@@ -117,13 +123,69 @@ impl App {
 
     fn load_backlinks(db: &Connection, file_id: i64) -> Result<Vec<(String, i64)>, EditorError> {
         let mut stmt = db.prepare(
-            "SELECT backlink, backlink_id FROM backlinks
-             WHERE file_id = ?",
+            "SELECT DISTINCT b.backlink, f.id
+             FROM backlinks b
+             JOIN files f ON b.backlink_id = f.id
+             WHERE b.file_id = ?",
         )?;
-        let backlinks = stmt
-            .query_map([file_id], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(backlinks)
+        let mut backlinks = Vec::new();
+        let rows = stmt.query_map([file_id], |row| {
+            let backlink: String = row.get(0)?;
+            let backlink_id: i64 = row.get(1)?;
+            Ok((backlink, backlink_id))
+        })?;
+
+        for row in rows {
+            match row {
+                Ok((backlink, backlink_id)) => {
+                    backlinks.push((backlink, backlink_id));
+                }
+                Err(e) => {
+                    eprintln!("Error loading backlink: {}", e);
+                }
+            }
+        }
+
+        // Handle ambiguous backlinks by selecting the file with the shortest basename
+        let mut unique_backlinks = Vec::new();
+        let mut seen_backlinks = std::collections::HashSet::new();
+        for (backlink, backlink_id) in backlinks {
+            if seen_backlinks.insert(backlink.clone()) {
+                unique_backlinks.push((backlink, backlink_id));
+            } else {
+                let existing = unique_backlinks
+                    .iter_mut()
+                    .find(|(b, _)| b == &backlink)
+                    .expect("Backlink should exist");
+                let existing_path = db
+                    .query_row("SELECT path FROM files WHERE id = ?", [existing.1], |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .unwrap_or_default();
+                let new_path = db
+                    .query_row(
+                        "SELECT path FROM files WHERE id = ?",
+                        [backlink_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap_or_default();
+
+                let existing_basename = Path::new(&existing_path)
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let new_basename = Path::new(&new_path)
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+
+                if new_basename.len() < existing_basename.len() {
+                    *existing = (backlink, backlink_id);
+                }
+            }
+        }
+
+        Ok(unique_backlinks)
     }
 
     fn save_file(&mut self) -> Result<(), EditorError> {
@@ -143,28 +205,63 @@ impl App {
         Ok(())
     }
 
+    fn open_file(&mut self, path: String, file_id: i64) -> Result<(), EditorError> {
+        self.file_path = path.clone();
+        self.file_id = file_id;
+        let content = fs::read_to_string(&self.file_path).unwrap_or_default();
+        self.textarea = TextArea::new(content.lines().map(|s| s.to_string()).collect());
+        self.textarea.set_block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Markdown Editor")
+                .style(Style::default().fg(Color::White)),
+        );
+        self.textarea.set_cursor_line_style(Style::default());
+        self.textarea
+            .set_cursor_style(Style::default().bg(Color::White).fg(Color::Black));
+        self.textarea.set_undo_limit(100); // Enable undo with a limit of 100 changes
+        self.tags = App::load_tags(&self.db, self.file_id)?;
+        self.backlinks = App::load_backlinks(&self.db, self.file_id)?;
+        self.view = View::Editor;
+        self.status = format!("Opened {}", self.file_path);
+        Ok(())
+    }
+
     fn follow_backlink(&mut self, index: usize) -> Result<(), EditorError> {
         if index < self.backlinks.len() {
             let backlink_id = self.backlinks[index].1;
             let mut stmt = self.db.prepare("SELECT path FROM files WHERE id = ?")?;
             let path: String = stmt.query_row([backlink_id], |row| row.get(0))?;
-            self.file_path = path;
-            self.file_id = backlink_id;
-            let content = fs::read_to_string(&self.file_path).unwrap_or_default();
-            self.textarea = TextArea::new(content.lines().map(|s| s.to_string()).collect());
-            self.textarea.set_block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Markdown Editor")
-                    .style(Style::default().fg(Color::White)),
-            );
-            self.textarea.set_cursor_line_style(Style::default());
-            self.textarea
-                .set_cursor_style(Style::default().bg(Color::White).fg(Color::Black));
-            self.tags = App::load_tags(&self.db, self.file_id)?;
-            self.backlinks = App::load_backlinks(&self.db, self.file_id)?;
-            self.view = View::Editor;
-            self.status = format!("Opened {}", self.file_path);
+            drop(stmt); // Explicitly drop stmt to end the immutable borrow
+
+            // Update history: truncate future entries and append new file
+            self.history.truncate(self.history_index + 1);
+            self.history.push((path.clone(), backlink_id));
+            self.history_index += 1;
+
+            self.open_file(path, backlink_id)?;
+        }
+        Ok(())
+    }
+
+    fn navigate_back(&mut self) -> Result<(), EditorError> {
+        if self.history_index > 0 {
+            self.history_index -= 1;
+            let (path, file_id) = self.history[self.history_index].clone();
+            self.open_file(path, file_id)?;
+        } else {
+            self.status = "No previous file in history".to_string();
+        }
+        Ok(())
+    }
+
+    fn navigate_forward(&mut self) -> Result<(), EditorError> {
+        if self.history_index < self.history.len() - 1 {
+            self.history_index += 1;
+            let (path, file_id) = self.history[self.history_index].clone();
+            self.open_file(path, file_id)?;
+        } else {
+            self.status = "No next file in history".to_string();
         }
         Ok(())
     }
@@ -192,6 +289,41 @@ impl App {
             Mode::Normal => {
                 let input = Input::from(event);
                 match input {
+                    Input {
+                        key: Key::Char('o'),
+                        ctrl: true,
+                        ..
+                    } => {
+                        self.navigate_back()?;
+                    }
+                    Input {
+                        key: Key::Char('i'),
+                        ctrl: true,
+                        ..
+                    } => {
+                        self.navigate_forward()?;
+                    }
+                    Input {
+                        key: Key::Char('r'),
+                        ctrl: true,
+                        ..
+                    } => {
+                        if self.textarea.redo() {
+                            self.status = "Redone".to_string();
+                        } else {
+                            self.status = "Nothing to redo".to_string();
+                        }
+                    }
+                    Input {
+                        key: Key::Char('u'),
+                        ..
+                    } => {
+                        if self.textarea.undo() {
+                            self.status = "Undone".to_string();
+                        } else {
+                            self.status = "Nothing to undo".to_string();
+                        }
+                    }
                     Input {
                         key: Key::Char('i'),
                         ..
@@ -228,6 +360,20 @@ impl App {
                     Input {
                         key: Key::Char('l'),
                         ..
+                    } => {
+                        self.textarea.move_cursor(tui_textarea::CursorMove::Forward);
+                    }
+                    Input { key: Key::Up, .. } => {
+                        self.textarea.move_cursor(tui_textarea::CursorMove::Up);
+                    }
+                    Input { key: Key::Down, .. } => {
+                        self.textarea.move_cursor(tui_textarea::CursorMove::Down);
+                    }
+                    Input { key: Key::Left, .. } => {
+                        self.textarea.move_cursor(tui_textarea::CursorMove::Back);
+                    }
+                    Input {
+                        key: Key::Right, ..
                     } => {
                         self.textarea.move_cursor(tui_textarea::CursorMove::Forward);
                     }
