@@ -753,7 +753,7 @@ impl App {
                         .highlight_style(Style::default().bg(Color::White).fg(Color::Black));
                     let popup_area = Rect {
                         x: chunks[0].x + 2,
-                        y: chunks[0].y + self.textarea.cursor().0 as u16 + 1,
+                        y: chunks[0].y + self.textarea.cursor().0 as u16 + 2,
                         width: 40,
                         height: (self.completion_state.suggestions.len().min(5) + 2) as u16,
                     };
