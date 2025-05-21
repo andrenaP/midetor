@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 crossterm = "0.27"
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite  = "0.31"
 thiserror = "1.0"
 tui-textarea = "0.6"
 ratatui = "0.28.1"
