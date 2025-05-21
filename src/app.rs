@@ -239,7 +239,9 @@ impl App {
         self.tags = App::load_tags(&self.db, self.file_id)?;
         self.backlinks = App::load_backlinks(&self.db, self.file_id)?;
         self.view = View::Editor;
-        self.status = format!("Opened {}", self.file_path);
+        // self.status = format!("Opened {}", self.file_path);
+        self.mode = Mode::Normal;
+        self.status = "Normal".to_string();
         Ok(())
     }
 
@@ -264,7 +266,7 @@ impl App {
                 self.textarea
                     .move_cursor(tui_textarea::CursorMove::Jump(current_row as u16, 0));
             }
-            self.save_file()?;
+            // self.save_file()?;
 
             let backlink_id = self.backlinks[index].1;
             let mut stmt = self.db.prepare("SELECT path FROM files WHERE id = ?")?;
