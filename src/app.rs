@@ -12,6 +12,7 @@ use std::io;
 use std::path::Path;
 use std::process::Command;
 use tui_textarea::{Input, Key, TextArea};
+use rusqlite::params;
 
 #[derive(PartialEq)]
 pub enum Mode {
@@ -19,6 +20,8 @@ pub enum Mode {
     Insert,
     Command,
     Complete,
+    Search,
+    TagFiles,
 }
 
 #[derive(PartialEq)]
@@ -33,6 +36,15 @@ pub enum CompletionType {
     File,
     Tag,
 }
+
+#[derive(PartialEq, Clone, Debug)]
+pub enum SearchType {
+    None,
+    Backlinks,
+    Tags,
+    Files,
+}
+
 
 pub struct App {
     db: Connection,
@@ -50,6 +62,10 @@ pub struct App {
     history: Vec<(String, i64)>, // (file_path, file_id)
     history_index: usize,        // Current position in history
     completion_state: CompletionState,
+    search_state: SearchState,
+    key_sequence: String,        // Tracks key sequence in Normal mode (e.g., "\", "\o", "\ob")
+    tag_files: Vec<(String, i64)>, // Files associated with selected tag
+    tag_files_state: ListState,  // State for selecting tag files
 }
 
 pub struct CompletionState {
@@ -59,6 +75,14 @@ pub struct CompletionState {
     suggestions: Vec<String>,
     list_state: ListState,
     trigger_start: (usize, usize), // (row, col) where trigger started
+}
+
+pub struct SearchState {
+    active: bool,
+    search_type: SearchType,
+    query: String,
+    results: Vec<(String, Option<i64>)>, // (display_text, file_id or None for tags)
+    list_state: ListState,
 }
 
 impl App {
@@ -104,6 +128,16 @@ impl App {
                 list_state: ListState::default(),
                 trigger_start: (0, 0),
             },
+            search_state: SearchState {
+                active: false,
+                search_type: SearchType::None,
+                query: String::new(),
+                results: Vec::new(),
+                list_state: ListState::default(),
+            },
+            key_sequence: String::new(),
+            tag_files: Vec::new(),
+            tag_files_state: ListState::default(),
         })
     }
 
@@ -448,6 +482,198 @@ impl App {
         self.status = "Insert".to_string();
     }
 
+
+    fn load_tag_files(&mut self, tag: &str) -> Result<(), EditorError> {
+        let mut stmt = self.db.prepare(
+            "SELECT f.path, f.id FROM files f
+             JOIN file_tags ft ON f.id = ft.file_id
+             JOIN tags t ON ft.tag_id = t.id
+             WHERE t.tag = ?",
+        )?;
+        let files = stmt
+            .query_map([tag], |row| {
+                let path: String = row.get(0)?;
+                let file_id: i64 = row.get(1)?;
+                Ok((path, file_id))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        self.tag_files = files;
+        self.tag_files_state = ListState::default();
+        if !self.tag_files.is_empty() {
+            self.tag_files_state.select(Some(0));
+            self.status = format!("Select file for tag '{}'", tag);
+        } else {
+            self.status = format!("No files found for tag '{}'", tag);
+        }
+        Ok(())
+    }
+
+    fn select_tag_file(&mut self) -> Result<(), EditorError> {
+        if let Some(selected) = self.tag_files_state.selected() {
+            if let Some((path, file_id)) = self.tag_files.get(selected) {
+                self.history.truncate(self.history_index + 1);
+                self.history.push((path.clone(), *file_id));
+                self.history_index += 1;
+                self.open_file(path.clone(), *file_id)?;
+            }
+        }
+        self.cancel_tag_files();
+        Ok(())
+    }
+
+    fn cancel_tag_files(&mut self) {
+        self.tag_files.clear();
+        self.tag_files_state = ListState::default();
+        self.mode = Mode::Normal;
+        self.status = "Normal".to_string();
+        self.key_sequence.clear();
+    }
+
+    fn start_search(&mut self, search_type: SearchType) -> Result<(), EditorError> {
+        self.search_state.active = true;
+        self.search_state.search_type = search_type.clone();
+        self.search_state.query = String::new();
+        self.search_state.results = Vec::new();
+        self.search_state.list_state = ListState::default();
+        self.mode = Mode::Search;
+        self.status = format!("Searching {:?}", search_type);
+        self.key_sequence.clear();
+        self.update_search_results()?;
+        Ok(())
+    }
+
+    fn update_search_results(&mut self) -> Result<(), EditorError> {
+        match self.search_state.search_type {
+            SearchType::Backlinks => self.search_backlinks()?,
+            SearchType::Tags => self.search_tags()?,
+            SearchType::Files => self.search_files()?,
+            SearchType::None => {}
+        }
+        if !self.search_state.results.is_empty() {
+            self.search_state.list_state.select(Some(0));
+        } else {
+            self.search_state.list_state.select(None);
+        }
+        Ok(())
+    }
+
+    fn search_backlinks(&mut self) -> Result<(), EditorError> {
+        let (row, _col) = self.textarea.cursor();
+        let line = self.textarea.lines()[row].clone();
+        let target = if let Some(wikilink) = self.extract_wikilink(&line) {
+            wikilink
+        } else {
+            self.file_path.clone()
+        };
+
+        let query = "SELECT DISTINCT f.path, f.id
+                     FROM backlinks b
+                     JOIN files f ON b.file_id = f.id
+                     JOIN files fp ON b.backlink_id = fp.id
+                     WHERE fp.path LIKE ?";
+        let mut stmt = self.db.prepare(query)?;
+        let results = stmt
+            .query_map([format!("%{}%", target)], |row| {
+                let path: String = row.get(0)?;
+                let file_id: i64 = row.get(1)?;
+                Ok((path, Some(file_id)))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        self.search_state.results = results;
+        Ok(())
+    }
+
+    fn search_tags(&mut self) -> Result<(), EditorError> {
+        let query = "SELECT DISTINCT tag FROM tags WHERE tag LIKE ? LIMIT 10";
+        let mut stmt = self.db.prepare(query)?;
+        let search_pattern = if self.search_state.query.is_empty() {
+            "%".to_string()
+        } else {
+            format!("%{}%", self.search_state.query)
+        };
+        let results = stmt
+            .query_map(params![search_pattern], |row| {
+                let tag: String = row.get(0)?;
+                Ok((tag, None))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        self.search_state.results = results;
+        Ok(())
+    }
+
+    fn search_files(&mut self) -> Result<(), EditorError> {
+        let query = "SELECT path, id FROM files WHERE path LIKE ? LIMIT 10";
+        let mut stmt = self.db.prepare(query)?;
+        let search_pattern = if self.search_state.query.is_empty() {
+            "%".to_string()
+        } else {
+            format!("%{}%", self.search_state.query)
+        };
+        let results = stmt
+            .query_map(params![search_pattern], |row| {
+                let path: String = row.get(0)?;
+                let file_id: i64 = row.get(1)?;
+                Ok((path, Some(file_id)))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        self.search_state.results = results;
+        Ok(())
+    }
+
+    fn extract_wikilink(&self, line: &str) -> Option<String> {
+        let start = line.find("[[")?;
+        let end = line[start..].find("]]").map(|i| i + start + 2)?;
+        Some(line[start + 2..end - 2].to_string())
+    }
+
+    fn select_search_result(&mut self) -> Result<(), EditorError> {
+        if let Some(selected) = self.search_state.list_state.selected() {
+            if let Some((result, file_id)) = self.search_state.results.get(selected).cloned() {
+                match self.search_state.search_type {
+                    SearchType::Backlinks | SearchType::Files => {
+                        if let Some(file_id) = file_id {
+                            self.history.truncate(self.history_index + 1);
+                            self.history.push((result.clone(), file_id));
+                            self.history_index += 1;
+                            self.open_file(result, file_id)?;
+                        }
+                    }
+                    SearchType::Tags => {
+                        self.load_tag_files(&result)?;
+                        if !self.tag_files.is_empty() {
+                            self.mode = Mode::TagFiles;
+                        } else {
+                            self.cancel_search();
+                        }
+                    }
+                    SearchType::None => {}
+                }
+            }
+        } else {
+            self.status = "No tag selected".to_string();
+        }
+        if self.mode != Mode::TagFiles {
+            self.cancel_search();
+        }
+        Ok(())
+    }
+
+    fn cancel_search(&mut self) {
+        self.search_state.active = false;
+        self.search_state.search_type = SearchType::None;
+        self.search_state.query = String::new();
+        self.search_state.results = Vec::new();
+        self.search_state.list_state = ListState::default();
+        self.mode = Mode::Normal;
+        self.status = "Normal".to_string();
+        self.key_sequence.clear();
+    }
+
+
+
     pub fn handle_input(
         &mut self,
         event: ratatui::crossterm::event::KeyEvent,
@@ -544,6 +770,32 @@ impl App {
                     } => {
                         self.textarea.move_cursor(tui_textarea::CursorMove::Forward);
                     }
+
+                    Input {
+                        key: Key::Char(c),
+                        ..
+                    } => {
+                        self.key_sequence.push(c);
+                        match self.key_sequence.as_str() {
+                            "\\ob" => {
+                                self.start_search(SearchType::Backlinks)?;
+                            }
+                            "\\ot" => {
+                                self.start_search(SearchType::Tags)?;
+                            }
+                            "\\f" => {
+                                self.start_search(SearchType::Files)?;
+                            }
+                            s if !("\\ob".starts_with(s)
+                                || "\\ot".starts_with(s)
+                                || "\\f".starts_with(s)) =>
+                            {
+                                self.key_sequence.clear();
+                            }
+                            _ => {}
+                        }
+                    }
+
                     Input {
                         key: Key::Enter, ..
                     } => {
@@ -709,6 +961,60 @@ impl App {
                 }
                 _ => {}
             },
+            Mode::Search => {
+                match event.code {
+                    ratatui::crossterm::event::KeyCode::Esc => {
+                        self.cancel_search();
+                    }
+                    ratatui::crossterm::event::KeyCode::Enter => {
+                        self.select_search_result()?;
+                    }
+                    ratatui::crossterm::event::KeyCode::Up => {
+                        let selected = self.search_state.list_state.selected().unwrap_or(0);
+                        if selected > 0 {
+                            self.search_state.list_state.select(Some(selected - 1));
+                        }
+                    }
+                    ratatui::crossterm::event::KeyCode::Down => {
+                        let selected = self.search_state.list_state.selected().unwrap_or(0);
+                        if selected < self.search_state.results.len() - 1 {
+                            self.search_state.list_state.select(Some(selected + 1));
+                        }
+                    }
+                    ratatui::crossterm::event::KeyCode::Char(c) => {
+                        self.search_state.query.push(c);
+                        self.update_search_results()?;
+                    }
+                    ratatui::crossterm::event::KeyCode::Backspace => {
+                        self.search_state.query.pop();
+                        self.update_search_results()?;
+                    }
+                    _ => {}
+                }
+            }
+            Mode::TagFiles => {
+                match event.code {
+                    ratatui::crossterm::event::KeyCode::Esc => {
+                        self.cancel_tag_files();
+                    }
+                    ratatui::crossterm::event::KeyCode::Enter => {
+                        self.select_tag_file()?;
+                    }
+                    ratatui::crossterm::event::KeyCode::Up => {
+                        let selected = self.tag_files_state.selected().unwrap_or(0);
+                        if selected > 0 {
+                            self.tag_files_state.select(Some(selected - 1));
+                        }
+                    }
+                    ratatui::crossterm::event::KeyCode::Down => {
+                        let selected = self.tag_files_state.selected().unwrap_or(0);
+                        if selected < self.tag_files.len() - 1 {
+                            self.tag_files_state.select(Some(selected + 1));
+                        }
+                    }
+                    _ => {}
+                }
+            },
         }
         Ok(())
     }
@@ -725,52 +1031,107 @@ impl App {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Min(1),    // Editor or info area
+                Constraint::Min(1),    // Editor, info, or list area
                 Constraint::Length(1), // Status line
-                Constraint::Length(1), // Command line
+                Constraint::Length(1), // Command line or key sequence
             ])
             .split(f.area());
 
-        match self.view {
-            View::Editor => {
-                f.render_widget(&self.textarea, chunks[0]);
-                if self.completion_state.active && !self.completion_state.suggestions.is_empty() {
-                    let items: Vec<ListItem> = self
-                        .completion_state
-                        .suggestions
-                        .iter()
-                        .map(|s| ListItem::new(s.clone()))
-                        .collect();
-                    let list = List::new(items)
-                        .block(
-                            Block::default()
-                                .borders(Borders::ALL)
-                                .title(match self.completion_state.completion_type {
-                                    CompletionType::File => "Files",
-                                    CompletionType::Tag => "Tags",
-                                    CompletionType::None => "",
-                                })
-                                .style(Style::default().fg(Color::White)),
-                        )
-                        .highlight_style(Style::default().bg(Color::White).fg(Color::Black));
-                    let popup_area = Rect {
-                        x: chunks[0].x + 2,
-                        y: chunks[0].y + self.textarea.cursor().0 as u16 + 2,
-                        width: 40,
-                        height: (self.completion_state.suggestions.len().min(5) + 2) as u16,
-                    };
-                    f.render_stateful_widget(
-                        list,
-                        popup_area,
-                        &mut self.completion_state.list_state,
-                    );
-                }
+        match self.mode {
+            Mode::Search => {
+                let items: Vec<ListItem> = self
+                    .search_state
+                    .results
+                    .iter()
+                    .map(|(text, _)| ListItem::new(text.clone()))
+                    .collect();
+                let title = match self.search_state.search_type {
+                    SearchType::Backlinks => "Backlinks",
+                    SearchType::Tags => "Tags",
+                    SearchType::Files => "Files",
+                    SearchType::None => "Search",
+                };
+                let list = List::new(items)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(format!("{}: {}", title, self.search_state.query))
+                            .style(Style::default().fg(Color::White)),
+                    )
+                    .highlight_style(Style::default().bg(Color::White).fg(Color::Black));
+                let popup_area = Rect {
+                    x: chunks[0].x + 2,
+                    y: chunks[0].y + 2,
+                    width: 50,
+                    height: (self.search_state.results.len().min(10) + 2) as u16,
+                };
+                f.render_stateful_widget(list, popup_area, &mut self.search_state.list_state);
             }
-            View::Info => {
-                let info = Paragraph::new(self.status.clone())
-                    .block(Block::default().borders(Borders::ALL).title("Info"))
-                    .style(Style::default().fg(Color::White));
-                f.render_widget(info, chunks[0]);
+            Mode::TagFiles => {
+                let items: Vec<ListItem> = self
+                    .tag_files
+                    .iter()
+                    .map(|(path, _)| ListItem::new(path.clone()))
+                    .collect();
+                let list = List::new(items)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title("Files for Tag")
+                            .style(Style::default().fg(Color::White)),
+                    )
+                    .highlight_style(Style::default().bg(Color::White).fg(Color::Black));
+                let popup_area = Rect {
+                    x: chunks[0].x + 2,
+                    y: chunks[0].y + 2,
+                    width: 50,
+                    height: (self.tag_files.len().min(10) + 2) as u16,
+                };
+                f.render_stateful_widget(list, popup_area, &mut self.tag_files_state);
+            }
+            Mode::Normal | Mode::Insert | Mode::Complete | Mode::Command => {
+                match self.view {
+                    View::Editor => {
+                        f.render_widget(&self.textarea, chunks[0]);
+                        if self.completion_state.active && !self.completion_state.suggestions.is_empty() {
+                            let items: Vec<ListItem> = self
+                                .completion_state
+                                .suggestions
+                                .iter()
+                                .map(|s| ListItem::new(s.clone()))
+                                .collect();
+                            let list = List::new(items)
+                                .block(
+                                    Block::default()
+                                        .borders(Borders::ALL)
+                                        .title(match self.completion_state.completion_type {
+                                            CompletionType::File => "Files",
+                                            CompletionType::Tag => "Tags",
+                                            CompletionType::None => "",
+                                        })
+                                        .style(Style::default().fg(Color::White)),
+                                )
+                                .highlight_style(Style::default().bg(Color::White).fg(Color::Black));
+                            let popup_area = Rect {
+                                x: chunks[0].x + 2,
+                                y: chunks[0].y + self.textarea.cursor().0 as u16 + 2,
+                                width: 40,
+                                height: (self.completion_state.suggestions.len().min(5) + 2) as u16,
+                            };
+                            f.render_stateful_widget(
+                                list,
+                                popup_area,
+                                &mut self.completion_state.list_state,
+                            );
+                        }
+                    }
+                    View::Info => {
+                        let info = Paragraph::new(self.status.clone())
+                            .block(Block::default().borders(Borders::ALL).title("Info"))
+                            .style(Style::default().fg(Color::White));
+                        f.render_widget(info, chunks[0]);
+                    }
+                }
             }
         }
 
@@ -778,10 +1139,10 @@ impl App {
             .style(Style::default().fg(Color::Yellow));
         f.render_widget(status, chunks[1]);
 
-        let command = Paragraph::new(if self.mode == Mode::Command {
-            format!(":{}", self.command)
-        } else {
-            String::new()
+        let command = Paragraph::new(match self.mode {
+            Mode::Command => format!(":{}", self.command),
+            Mode::Normal if !self.key_sequence.is_empty() => format!("{}", self.key_sequence),
+            _ => String::new(),
         })
         .style(Style::default().fg(Color::White));
         f.render_widget(command, chunks[2]);
