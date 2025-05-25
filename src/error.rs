@@ -10,4 +10,7 @@ pub enum EditorError {
     FileNotFound(String),
     #[error("Markdown scanner error: {0}")]
     Scanner(String),
+    #[error("Invalid backlink index: {0}")]
+    // InvalidBacklinkIndex(usize),
+    InvalidBacklink(String),
 }

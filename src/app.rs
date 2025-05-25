@@ -6,13 +6,13 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
     Frame, Terminal,
 };
+use rusqlite::params;
 use rusqlite::Connection;
 use std::fs;
 use std::io;
 use std::path::Path;
 use std::process::Command;
 use tui_textarea::{Input, Key, TextArea};
-use rusqlite::params;
 
 #[derive(PartialEq)]
 pub enum Mode {
@@ -45,7 +45,6 @@ pub enum SearchType {
     Files,
 }
 
-
 pub struct App {
     db: Connection,
     file_path: String,
@@ -63,9 +62,9 @@ pub struct App {
     history_index: usize,        // Current position in history
     completion_state: CompletionState,
     search_state: SearchState,
-    key_sequence: String,        // Tracks key sequence in Normal mode (e.g., "\", "\o", "\ob")
+    key_sequence: String, // Tracks key sequence in Normal mode (e.g., "\", "\o", "\ob")
     tag_files: Vec<(String, i64)>, // Files associated with selected tag
-    tag_files_state: ListState,  // State for selecting tag files
+    tag_files_state: ListState, // State for selecting tag files
 }
 
 pub struct CompletionState {
@@ -273,46 +272,161 @@ impl App {
         self.tags = App::load_tags(&self.db, self.file_id)?;
         self.backlinks = App::load_backlinks(&self.db, self.file_id)?;
         self.view = View::Editor;
-        // self.status = format!("Opened {}", self.file_path);
         self.mode = Mode::Normal;
         self.status = "Normal".to_string();
         Ok(())
     }
 
     fn follow_backlink(&mut self, index: usize) -> Result<(), EditorError> {
-        if index < self.backlinks.len() {
-            // Clean incomplete autocompletions
+        let current_row = self.textarea.cursor().0;
+        let line = self.textarea.lines()[current_row].clone();
+
+        // Extract wikilink from the current line if no valid backlink index
+        let wikilink = if index >= self.backlinks.len() {
+            self.extract_wikilink(&line).ok_or_else(|| {
+                EditorError::InvalidBacklink("No valid wikilink found".to_string())
+            })?
+        } else {
+            self.backlinks[index].0.clone()
+        };
+
+        // Clean incomplete autocompletions
+        if line.contains("[[") && !line.contains("]]") {
             let mut new_lines = self.textarea.lines().to_vec();
-            let current_row = self.textarea.cursor().0;
-            let line = new_lines[current_row].clone();
-            if line.contains("[[") && !line.contains("]]") {
-                new_lines[current_row] = line[..line.rfind("[[").unwrap_or(line.len())].to_string();
-                self.textarea = TextArea::new(new_lines.clone());
-                self.textarea.set_block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title("Markdown Editor")
-                        .style(Style::default().fg(Color::White)),
-                );
-                self.textarea.set_cursor_line_style(Style::default());
-                self.textarea
-                    .set_cursor_style(Style::default().bg(Color::White).fg(Color::Black));
-                self.textarea
-                    .move_cursor(tui_textarea::CursorMove::Jump(current_row as u16, 0));
-            }
-            // self.save_file()?;
-
-            let backlink_id = self.backlinks[index].1;
-            let mut stmt = self.db.prepare("SELECT path FROM files WHERE id = ?")?;
-            let path: String = stmt.query_row([backlink_id], |row| row.get(0))?;
-            drop(stmt);
-
-            self.history.truncate(self.history_index + 1);
-            self.history.push((path.clone(), backlink_id));
-            self.history_index += 1;
-
-            self.open_file(path, backlink_id)?;
+            new_lines[current_row] = line[..line.rfind("[[").unwrap_or(line.len())].to_string();
+            self.textarea = TextArea::new(new_lines);
+            self.textarea.set_block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Markdown Editor")
+                    .style(Style::default().fg(Color::White)),
+            );
+            self.textarea.set_cursor_line_style(Style::default());
+            self.textarea
+                .set_cursor_style(Style::default().bg(Color::White).fg(Color::Black));
+            self.textarea
+                .move_cursor(tui_textarea::CursorMove::Jump(current_row as u16, 0));
         }
+
+        // Normalize the wikilink to a file path
+        let path = if wikilink.ends_with(".md") {
+            wikilink.clone() // Preserve path as-is if it includes .md
+        } else {
+            format!("{}.md", wikilink) // Append .md if not present
+        };
+
+        // Try the wikilink as a relative path (e.g., Games/Crysis 1.md)
+        let db_path = path.clone();
+        let full_path = Path::new(&self.base_dir)
+            .join(&path)
+            .to_string_lossy()
+            .to_string();
+
+        // eprintln!(
+        //     "DEBUG: Attempting to follow wikilink '{}', db_path: '{}', full_path: '{}'",
+        //     wikilink, db_path, full_path
+        // );
+
+        // Check if the file exists in the database with the exact path
+        let file_id_result = {
+            let mut stmt = self.db.prepare("SELECT id FROM files WHERE path = ?")?;
+            stmt.query_row([&db_path], |row| row.get(0))
+        };
+
+        let file_id = match file_id_result {
+            Ok(id) => {
+                // eprintln!("DEBUG: File found in database with ID: {}", id);
+                id
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                // Try finding the file by basename (e.g., Crysis 1.md anywhere in the vault)
+                let basename = Path::new(&path)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                // eprintln!(
+                //     "DEBUG: File not found at '{}', trying basename '{}'",
+                //     db_path, basename
+                // );
+                let mut stmt = self
+                    .db
+                    .prepare("SELECT id, path FROM files WHERE path LIKE ?")?;
+                let file_result = stmt.query_row([format!("%/{}", basename)], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                });
+                drop(stmt);
+
+                match file_result {
+                    Ok((id, found_path)) => {
+                        // eprintln!(
+                        //     "DEBUG: File found by basename at '{}' with ID: {}",
+                        //     found_path, id
+                        // );
+                        // Update full_path to the actual file location
+                        let full_path = Path::new(&self.base_dir)
+                            .join(&found_path)
+                            .to_string_lossy()
+                            .to_string();
+                        self.history.truncate(self.history_index + 1);
+                        self.history.push((full_path.clone(), id));
+                        self.history_index += 1;
+                        self.open_file(full_path, id)?;
+                        return Ok(());
+                    }
+                    Err(rusqlite::Error::QueryReturnedNoRows) => {
+                        // eprintln!("DEBUG: File not found in database, creating: {}", full_path);
+                        // File doesn't exist; create it
+                        // Ensure parent directories exist
+                        if let Some(parent) = Path::new(&full_path).parent() {
+                            fs::create_dir_all(parent)?;
+                        }
+                        fs::write(&full_path, "")?;
+                        // Run markdown-scanner to add the file to the database
+                        let output = Command::new("markdown-scanner")
+                            .arg(&full_path)
+                            .arg(&self.base_dir)
+                            .output()?;
+                        if !output.status.success() {
+                            let error_msg = String::from_utf8_lossy(&output.stderr).into_owned();
+                            // eprintln!("DEBUG: Scanner failed: {}", error_msg);
+                            return Err(EditorError::Scanner(error_msg));
+                        }
+                        // eprintln!("DEBUG: Scanner executed successfully for: {}", full_path);
+                        // Retrieve the new file's ID
+                        let mut stmt = self.db.prepare("SELECT id FROM files WHERE path = ?")?;
+                        stmt.query_row([&db_path], |row| row.get(0)).map_err(|e| {
+                            // eprintln!(
+                            //     "DEBUG: Failed to retrieve new file ID for path '{}': {:?}",
+                            //     db_path, e
+                            // );
+                            EditorError::Database(e)
+                        })?
+                    }
+                    Err(e) => {
+                        // eprintln!("DEBUG: Database error on basename search: {:?}", e);
+                        return Err(EditorError::Database(e));
+                    }
+                }
+            }
+            Err(e) => {
+                // eprintln!("DEBUG: Database error: {:?}", e);
+                return Err(EditorError::Database(e));
+            }
+        };
+
+        // Update history only if the file ID is different from the current one
+        if file_id != self.file_id {
+            self.history.truncate(self.history_index + 1);
+            self.history.push((full_path.clone(), file_id));
+            self.history_index += 1;
+            self.open_file(full_path, file_id)?;
+            // eprintln!("DEBUG: Opened file with ID: {}", file_id);
+        } else {
+            self.status = "Already on this file".to_string();
+            // eprintln!("DEBUG: File ID {} is already open", file_id);
+        }
+
         Ok(())
     }
 
@@ -382,17 +496,13 @@ impl App {
         self.completion_state.query = query.clone();
         self.completion_state.suggestions = if query.len() >= 2 {
             let sql = match self.completion_state.completion_type {
-                CompletionType::File => format!(
-                    "SELECT path FROM files WHERE path LIKE '%{}%' LIMIT 10",
-                    query
-                ),
-                CompletionType::Tag => {
-                    format!("SELECT tag FROM tags WHERE tag LIKE '%{}%' LIMIT 10", query)
-                }
+                CompletionType::File => "SELECT path FROM files WHERE path LIKE ? LIMIT 10",
+                CompletionType::Tag => "SELECT tag FROM tags WHERE tag LIKE ? LIMIT 10",
                 CompletionType::None => return Ok(()),
             };
-            let mut stmt = self.db.prepare(&sql)?;
-            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            let mut stmt = self.db.prepare(sql)?;
+            let search_pattern = format!("%{}%", query);
+            let rows = stmt.query_map(params![search_pattern], |row| row.get::<_, String>(0))?;
             rows.collect::<Result<Vec<_>, _>>()?
         } else {
             Vec::new()
@@ -421,7 +531,7 @@ impl App {
                 };
 
                 if let Some(start) = trigger_pos {
-                    // Modify the current line to remove the trigger and query (e.g., "[[rad")
+                    // Modify the current line to remove the trigger and query
                     let mut new_lines = self.textarea.lines().to_vec();
                     let new_line =
                         format!("{}{}", &current_line[..start], &current_line[current_col..]);
@@ -436,7 +546,7 @@ impl App {
                     self.textarea.set_cursor_line_style(Style::default());
                     self.textarea
                         .set_cursor_style(Style::default().bg(Color::White).fg(Color::Black));
-                    // Move cursor to the position after the prefix (e.g., after "12345")
+                    // Move cursor to the position after the prefix
                     self.textarea.move_cursor(tui_textarea::CursorMove::Jump(
                         current_row as u16,
                         start as u16,
@@ -481,7 +591,6 @@ impl App {
         self.mode = Mode::Insert;
         self.status = "Insert".to_string();
     }
-
 
     fn load_tag_files(&mut self, tag: &str) -> Result<(), EditorError> {
         let mut stmt = self.db.prepare(
@@ -672,8 +781,6 @@ impl App {
         self.key_sequence.clear();
     }
 
-
-
     pub fn handle_input(
         &mut self,
         event: ratatui::crossterm::event::KeyEvent,
@@ -770,10 +877,8 @@ impl App {
                     } => {
                         self.textarea.move_cursor(tui_textarea::CursorMove::Forward);
                     }
-
                     Input {
-                        key: Key::Char(c),
-                        ..
+                        key: Key::Char(c), ..
                     } => {
                         self.key_sequence.push(c);
                         match self.key_sequence.as_str() {
@@ -795,7 +900,6 @@ impl App {
                             _ => {}
                         }
                     }
-
                     Input {
                         key: Key::Enter, ..
                     } => {
@@ -807,30 +911,10 @@ impl App {
                                 .iter()
                                 .position(|(text, _)| line.contains(text))
                             {
-                                // Clean incomplete autocompletions
-                                let mut new_lines = self.textarea.lines().to_vec();
-                                if line.contains("[[") && !line.contains("]]") {
-                                    new_lines[current_row] =
-                                        line[..line.rfind("[[").unwrap_or(line.len())].to_string();
-                                }
-                                self.textarea = TextArea::new(new_lines);
-                                self.textarea.set_block(
-                                    Block::default()
-                                        .borders(Borders::ALL)
-                                        .title("Markdown Editor")
-                                        .style(Style::default().fg(Color::White)),
-                                );
-                                self.textarea.set_cursor_line_style(Style::default());
-                                self.textarea.set_cursor_style(
-                                    Style::default().bg(Color::White).fg(Color::Black),
-                                );
-                                self.textarea.move_cursor(tui_textarea::CursorMove::Jump(
-                                    current_row as u16,
-                                    0,
-                                ));
-                                // Reset completion state
-                                self.cancel_completion();
                                 self.follow_backlink(index)?;
+                            } else if let Some(wikilink) = self.extract_wikilink(&line) {
+                                // Handle wikilink not in backlinks by passing an invalid index
+                                self.follow_backlink(usize::MAX)?;
                             } else if let Some(tag) =
                                 self.tags.iter().find(|tag| line.contains(&**tag)).cloned()
                             {
@@ -961,59 +1045,55 @@ impl App {
                 }
                 _ => {}
             },
-            Mode::Search => {
-                match event.code {
-                    ratatui::crossterm::event::KeyCode::Esc => {
-                        self.cancel_search();
-                    }
-                    ratatui::crossterm::event::KeyCode::Enter => {
-                        self.select_search_result()?;
-                    }
-                    ratatui::crossterm::event::KeyCode::Up => {
-                        let selected = self.search_state.list_state.selected().unwrap_or(0);
-                        if selected > 0 {
-                            self.search_state.list_state.select(Some(selected - 1));
-                        }
-                    }
-                    ratatui::crossterm::event::KeyCode::Down => {
-                        let selected = self.search_state.list_state.selected().unwrap_or(0);
-                        if selected < self.search_state.results.len() - 1 {
-                            self.search_state.list_state.select(Some(selected + 1));
-                        }
-                    }
-                    ratatui::crossterm::event::KeyCode::Char(c) => {
-                        self.search_state.query.push(c);
-                        self.update_search_results()?;
-                    }
-                    ratatui::crossterm::event::KeyCode::Backspace => {
-                        self.search_state.query.pop();
-                        self.update_search_results()?;
-                    }
-                    _ => {}
+            Mode::Search => match event.code {
+                ratatui::crossterm::event::KeyCode::Esc => {
+                    self.cancel_search();
                 }
-            }
-            Mode::TagFiles => {
-                match event.code {
-                    ratatui::crossterm::event::KeyCode::Esc => {
-                        self.cancel_tag_files();
-                    }
-                    ratatui::crossterm::event::KeyCode::Enter => {
-                        self.select_tag_file()?;
-                    }
-                    ratatui::crossterm::event::KeyCode::Up => {
-                        let selected = self.tag_files_state.selected().unwrap_or(0);
-                        if selected > 0 {
-                            self.tag_files_state.select(Some(selected - 1));
-                        }
-                    }
-                    ratatui::crossterm::event::KeyCode::Down => {
-                        let selected = self.tag_files_state.selected().unwrap_or(0);
-                        if selected < self.tag_files.len() - 1 {
-                            self.tag_files_state.select(Some(selected + 1));
-                        }
-                    }
-                    _ => {}
+                ratatui::crossterm::event::KeyCode::Enter => {
+                    self.select_search_result()?;
                 }
+                ratatui::crossterm::event::KeyCode::Up => {
+                    let selected = self.search_state.list_state.selected().unwrap_or(0);
+                    if selected > 0 {
+                        self.search_state.list_state.select(Some(selected - 1));
+                    }
+                }
+                ratatui::crossterm::event::KeyCode::Down => {
+                    let selected = self.search_state.list_state.selected().unwrap_or(0);
+                    if selected < self.search_state.results.len() - 1 {
+                        self.search_state.list_state.select(Some(selected + 1));
+                    }
+                }
+                ratatui::crossterm::event::KeyCode::Char(c) => {
+                    self.search_state.query.push(c);
+                    self.update_search_results()?;
+                }
+                ratatui::crossterm::event::KeyCode::Backspace => {
+                    self.search_state.query.pop();
+                    self.update_search_results()?;
+                }
+                _ => {}
+            },
+            Mode::TagFiles => match event.code {
+                ratatui::crossterm::event::KeyCode::Esc => {
+                    self.cancel_tag_files();
+                }
+                ratatui::crossterm::event::KeyCode::Enter => {
+                    self.select_tag_file()?;
+                }
+                ratatui::crossterm::event::KeyCode::Up => {
+                    let selected = self.tag_files_state.selected().unwrap_or(0);
+                    if selected > 0 {
+                        self.tag_files_state.select(Some(selected - 1));
+                    }
+                }
+                ratatui::crossterm::event::KeyCode::Down => {
+                    let selected = self.tag_files_state.selected().unwrap_or(0);
+                    if selected < self.tag_files.len() - 1 {
+                        self.tag_files_state.select(Some(selected + 1));
+                    }
+                }
+                _ => {}
             },
         }
         Ok(())
@@ -1089,50 +1169,49 @@ impl App {
                 };
                 f.render_stateful_widget(list, popup_area, &mut self.tag_files_state);
             }
-            Mode::Normal | Mode::Insert | Mode::Complete | Mode::Command => {
-                match self.view {
-                    View::Editor => {
-                        f.render_widget(&self.textarea, chunks[0]);
-                        if self.completion_state.active && !self.completion_state.suggestions.is_empty() {
-                            let items: Vec<ListItem> = self
-                                .completion_state
-                                .suggestions
-                                .iter()
-                                .map(|s| ListItem::new(s.clone()))
-                                .collect();
-                            let list = List::new(items)
-                                .block(
-                                    Block::default()
-                                        .borders(Borders::ALL)
-                                        .title(match self.completion_state.completion_type {
-                                            CompletionType::File => "Files",
-                                            CompletionType::Tag => "Tags",
-                                            CompletionType::None => "",
-                                        })
-                                        .style(Style::default().fg(Color::White)),
-                                )
-                                .highlight_style(Style::default().bg(Color::White).fg(Color::Black));
-                            let popup_area = Rect {
-                                x: chunks[0].x + 2,
-                                y: chunks[0].y + self.textarea.cursor().0 as u16 + 2,
-                                width: 40,
-                                height: (self.completion_state.suggestions.len().min(5) + 2) as u16,
-                            };
-                            f.render_stateful_widget(
-                                list,
-                                popup_area,
-                                &mut self.completion_state.list_state,
-                            );
-                        }
-                    }
-                    View::Info => {
-                        let info = Paragraph::new(self.status.clone())
-                            .block(Block::default().borders(Borders::ALL).title("Info"))
-                            .style(Style::default().fg(Color::White));
-                        f.render_widget(info, chunks[0]);
+            Mode::Normal | Mode::Insert | Mode::Complete | Mode::Command => match self.view {
+                View::Editor => {
+                    f.render_widget(&self.textarea, chunks[0]);
+                    if self.completion_state.active && !self.completion_state.suggestions.is_empty()
+                    {
+                        let items: Vec<ListItem> = self
+                            .completion_state
+                            .suggestions
+                            .iter()
+                            .map(|s| ListItem::new(s.clone()))
+                            .collect();
+                        let list = List::new(items)
+                            .block(
+                                Block::default()
+                                    .borders(Borders::ALL)
+                                    .title(match self.completion_state.completion_type {
+                                        CompletionType::File => "Files",
+                                        CompletionType::Tag => "Tags",
+                                        CompletionType::None => "",
+                                    })
+                                    .style(Style::default().fg(Color::White)),
+                            )
+                            .highlight_style(Style::default().bg(Color::White).fg(Color::Black));
+                        let popup_area = Rect {
+                            x: chunks[0].x + 2,
+                            y: chunks[0].y + self.textarea.cursor().0 as u16 + 2,
+                            width: 40,
+                            height: (self.completion_state.suggestions.len().min(5) + 2) as u16,
+                        };
+                        f.render_stateful_widget(
+                            list,
+                            popup_area,
+                            &mut self.completion_state.list_state,
+                        );
                     }
                 }
-            }
+                View::Info => {
+                    let info = Paragraph::new(self.status.clone())
+                        .block(Block::default().borders(Borders::ALL).title("Info"))
+                        .style(Style::default().fg(Color::White));
+                    f.render_widget(info, chunks[0]);
+                }
+            },
         }
 
         let status = Paragraph::new(format!("-- {} --", self.status))
