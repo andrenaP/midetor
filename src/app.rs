@@ -496,7 +496,8 @@ impl App {
         self.completion_state.query = query.clone();
         self.completion_state.suggestions = if query.len() >= 2 {
             let sql = match self.completion_state.completion_type {
-                CompletionType::File => "SELECT path FROM files WHERE path LIKE ? LIMIT 10",
+                //CompletionType::File => "SELECT path FROM files WHERE path LIKE ? LIMIT 10",
+                CompletionType::File => "SELECT DISTINCT result FROM (SELECT path AS result FROM files UNION SELECT file_name FROM files UNION SELECT backlink FROM backlinks) WHERE result LIKE ? LIMIT 10;",
                 CompletionType::Tag => "SELECT tag FROM tags WHERE tag LIKE ? LIMIT 10",
                 CompletionType::None => return Ok(()),
             };
