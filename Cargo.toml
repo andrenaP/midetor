@@ -1,6 +1,6 @@
 [package]
 name = "markdown-editor"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 
 [dependencies]
@@ -9,3 +9,12 @@ rusqlite = { version = "0.31", features = ["bundled"]}
 thiserror = "1.0"
 tui-textarea = "0.6"
 ratatui = "0.28.1"
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+codegen-units = 1
+#rustflags = ["-C", "target-cpu=native"]
+lto = "fat"
+debug = false
+strip = "symbols"
