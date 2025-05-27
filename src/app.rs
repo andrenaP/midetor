@@ -1,4 +1,5 @@
 use crate::error::EditorError;
+use chrono::{Duration, Local};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
@@ -277,6 +278,88 @@ impl App {
         Ok(())
     }
 
+    fn open_wikilink_file(&mut self, wikilink: String) -> Result<(), EditorError> {
+        // Normalize the wikilink to a file path
+        let path = if wikilink.ends_with(".md") {
+            wikilink.clone() // Preserve path as-is if it includes .md
+        } else {
+            format!("{}.md", wikilink) // Append .md if not present
+        };
+
+        // Try the wikilink as a relative path (e.g., Every day info/2023-04-18.md)
+        let db_path = path.clone();
+        let full_path = Path::new(&self.base_dir)
+            .join(&path)
+            .to_string_lossy()
+            .to_string();
+
+        // Check if the file exists in the database with the exact path
+        let file_id_result = {
+            let mut stmt = self.db.prepare("SELECT id FROM files WHERE path = ?")?;
+            stmt.query_row([&db_path], |row| row.get(0))
+        };
+
+        let file_id = match file_id_result {
+            Ok(id) => id,
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                // Try finding the file by basename (e.g., 2023-04-18.md anywhere in the vault)
+                let basename = Path::new(&path)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                let mut stmt = self
+                    .db
+                    .prepare("SELECT id, path FROM files WHERE path LIKE ?")?;
+                let file_result = stmt.query_row([format!("%/{}", basename)], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                });
+                drop(stmt);
+
+                match file_result {
+                    Ok((id, found_path)) => {
+                        // Update full_path to the actual file location
+                        let full_path = Path::new(&self.base_dir)
+                            .join(&found_path)
+                            .to_string_lossy()
+                            .to_string();
+                        self.history.truncate(self.history_index + 1);
+                        self.history.push((full_path.clone(), id));
+                        self.history_index += 1;
+                        self.open_file(full_path, id)?;
+                        return Ok(());
+                    }
+                    Err(rusqlite::Error::QueryReturnedNoRows) => {
+                        // File doesn't exist; create it
+                        if let Some(parent) = Path::new(&full_path).parent() {
+                            fs::create_dir_all(parent)?;
+                        }
+                        fs::write(&full_path, "")?;
+                        let output = Command::new("markdown-scanner")
+                            .arg(&full_path)
+                            .arg(&self.base_dir)
+                            .output()?;
+                        if !output.status.success() {
+                            let error_msg = String::from_utf8_lossy(&output.stderr).into_owned();
+                            return Err(EditorError::Scanner(error_msg));
+                        }
+                        let mut stmt = self.db.prepare("SELECT id FROM files WHERE path = ?")?;
+                        stmt.query_row([&db_path], |row| row.get(0))
+                            .map_err(|e| EditorError::Database(e))?
+                    }
+                    Err(e) => return Err(EditorError::Database(e)),
+                }
+            }
+            Err(e) => return Err(EditorError::Database(e)),
+        };
+
+        self.history.truncate(self.history_index + 1);
+        self.history.push((full_path.clone(), file_id));
+        self.history_index += 1;
+        self.open_file(full_path, file_id)?;
+        Ok(())
+    }
+
     fn follow_backlink(&mut self, index: usize) -> Result<(), EditorError> {
         let current_row = self.textarea.cursor().0;
         let line = self.textarea.lines()[current_row].clone();
@@ -308,124 +391,7 @@ impl App {
                 .move_cursor(tui_textarea::CursorMove::Jump(current_row as u16, 0));
         }
 
-        // Normalize the wikilink to a file path
-        let path = if wikilink.ends_with(".md") {
-            wikilink.clone() // Preserve path as-is if it includes .md
-        } else {
-            format!("{}.md", wikilink) // Append .md if not present
-        };
-
-        // Try the wikilink as a relative path (e.g., Games/Crysis 1.md)
-        let db_path = path.clone();
-        let full_path = Path::new(&self.base_dir)
-            .join(&path)
-            .to_string_lossy()
-            .to_string();
-
-        // eprintln!(
-        //     "DEBUG: Attempting to follow wikilink '{}', db_path: '{}', full_path: '{}'",
-        //     wikilink, db_path, full_path
-        // );
-
-        // Check if the file exists in the database with the exact path
-        let file_id_result = {
-            let mut stmt = self.db.prepare("SELECT id FROM files WHERE path = ?")?;
-            stmt.query_row([&db_path], |row| row.get(0))
-        };
-
-        let file_id = match file_id_result {
-            Ok(id) => {
-                // eprintln!("DEBUG: File found in database with ID: {}", id);
-                id
-            }
-            Err(rusqlite::Error::QueryReturnedNoRows) => {
-                // Try finding the file by basename (e.g., Crysis 1.md anywhere in the vault)
-                let basename = Path::new(&path)
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string();
-                // eprintln!(
-                //     "DEBUG: File not found at '{}', trying basename '{}'",
-                //     db_path, basename
-                // );
-                let mut stmt = self
-                    .db
-                    .prepare("SELECT id, path FROM files WHERE path LIKE ?")?;
-                let file_result = stmt.query_row([format!("%/{}", basename)], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-                });
-                drop(stmt);
-
-                match file_result {
-                    Ok((id, found_path)) => {
-                        // eprintln!(
-                        //     "DEBUG: File found by basename at '{}' with ID: {}",
-                        //     found_path, id
-                        // );
-                        // Update full_path to the actual file location
-                        let full_path = Path::new(&self.base_dir)
-                            .join(&found_path)
-                            .to_string_lossy()
-                            .to_string();
-                        self.history.truncate(self.history_index + 1);
-                        self.history.push((full_path.clone(), id));
-                        self.history_index += 1;
-                        self.open_file(full_path, id)?;
-                        return Ok(());
-                    }
-                    Err(rusqlite::Error::QueryReturnedNoRows) => {
-                        // eprintln!("DEBUG: File not found in database, creating: {}", full_path);
-                        // File doesn't exist; create it
-                        // Ensure parent directories exist
-                        if let Some(parent) = Path::new(&full_path).parent() {
-                            fs::create_dir_all(parent)?;
-                        }
-                        fs::write(&full_path, "")?;
-                        // Run markdown-scanner to add the file to the database
-                        let output = Command::new("markdown-scanner")
-                            .arg(&full_path)
-                            .arg(&self.base_dir)
-                            .output()?;
-                        if !output.status.success() {
-                            let error_msg = String::from_utf8_lossy(&output.stderr).into_owned();
-                            // eprintln!("DEBUG: Scanner failed: {}", error_msg);
-                            return Err(EditorError::Scanner(error_msg));
-                        }
-                        // eprintln!("DEBUG: Scanner executed successfully for: {}", full_path);
-                        // Retrieve the new file's ID
-                        let mut stmt = self.db.prepare("SELECT id FROM files WHERE path = ?")?;
-                        stmt.query_row([&db_path], |row| row.get(0)).map_err(|e| {
-                            // eprintln!(
-                            //     "DEBUG: Failed to retrieve new file ID for path '{}': {:?}",
-                            //     db_path, e
-                            // );
-                            EditorError::Database(e)
-                        })?
-                    }
-                    Err(e) => {
-                        // eprintln!("DEBUG: Database error on basename search: {:?}", e);
-                        return Err(EditorError::Database(e));
-                    }
-                }
-            }
-            Err(e) => {
-                // eprintln!("DEBUG: Database error: {:?}", e);
-                return Err(EditorError::Database(e));
-            }
-        };
-
-        // Update history only if the file ID is different from the current one
-        if file_id != self.file_id {
-            self.history.truncate(self.history_index + 1);
-            self.history.push((full_path.clone(), file_id));
-            self.history_index += 1;
-            self.open_file(full_path, file_id)?;
-            // eprintln!("DEBUG: Opened file with ID: {}", file_id);
-        } else {
-            self.status = "Already on this file".to_string();
-            // eprintln!("DEBUG: File ID {} is already open", file_id);
-        }
+        self.open_wikilink_file(wikilink)?;
 
         Ok(())
     }
@@ -892,9 +858,30 @@ impl App {
                             "\\f" => {
                                 self.start_search(SearchType::Files)?;
                             }
+                            "\\oot" => {
+                                let today = Local::now()
+                                    .format("Every day info/%Y-%m-%d.md")
+                                    .to_string();
+                                self.open_wikilink_file(today)?;
+                            }
+                            "\\ooy" => {
+                                let yesterday = (Local::now() - Duration::days(1))
+                                    .format("Every day info/%Y-%m-%d.md")
+                                    .to_string();
+                                self.open_wikilink_file(yesterday)?;
+                            }
+                            "\\ooT" => {
+                                let tomorrow = (Local::now() + Duration::days(1))
+                                    .format("Every day info/%Y-%m-%d.md")
+                                    .to_string();
+                                self.open_wikilink_file(tomorrow)?;
+                            }
                             s if !("\\ob".starts_with(s)
                                 || "\\ot".starts_with(s)
-                                || "\\f".starts_with(s)) =>
+                                || "\\f".starts_with(s)
+                                || "\\oot".starts_with(s)
+                                || "\\ooy".starts_with(s)
+                                || "\\ooT".starts_with(s)) =>
                             {
                                 self.key_sequence.clear();
                             }
@@ -913,7 +900,7 @@ impl App {
                                 .position(|(text, _)| line.contains(text))
                             {
                                 self.follow_backlink(index)?;
-                            } else if let Some(wikilink) = self.extract_wikilink(&line) {
+                            } else if let Some(_wikilink) = self.extract_wikilink(&line) {
                                 // Handle wikilink not in backlinks by passing an invalid index
                                 self.follow_backlink(usize::MAX)?;
                             } else if let Some(tag) =
