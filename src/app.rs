@@ -447,22 +447,29 @@ impl App {
     fn update_completion(&mut self) -> Result<(), EditorError> {
         let (row, col) = self.textarea.cursor();
         let line = self.textarea.lines()[row].clone();
+
+        // Convert character index to byte index
+        let col_bytes = line
+            .char_indices()
+            .nth(col)
+            .map(|(i, _)| i)
+            .unwrap_or(line.len());
+
         let query = if self.completion_state.completion_type == CompletionType::File {
-            line.get(..col)
+            line.get(..col_bytes)
                 .and_then(|s| s.rfind("[["))
-                .map(|start| line[start + 2..col].to_string())
+                .map(|start| line[start + 2..col_bytes].to_string())
                 .unwrap_or_default()
         } else {
-            line.get(..col)
+            line.get(..col_bytes)
                 .and_then(|s| s.rfind("#"))
-                .map(|start| line[start + 1..col].to_string())
+                .map(|start| line[start + 1..col_bytes].to_string())
                 .unwrap_or_default()
         };
 
         self.completion_state.query = query.clone();
         self.completion_state.suggestions = if query.len() >= 2 {
             let sql = match self.completion_state.completion_type {
-                //CompletionType::File => "SELECT path FROM files WHERE path LIKE ? LIMIT 10",
                 CompletionType::File => "SELECT DISTINCT result FROM (SELECT path AS result FROM files UNION SELECT file_name FROM files UNION SELECT backlink FROM backlinks) WHERE result LIKE ? LIMIT 10;",
                 CompletionType::Tag => "SELECT tag FROM tags WHERE tag LIKE ? LIMIT 10",
                 CompletionType::None => return Ok(()),
@@ -490,18 +497,25 @@ impl App {
                 let (current_row, current_col) = self.textarea.cursor();
                 let current_line = self.textarea.lines()[current_row].clone();
 
-                // Find the most recent trigger in the current line
+                // Convert character index to byte index
+                let col_bytes = current_line
+                    .char_indices()
+                    .nth(current_col)
+                    .map(|(i, _)| i)
+                    .unwrap_or(current_line.len());
+
+                // Find the most recent trigger in the current line up to cursor
                 let trigger_pos = if self.completion_state.completion_type == CompletionType::File {
-                    current_line[..current_col].rfind("[[")
+                    current_line[..col_bytes].rfind("[[")
                 } else {
-                    current_line[..current_col].rfind("#")
+                    current_line[..col_bytes].rfind("#")
                 };
 
                 if let Some(start) = trigger_pos {
-                    // Modify the current line to remove the trigger and query
+                    // Remove text from trigger to current cursor position (in bytes)
                     let mut new_lines = self.textarea.lines().to_vec();
                     let new_line =
-                        format!("{}{}", &current_line[..start], &current_line[current_col..]);
+                        format!("{}{}", &current_line[..start], &current_line[col_bytes..]);
                     new_lines[current_row] = new_line;
                     self.textarea = TextArea::new(new_lines);
                     self.textarea.set_block(
@@ -513,18 +527,28 @@ impl App {
                     self.textarea.set_cursor_line_style(Style::default());
                     self.textarea
                         .set_cursor_style(Style::default().bg(Color::White).fg(Color::Black));
-                    // Move cursor to the position after the prefix
+
+                    // Calculate new cursor position in characters (after the trigger)
+                    let prefix_chars = current_line[..start].chars().count();
                     self.textarea.move_cursor(tui_textarea::CursorMove::Jump(
                         current_row as u16,
-                        start as u16,
+                        prefix_chars as u16,
                     ));
+
+                    // Insert the full suggestion
+                    let insert_text = match self.completion_state.completion_type {
+                        CompletionType::File => format!("[[{}]]", suggestion),
+                        CompletionType::Tag => format!("#{}", suggestion),
+                        CompletionType::None => String::new(),
+                    };
+                    self.textarea.insert_str(&insert_text);
                 } else {
-                    // Fallback: Delete query length backward from current position
+                    // Fallback: Delete the query and trigger
                     let delete_len = self.completion_state.query.len()
                         + if self.completion_state.completion_type == CompletionType::File {
-                            2
+                            2 // Length of "[[" trigger
                         } else {
-                            1
+                            1 // Length of "#" trigger
                         };
                     let new_col = current_col.saturating_sub(delete_len);
                     self.textarea.move_cursor(tui_textarea::CursorMove::Jump(
@@ -534,15 +558,15 @@ impl App {
                     for _ in 0..delete_len {
                         self.textarea.delete_char();
                     }
-                }
 
-                // Insert the full suggestion
-                let insert_text = match self.completion_state.completion_type {
-                    CompletionType::File => format!("[[{}]]", suggestion),
-                    CompletionType::Tag => format!("#{}", suggestion),
-                    CompletionType::None => String::new(),
-                };
-                self.textarea.insert_str(&insert_text);
+                    // Insert the full suggestion
+                    let insert_text = match self.completion_state.completion_type {
+                        CompletionType::File => format!("[[{}]]", suggestion),
+                        CompletionType::Tag => format!("#{}", suggestion),
+                        CompletionType::None => String::new(),
+                    };
+                    self.textarea.insert_str(&insert_text);
+                }
             }
         }
         self.cancel_completion();
@@ -926,10 +950,16 @@ impl App {
                     self.textarea.input(input);
                     let (row, col) = self.textarea.cursor();
                     let line = self.textarea.lines()[row].clone();
-                    if line.get(..col).map_or(false, |s| s.ends_with("[[")) {
+                    // Convert character index to byte index
+                    let col_bytes = line
+                        .char_indices()
+                        .nth(col)
+                        .map(|(i, _)| i)
+                        .unwrap_or(line.len());
+                    if line.get(..col_bytes).map_or(false, |s| s.ends_with("[[")) {
                         self.start_completion(CompletionType::File);
                         self.update_completion()?;
-                    } else if line.get(..col).map_or(false, |s| s.ends_with("#")) {
+                    } else if line.get(..col_bytes).map_or(false, |s| s.ends_with("#")) {
                         self.start_completion(CompletionType::Tag);
                         self.update_completion()?;
                     } else if self.completion_state.active {
@@ -942,12 +972,18 @@ impl App {
                     if self.completion_state.active {
                         let (row, col) = self.textarea.cursor();
                         let line = self.textarea.lines()[row].clone();
+                        // Convert character index to byte index
+                        let col_bytes = line
+                            .char_indices()
+                            .nth(col)
+                            .map(|(i, _)| i)
+                            .unwrap_or(line.len());
                         if self.completion_state.completion_type == CompletionType::File
-                            && !line.get(..col).map_or(false, |s| s.contains("[["))
+                            && !line.get(..col_bytes).map_or(false, |s| s.contains("[["))
                         {
                             self.cancel_completion();
                         } else if self.completion_state.completion_type == CompletionType::Tag
-                            && !line.get(..col).map_or(false, |s| s.contains("#"))
+                            && !line.get(..col_bytes).map_or(false, |s| s.contains("#"))
                         {
                             self.cancel_completion();
                         } else {
@@ -1019,12 +1055,18 @@ impl App {
                     self.textarea.input(input);
                     let (row, col) = self.textarea.cursor();
                     let line = self.textarea.lines()[row].clone();
+                    // Convert character index to byte index
+                    let col_bytes = line
+                        .char_indices()
+                        .nth(col)
+                        .map(|(i, _)| i)
+                        .unwrap_or(line.len());
                     if self.completion_state.completion_type == CompletionType::File
-                        && !line.get(..col).map_or(false, |s| s.contains("[["))
+                        && !line.get(..col_bytes).map_or(false, |s| s.contains("[["))
                     {
                         self.cancel_completion();
                     } else if self.completion_state.completion_type == CompletionType::Tag
-                        && !line.get(..col).map_or(false, |s| s.contains("#"))
+                        && !line.get(..col_bytes).map_or(false, |s| s.contains("#"))
                     {
                         self.cancel_completion();
                     } else {
