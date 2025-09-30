@@ -469,14 +469,25 @@ impl App {
 
         self.completion_state.query = query.clone();
         self.completion_state.suggestions = if query.len() >= 2 {
+            let search_pattern = format!("%{}%", query);
             let sql = match self.completion_state.completion_type {
-                CompletionType::File => "SELECT DISTINCT result FROM (SELECT path AS result FROM files UNION SELECT file_name FROM files UNION SELECT backlink FROM backlinks) WHERE result LIKE ? LIMIT 10;",
+                CompletionType::File => {
+                    "SELECT DISTINCT result FROM (
+                        SELECT file_name AS result FROM files WHERE file_name LIKE ?
+                        UNION
+                        SELECT backlink AS result FROM backlinks WHERE backlink LIKE ?
+                    ) LIMIT 10"
+                }
                 CompletionType::Tag => "SELECT tag FROM tags WHERE tag LIKE ? LIMIT 10",
                 CompletionType::None => return Ok(()),
             };
             let mut stmt = self.db.prepare(sql)?;
-            let search_pattern = format!("%{}%", query);
-            let rows = stmt.query_map(params![search_pattern], |row| row.get::<_, String>(0))?;
+            let closure = |row: &rusqlite::Row| row.get::<_, String>(0);
+            let rows = if self.completion_state.completion_type == CompletionType::File {
+                stmt.query_map(params![search_pattern, search_pattern], closure)?
+            } else {
+                stmt.query_map(params![search_pattern], closure)?
+            };
             rows.collect::<Result<Vec<_>, _>>()?
         } else {
             Vec::new()
