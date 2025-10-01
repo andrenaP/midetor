@@ -13,7 +13,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 use std::process::Command;
-use tui_textarea::{Input, Key, TextArea};
+use tui_textarea::{CursorMove, Input, Key, TextArea};
 
 #[derive(PartialEq)]
 pub enum Mode {
@@ -23,6 +23,9 @@ pub enum Mode {
     Complete,
     Search,
     TagFiles,
+    Visual,
+    VisualBlock,
+    BlockInsert,
 }
 
 #[derive(PartialEq)]
@@ -46,6 +49,12 @@ pub enum SearchType {
     Files,
 }
 
+#[derive(PartialEq, Clone, Debug)]
+pub enum InsertPosition {
+    Before,
+    After,
+}
+
 pub struct App {
     db: Connection,
     file_path: String,
@@ -66,6 +75,10 @@ pub struct App {
     key_sequence: String, // Tracks key sequence in Normal mode (e.g., "\", "\o", "\ob")
     tag_files: Vec<(String, i64)>, // Files associated with selected tag
     tag_files_state: ListState, // State for selecting tag files
+    yanked: Vec<String>,
+    visual_anchor: Option<(usize, usize)>,
+    insert_position: InsertPosition,
+    block_insert_col: usize,
 }
 
 pub struct CompletionState {
@@ -100,6 +113,7 @@ impl App {
         );
         textarea.set_cursor_line_style(Style::default());
         textarea.set_cursor_style(Style::default().bg(Color::White).fg(Color::Black));
+        textarea.set_selection_style(Style::default().bg(Color::LightBlue));
 
         let file_id = App::get_file_id(&db, file_path)?;
         let tags = App::load_tags(&db, file_id)?;
@@ -138,6 +152,10 @@ impl App {
             key_sequence: String::new(),
             tag_files: Vec::new(),
             tag_files_state: ListState::default(),
+            yanked: Vec::new(),
+            visual_anchor: None,
+            insert_position: InsertPosition::Before,
+            block_insert_col: 0,
         })
     }
 
@@ -258,6 +276,7 @@ impl App {
         );
         textarea.set_cursor_line_style(Style::default());
         textarea.set_cursor_style(Style::default().bg(Color::White).fg(Color::Black));
+        textarea.set_selection_style(Style::default().bg(Color::LightBlue));
         textarea.move_cursor(tui_textarea::CursorMove::Jump(0, 0)); // Reset cursor
                                                                     // Clear undo/redo history
         while textarea.undo() {}
@@ -538,6 +557,8 @@ impl App {
                     self.textarea.set_cursor_line_style(Style::default());
                     self.textarea
                         .set_cursor_style(Style::default().bg(Color::White).fg(Color::Black));
+                    self.textarea
+                        .set_selection_style(Style::default().bg(Color::LightBlue));
 
                     // Calculate new cursor position in characters (after the trigger)
                     let prefix_chars = current_line[..start].chars().count();
@@ -789,127 +810,67 @@ impl App {
     ) -> Result<(), EditorError> {
         match self.mode {
             Mode::Normal => {
-                let input = Input::from(event);
-                match input {
-                    Input {
-                        key: Key::Char('o'),
-                        ctrl: true,
-                        ..
-                    } => {
-                        self.navigate_back()?;
-                    }
-                    Input {
-                        key: Key::Char('i'),
-                        ctrl: true,
-                        ..
-                    } => {
-                        self.navigate_forward()?;
-                    }
-                    Input {
-                        key: Key::Char('r'),
-                        ctrl: true,
-                        ..
-                    } => {
-                        if self.textarea.redo() {
-                            self.status = "Redone".to_string();
-                        } else {
-                            self.status = "Nothing to redo".to_string();
-                        }
-                    }
-                    Input {
-                        key: Key::Char('u'),
-                        ..
-                    } => {
-                        if self.textarea.undo() {
-                            self.status = "Undone".to_string();
-                        } else {
-                            self.status = "Nothing to undo".to_string();
-                        }
-                    }
-                    Input {
-                        key: Key::Char('i'),
-                        ..
-                    } => {
-                        self.mode = Mode::Insert;
-                        self.status = "Insert".to_string();
-                    }
-                    Input {
-                        key: Key::Char(':'),
-                        ..
-                    } => {
-                        self.mode = Mode::Command;
-                        self.command.clear();
-                        self.status = "Command".to_string();
-                    }
-                    Input {
-                        key: Key::Char('j'),
-                        ..
-                    } => {
-                        self.textarea.move_cursor(tui_textarea::CursorMove::Down);
-                    }
-                    Input {
-                        key: Key::Char('k'),
-                        ..
-                    } => {
-                        self.textarea.move_cursor(tui_textarea::CursorMove::Up);
-                    }
-                    Input {
-                        key: Key::Char('h'),
-                        ..
-                    } => {
-                        self.textarea.move_cursor(tui_textarea::CursorMove::Back);
-                    }
-                    Input {
-                        key: Key::Char('l'),
-                        ..
-                    } => {
-                        self.textarea.move_cursor(tui_textarea::CursorMove::Forward);
-                    }
-                    Input { key: Key::Up, .. } => {
-                        self.textarea.move_cursor(tui_textarea::CursorMove::Up);
-                    }
-                    Input { key: Key::Down, .. } => {
-                        self.textarea.move_cursor(tui_textarea::CursorMove::Down);
-                    }
-                    Input { key: Key::Left, .. } => {
-                        self.textarea.move_cursor(tui_textarea::CursorMove::Back);
-                    }
-                    Input {
-                        key: Key::Right, ..
-                    } => {
-                        self.textarea.move_cursor(tui_textarea::CursorMove::Forward);
-                    }
-                    Input {
-                        key: Key::Char(c), ..
-                    } => {
+                // Handle key sequence first if it has started
+                if !self.key_sequence.is_empty() {
+                    if let ratatui::crossterm::event::KeyCode::Char(c) = event.code {
                         self.key_sequence.push(c);
-                        match self.key_sequence.as_str() {
+                        let sequence = self.key_sequence.clone(); // Clone to avoid borrow issues
+                        match sequence.as_str() {
+                            "gg" => {
+                                self.textarea.move_cursor(CursorMove::Top);
+                                self.key_sequence.clear();
+                                self.status = "Moved to top".to_string();
+                            }
+                            "yy" => {
+                                let row = self.textarea.cursor().0;
+                                self.yanked = vec![self.textarea.lines()[row].clone()];
+                                self.key_sequence.clear();
+                                self.status = "Yanked line (not undoable)".to_string();
+                            }
+                            "dd" => {
+                                self.textarea.move_cursor(CursorMove::Head);
+                                self.textarea.delete_line_by_end();
+                                self.key_sequence.clear();
+                                self.status = "Deleted line".to_string();
+                            }
                             "\\ob" => {
                                 self.start_search(SearchType::Backlinks)?;
+                                self.key_sequence.clear();
+                                self.status = "Started backlinks search".to_string();
                             }
                             "\\ot" => {
                                 self.start_search(SearchType::Tags)?;
+                                self.key_sequence.clear();
+                                self.status = "Started tags search".to_string();
                             }
                             "\\f" => {
                                 self.start_search(SearchType::Files)?;
+                                self.key_sequence.clear();
+                                self.status = "Started files search".to_string();
                             }
                             "\\oot" => {
                                 let today = Local::now()
                                     .format("Every day info/%Y-%m-%d.md")
                                     .to_string();
                                 self.open_wikilink_file(today)?;
+                                self.key_sequence.clear();
+                                self.status = "Opened today's file".to_string();
                             }
                             "\\ooy" => {
                                 let yesterday = (Local::now() - Duration::days(1))
                                     .format("Every day info/%Y-%m-%d.md")
                                     .to_string();
                                 self.open_wikilink_file(yesterday)?;
+                                self.key_sequence.clear();
+                                self.status = "Opened yesterday's file".to_string();
                             }
                             "\\ooT" => {
                                 let tomorrow = (Local::now() + Duration::days(1))
                                     .format("Every day info/%Y-%m-%d.md")
                                     .to_string();
                                 self.open_wikilink_file(tomorrow)?;
+                                self.key_sequence.clear();
+                                self.status = "Opened tomorrow's file".to_string();
                             }
                             s if !("\\ob".starts_with(s)
                                 || "\\ot".starts_with(s)
@@ -919,13 +880,154 @@ impl App {
                                 || "\\ooT".starts_with(s)) =>
                             {
                                 self.key_sequence.clear();
+                                self.status = format!("Invalid sequence 1: {}", s);
                             }
                             _ => {}
                         }
+                        return Ok(());
                     }
-                    Input {
-                        key: Key::Enter, ..
-                    } => {
+                }
+
+                // Handle single-key commands and other key events
+                match (event.code, event.modifiers) {
+                    (
+                        ratatui::crossterm::event::KeyCode::Char('o'),
+                        ratatui::crossterm::event::KeyModifiers::CONTROL,
+                    ) => {
+                        self.navigate_back()?;
+                    }
+                    (
+                        ratatui::crossterm::event::KeyCode::Char('i'),
+                        ratatui::crossterm::event::KeyModifiers::CONTROL,
+                    ) => {
+                        self.navigate_forward()?;
+                    }
+                    (
+                        ratatui::crossterm::event::KeyCode::Char('r'),
+                        ratatui::crossterm::event::KeyModifiers::CONTROL,
+                    ) => {
+                        if self.textarea.redo() {
+                            self.status = "Redone".to_string();
+                        } else {
+                            self.status = "Nothing to redo".to_string();
+                        }
+                    }
+                    (ratatui::crossterm::event::KeyCode::Char('u'), _) => {
+                        if self.textarea.undo() {
+                            self.status = "Undone".to_string();
+                        } else {
+                            self.status = "Nothing to undo".to_string();
+                        }
+                    }
+                    (ratatui::crossterm::event::KeyCode::Char('i'), _) => {
+                        self.mode = Mode::Insert;
+                        self.status = "Insert".to_string();
+                    }
+                    (ratatui::crossterm::event::KeyCode::Char('a'), _) => {
+                        self.textarea.move_cursor(CursorMove::Forward);
+                        self.mode = Mode::Insert;
+                        self.status = "Insert".to_string();
+                    }
+                    (ratatui::crossterm::event::KeyCode::Char('o'), _) => {
+                        self.textarea.move_cursor(CursorMove::End);
+                        self.textarea.insert_newline();
+                        self.mode = Mode::Insert;
+                        self.status = "Insert".to_string();
+                    }
+                    (
+                        ratatui::crossterm::event::KeyCode::Char('v'),
+                        ratatui::crossterm::event::KeyModifiers::CONTROL,
+                    ) => {
+                        self.visual_anchor = Some(self.textarea.cursor());
+                        self.mode = Mode::VisualBlock;
+                        self.status = "Visual Block".to_string();
+                    }
+                    (ratatui::crossterm::event::KeyCode::Char('v'), _) => {
+                        self.visual_anchor = Some(self.textarea.cursor());
+                        self.mode = Mode::Visual;
+                        self.status = "Visual".to_string();
+                    }
+                    (ratatui::crossterm::event::KeyCode::Char('x'), _) => {
+                        self.textarea.delete_next_char();
+                    }
+                    (ratatui::crossterm::event::KeyCode::Char('p'), _) => {
+                        self.textarea.move_cursor(CursorMove::End);
+                        self.textarea.insert_char('\n');
+                        self.textarea.insert_str(&self.yanked.join("\n"));
+                    }
+                    (ratatui::crossterm::event::KeyCode::Char(':'), _) => {
+                        self.mode = Mode::Command;
+                        self.command.clear();
+                        self.status = "Command".to_string();
+                    }
+                    (ratatui::crossterm::event::KeyCode::Char('j'), _) => {
+                        self.textarea.move_cursor(CursorMove::Down);
+                    }
+                    (ratatui::crossterm::event::KeyCode::Char('k'), _) => {
+                        self.textarea.move_cursor(CursorMove::Up);
+                    }
+                    (ratatui::crossterm::event::KeyCode::Char('h'), _) => {
+                        self.textarea.move_cursor(CursorMove::Back);
+                    }
+                    (ratatui::crossterm::event::KeyCode::Char('l'), _) => {
+                        self.textarea.move_cursor(CursorMove::Forward);
+                    }
+                    (ratatui::crossterm::event::KeyCode::Up, _) => {
+                        self.textarea.move_cursor(CursorMove::Up);
+                    }
+                    (ratatui::crossterm::event::KeyCode::Down, _) => {
+                        self.textarea.move_cursor(CursorMove::Down);
+                    }
+                    (
+                        ratatui::crossterm::event::KeyCode::Left,
+                        ratatui::crossterm::event::KeyModifiers::CONTROL,
+                    ) => {
+                        self.textarea.move_cursor(CursorMove::WordBack);
+                    }
+                    (
+                        ratatui::crossterm::event::KeyCode::Right,
+                        ratatui::crossterm::event::KeyModifiers::CONTROL,
+                    ) => {
+                        self.textarea.move_cursor(CursorMove::WordForward);
+                    }
+                    (ratatui::crossterm::event::KeyCode::Left, _) => {
+                        self.textarea.move_cursor(CursorMove::Back);
+                    }
+                    (ratatui::crossterm::event::KeyCode::Right, _) => {
+                        self.textarea.move_cursor(CursorMove::Forward);
+                    }
+                    (
+                        ratatui::crossterm::event::KeyCode::Home,
+                        ratatui::crossterm::event::KeyModifiers::CONTROL,
+                    ) => {
+                        self.textarea.move_cursor(CursorMove::Top);
+                    }
+                    (ratatui::crossterm::event::KeyCode::Home, _) => {
+                        self.textarea.move_cursor(CursorMove::Head);
+                    }
+                    (
+                        ratatui::crossterm::event::KeyCode::End,
+                        ratatui::crossterm::event::KeyModifiers::CONTROL,
+                    ) => {
+                        self.textarea.move_cursor(CursorMove::Bottom);
+                    }
+                    (ratatui::crossterm::event::KeyCode::End, _) => {
+                        self.textarea.move_cursor(CursorMove::End);
+                    }
+                    (ratatui::crossterm::event::KeyCode::Char('G'), _)
+                        if self.key_sequence.is_empty() =>
+                    {
+                        self.textarea.move_cursor(CursorMove::Bottom);
+                    }
+                    (ratatui::crossterm::event::KeyCode::Char(c), _) => {
+                        //TODO IF I DELETE THAT THAN gg dd and yy in not working.
+                        self.key_sequence.push(c);
+                        let sequence = self.key_sequence.clone(); // Clone to avoid borrow issues
+                        match sequence.as_str() {
+                            _ => {}
+                        }
+                    }
+                    (ratatui::crossterm::event::KeyCode::Enter, _) => {
                         if self.view == View::Editor {
                             let current_row = self.textarea.cursor().0;
                             let line = self.textarea.lines()[current_row].clone();
@@ -948,39 +1050,20 @@ impl App {
                             self.status = "Normal".to_string();
                         }
                     }
-                    _ => {}
-                }
-            }
-            Mode::Insert => match event.code {
-                ratatui::crossterm::event::KeyCode::Esc => {
-                    self.mode = Mode::Normal;
-                    self.status = "Normal".to_string();
-                }
-                ratatui::crossterm::event::KeyCode::Char(_) => {
-                    let input = Input::from(event);
-                    self.textarea.input(input);
-                    let (row, col) = self.textarea.cursor();
-                    let line = self.textarea.lines()[row].clone();
-                    // Convert character index to byte index
-                    let col_bytes = line
-                        .char_indices()
-                        .nth(col)
-                        .map(|(i, _)| i)
-                        .unwrap_or(line.len());
-                    if line.get(..col_bytes).map_or(false, |s| s.ends_with("[[")) {
-                        self.start_completion(CompletionType::File);
-                        self.update_completion()?;
-                    } else if line.get(..col_bytes).map_or(false, |s| s.ends_with("#")) {
-                        self.start_completion(CompletionType::Tag);
-                        self.update_completion()?;
-                    } else if self.completion_state.active {
-                        self.update_completion()?;
+                    _ => {
+                        self.status = format!("Unsupported key: {:?}", event.code);
                     }
                 }
-                ratatui::crossterm::event::KeyCode::Backspace => {
-                    let input = Input::from(event);
-                    self.textarea.input(input);
-                    if self.completion_state.active {
+            }
+            Mode::Insert => {
+                let input = Input::from(event);
+                match event.code {
+                    ratatui::crossterm::event::KeyCode::Esc => {
+                        self.mode = Mode::Normal;
+                        self.status = "Normal".to_string();
+                    }
+                    ratatui::crossterm::event::KeyCode::Char(_) => {
+                        self.textarea.input(input);
                         let (row, col) = self.textarea.cursor();
                         let line = self.textarea.lines()[row].clone();
                         // Convert character index to byte index
@@ -989,27 +1072,48 @@ impl App {
                             .nth(col)
                             .map(|(i, _)| i)
                             .unwrap_or(line.len());
-                        if self.completion_state.completion_type == CompletionType::File
-                            && !line.get(..col_bytes).map_or(false, |s| s.contains("[["))
-                        {
-                            self.cancel_completion();
-                        } else if self.completion_state.completion_type == CompletionType::Tag
-                            && !line.get(..col_bytes).map_or(false, |s| s.contains("#"))
-                        {
-                            self.cancel_completion();
-                        } else {
+                        if line.get(..col_bytes).map_or(false, |s| s.ends_with("[[")) {
+                            self.start_completion(CompletionType::File);
+                            self.update_completion()?;
+                        } else if line.get(..col_bytes).map_or(false, |s| s.ends_with("#")) {
+                            self.start_completion(CompletionType::Tag);
+                            self.update_completion()?;
+                        } else if self.completion_state.active {
+                            self.update_completion()?;
+                        }
+                    }
+                    ratatui::crossterm::event::KeyCode::Backspace => {
+                        self.textarea.input(input);
+                        if self.completion_state.active {
+                            let (row, col) = self.textarea.cursor();
+                            let line = self.textarea.lines()[row].clone();
+                            // Convert character index to byte index
+                            let col_bytes = line
+                                .char_indices()
+                                .nth(col)
+                                .map(|(i, _)| i)
+                                .unwrap_or(line.len());
+                            if self.completion_state.completion_type == CompletionType::File
+                                && !line.get(..col_bytes).map_or(false, |s| s.contains("[["))
+                            {
+                                self.cancel_completion();
+                            } else if self.completion_state.completion_type == CompletionType::Tag
+                                && !line.get(..col_bytes).map_or(false, |s| s.contains("#"))
+                            {
+                                self.cancel_completion();
+                            } else {
+                                self.update_completion()?;
+                            }
+                        }
+                    }
+                    _ => {
+                        self.textarea.input(input);
+                        if self.completion_state.active {
                             self.update_completion()?;
                         }
                     }
                 }
-                _ => {
-                    let input = Input::from(event);
-                    self.textarea.input(input);
-                    if self.completion_state.active {
-                        self.update_completion()?;
-                    }
-                }
-            },
+            }
             Mode::Command => match event.code {
                 ratatui::crossterm::event::KeyCode::Esc => {
                     self.mode = Mode::Normal;
@@ -1136,6 +1240,319 @@ impl App {
                 }
                 _ => {}
             },
+            Mode::Visual | Mode::VisualBlock => {
+                let mut input = Input::from(event);
+                match input.key {
+                    Key::Esc => {
+                        self.textarea.cancel_selection();
+                        self.visual_anchor = None;
+                        self.mode = Mode::Normal;
+                        self.status = "Normal".to_string();
+                    }
+                    Key::Char('y') => {
+                        let (min_row, min_col, max_row, max_col) =
+                            if let Some(anchor) = self.visual_anchor {
+                                let cursor = self.textarea.cursor();
+                                (
+                                    anchor.0.min(cursor.0),
+                                    anchor.1.min(cursor.1),
+                                    anchor.0.max(cursor.0),
+                                    anchor.1.max(cursor.1),
+                                )
+                            } else {
+                                return Ok(());
+                            };
+                        if self.mode == Mode::VisualBlock {
+                            self.yanked = (min_row..=max_row)
+                                .map(|row| {
+                                    let line = &self.textarea.lines()[row];
+                                    let start_byte = line
+                                        .char_indices()
+                                        .nth(min_col)
+                                        .map(|(b, _)| b)
+                                        .unwrap_or(line.len());
+                                    let end_byte = line
+                                        .char_indices()
+                                        .nth(max_col + 1)
+                                        .map(|(b, _)| b)
+                                        .unwrap_or(line.len());
+                                    line[start_byte..end_byte].to_string()
+                                })
+                                .collect();
+                        } else {
+                            if let Some(range) = self.textarea.selection_range() {
+                                let start_row = range.0 .0;
+                                let start_col = range.0 .1;
+                                let end_row = range.1 .0;
+                                let end_col = range.1 .1;
+                                if start_row == end_row {
+                                    let line = self.textarea.lines()[start_row].clone();
+                                    let start_byte = line
+                                        .char_indices()
+                                        .nth(start_col)
+                                        .map(|(b, _)| b)
+                                        .unwrap_or(0);
+                                    let end_byte = line
+                                        .char_indices()
+                                        .nth(end_col)
+                                        .map(|(b, _)| b)
+                                        .unwrap_or(line.len());
+                                    self.yanked = vec![line[start_byte..end_byte].to_string()];
+                                } else {
+                                    let mut yanked = Vec::new();
+                                    for row in start_row..=end_row {
+                                        let line = self.textarea.lines()[row].clone();
+                                        if row == start_row {
+                                            let start_byte = line
+                                                .char_indices()
+                                                .nth(start_col)
+                                                .map(|(b, _)| b)
+                                                .unwrap_or(0);
+                                            yanked.push(line[start_byte..].to_string());
+                                        } else if row == end_row {
+                                            let end_byte = line
+                                                .char_indices()
+                                                .nth(end_col)
+                                                .map(|(b, _)| b)
+                                                .unwrap_or(line.len());
+                                            yanked.push(line[..end_byte].to_string());
+                                        } else {
+                                            yanked.push(line);
+                                        }
+                                    }
+                                    self.yanked = yanked;
+                                }
+                            }
+                        }
+                        self.textarea.cancel_selection();
+                        self.visual_anchor = None;
+                        self.mode = Mode::Normal;
+                        self.status = "Yanked (not undoable)".to_string();
+                    }
+                    Key::Char('x') | Key::Char('d') => {
+                        let (min_row, min_col, max_row, max_col) =
+                            if let Some(anchor) = self.visual_anchor {
+                                let cursor = self.textarea.cursor();
+                                (
+                                    anchor.0.min(cursor.0),
+                                    anchor.1.min(cursor.1),
+                                    anchor.0.max(cursor.0),
+                                    anchor.1.max(cursor.1),
+                                )
+                            } else {
+                                return Ok(());
+                            };
+                        if self.mode == Mode::VisualBlock {
+                            for row in (min_row..=max_row).rev() {
+                                let line = self.textarea.lines()[row].clone();
+                                let start_byte = line
+                                    .char_indices()
+                                    .nth(min_col)
+                                    .map(|(b, _)| b)
+                                    .unwrap_or(line.len());
+                                let end_byte = line
+                                    .char_indices()
+                                    .nth(max_col + 1)
+                                    .map(|(b, _)| b)
+                                    .unwrap_or(line.len());
+                                let new_line =
+                                    format!("{}{}", &line[0..start_byte], &line[end_byte..]);
+                                self.textarea.move_cursor(CursorMove::Jump(row as u16, 0));
+                                self.textarea.delete_line_by_end();
+                                self.textarea.insert_str(&new_line);
+                            }
+                            self.textarea
+                                .move_cursor(CursorMove::Jump(min_row as u16, min_col as u16));
+                        } else {
+                            // Custom delete selection logic
+                            if let Some(range) = self.textarea.selection_range() {
+                                let start_row = range.0 .0;
+                                let start_col = range.0 .1;
+                                let end_row = range.1 .0;
+                                let end_col = range.1 .1;
+                                let mut new_lines = self.textarea.lines().to_vec();
+                                if start_row == end_row {
+                                    let line = new_lines[start_row].clone();
+                                    let start_byte = line
+                                        .char_indices()
+                                        .nth(start_col)
+                                        .map(|(b, _)| b)
+                                        .unwrap_or(0);
+                                    let end_byte = line
+                                        .char_indices()
+                                        .nth(end_col)
+                                        .map(|(b, _)| b)
+                                        .unwrap_or(line.len());
+                                    new_lines[start_row] =
+                                        format!("{}{}", &line[..start_byte], &line[end_byte..]);
+                                } else {
+                                    // Delete from start_row to end_row
+                                    let first_line = new_lines[start_row].clone();
+                                    let last_line = new_lines[end_row].clone();
+                                    let start_byte = first_line
+                                        .char_indices()
+                                        .nth(start_col)
+                                        .map(|(b, _)| b)
+                                        .unwrap_or(0);
+                                    let end_byte = last_line
+                                        .char_indices()
+                                        .nth(end_col)
+                                        .map(|(b, _)| b)
+                                        .unwrap_or(last_line.len());
+                                    new_lines[start_row] = format!(
+                                        "{}{}",
+                                        &first_line[..start_byte],
+                                        &last_line[end_byte..]
+                                    );
+                                    new_lines.drain((start_row + 1)..=end_row);
+                                }
+                                self.textarea = TextArea::new(new_lines);
+                                self.textarea.set_block(
+                                    Block::default()
+                                        .borders(Borders::ALL)
+                                        .title("Markdown Editor")
+                                        .style(Style::default().fg(Color::White)),
+                                );
+                                self.textarea.set_cursor_line_style(Style::default());
+                                self.textarea.set_cursor_style(
+                                    Style::default().bg(Color::White).fg(Color::Black),
+                                );
+                                self.textarea
+                                    .set_selection_style(Style::default().bg(Color::LightBlue));
+                                self.textarea.move_cursor(CursorMove::Jump(
+                                    start_row as u16,
+                                    start_col as u16,
+                                ));
+                            }
+                        }
+                        self.visual_anchor = None;
+                        self.mode = Mode::Normal;
+                        self.status = "Deleted".to_string();
+                    }
+                    Key::Char('I') if self.mode == Mode::VisualBlock => {
+                        self.insert_position = InsertPosition::Before;
+                        let (min_row, min_col, _, _) = if let Some(anchor) = self.visual_anchor {
+                            let cursor = self.textarea.cursor();
+                            (
+                                anchor.0.min(cursor.0),
+                                anchor.1.min(cursor.1),
+                                anchor.0.max(cursor.0),
+                                anchor.1.max(cursor.1),
+                            )
+                        } else {
+                            return Ok(());
+                        };
+                        self.block_insert_col = min_col;
+                        self.textarea.cancel_selection();
+                        self.textarea
+                            .move_cursor(CursorMove::Jump(min_row as u16, min_col as u16));
+                        self.mode = Mode::BlockInsert;
+                        self.status = "Block Insert Before".to_string();
+                    }
+                    Key::Char('A') if self.mode == Mode::VisualBlock => {
+                        self.insert_position = InsertPosition::After;
+                        let (min_row, _, _, max_col) = if let Some(anchor) = self.visual_anchor {
+                            let cursor = self.textarea.cursor();
+                            (
+                                anchor.0.min(cursor.0),
+                                anchor.1.min(cursor.1),
+                                anchor.0.max(cursor.0),
+                                anchor.1.max(cursor.1),
+                            )
+                        } else {
+                            return Ok(());
+                        };
+                        self.block_insert_col = max_col + 1;
+                        self.textarea.cancel_selection();
+                        self.textarea.move_cursor(CursorMove::Jump(
+                            min_row as u16,
+                            self.block_insert_col as u16,
+                        ));
+                        self.mode = Mode::BlockInsert;
+                        self.status = "Block Insert After".to_string();
+                    }
+                    _ => {
+                        input.shift = true;
+                        self.textarea.input(input);
+                    }
+                }
+            }
+            Mode::BlockInsert => {
+                let input = Input::from(event);
+                let (min_row, min_col, max_row, max_col) = if let Some(anchor) = self.visual_anchor
+                {
+                    let cursor = self.textarea.cursor();
+                    (
+                        anchor.0.min(cursor.0),
+                        anchor.1.min(cursor.1),
+                        anchor.0.max(cursor.0),
+                        anchor.1.max(cursor.1),
+                    )
+                } else {
+                    return Ok(());
+                };
+                let original_col = match self.insert_position {
+                    InsertPosition::Before => min_col,
+                    InsertPosition::After => max_col + 1,
+                };
+                match event.code {
+                    ratatui::crossterm::event::KeyCode::Esc => {
+                        self.visual_anchor = None;
+                        self.mode = Mode::Normal;
+                        self.status = "Normal".to_string();
+                    }
+                    ratatui::crossterm::event::KeyCode::Char(c) => {
+                        for row in min_row..=max_row {
+                            let line = self.textarea.lines()[row].clone();
+                            let target_col = self.block_insert_col;
+                            let start_byte = line
+                                .char_indices()
+                                .nth(target_col)
+                                .map(|(b, _)| b)
+                                .unwrap_or(line.len());
+                            let mut new_line = line.clone();
+                            if target_col > line.len() {
+                                new_line.push_str(&" ".repeat(target_col - line.len()));
+                            }
+                            new_line.insert_str(start_byte, &c.to_string());
+                            self.textarea.move_cursor(CursorMove::Jump(row as u16, 0));
+                            self.textarea.delete_line_by_end();
+                            self.textarea.insert_str(&new_line);
+                        }
+                        self.block_insert_col += 1;
+                        self.textarea.move_cursor(CursorMove::Jump(
+                            min_row as u16,
+                            self.block_insert_col as u16,
+                        ));
+                    }
+                    ratatui::crossterm::event::KeyCode::Backspace => {
+                        if self.block_insert_col > original_col {
+                            self.block_insert_col -= 1;
+                            for row in min_row..=max_row {
+                                let line = self.textarea.lines()[row].clone();
+                                let target_col = self.block_insert_col;
+                                let start_byte = line
+                                    .char_indices()
+                                    .nth(target_col)
+                                    .map(|(b, _)| b)
+                                    .unwrap_or(line.len());
+                                let mut new_line = line.clone();
+                                if target_col < new_line.len() {
+                                    new_line.remove(start_byte);
+                                }
+                                self.textarea.move_cursor(CursorMove::Jump(row as u16, 0));
+                                self.textarea.delete_line_by_end();
+                                self.textarea.insert_str(&new_line);
+                            }
+                            self.textarea.move_cursor(CursorMove::Jump(
+                                min_row as u16,
+                                self.block_insert_col as u16,
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
         Ok(())
     }
@@ -1210,7 +1627,13 @@ impl App {
                 };
                 f.render_stateful_widget(list, popup_area, &mut self.tag_files_state);
             }
-            Mode::Normal | Mode::Insert | Mode::Complete | Mode::Command => match self.view {
+            Mode::Normal
+            | Mode::Insert
+            | Mode::Complete
+            | Mode::Command
+            | Mode::Visual
+            | Mode::VisualBlock
+            | Mode::BlockInsert => match self.view {
                 View::Editor => {
                     f.render_widget(&self.textarea, chunks[0]);
                     if self.completion_state.active && !self.completion_state.suggestions.is_empty()

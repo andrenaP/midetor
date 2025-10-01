@@ -7,7 +7,7 @@ edition = "2021"
 crossterm = "0.27"
 rusqlite = { version = "0.31", features = ["bundled"] }
 thiserror = "1.0"
-tui-textarea = "0.6"
+tui-textarea = "0.6.1"
 ratatui = "0.28.1"
 chrono = "0.4"
 

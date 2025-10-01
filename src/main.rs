@@ -59,6 +59,8 @@ fn main() -> Result<(), EditorError> {
                     crossterm::event::KeyCode::Right => ratatui::crossterm::event::KeyCode::Right,
                     crossterm::event::KeyCode::Up => ratatui::crossterm::event::KeyCode::Up,
                     crossterm::event::KeyCode::Down => ratatui::crossterm::event::KeyCode::Down,
+                    crossterm::event::KeyCode::Home => ratatui::crossterm::event::KeyCode::Home,
+                    crossterm::event::KeyCode::End => ratatui::crossterm::event::KeyCode::End,
                     other => {
                         eprintln!("Unsupported key: {:?}", other);
                         continue;
