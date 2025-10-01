@@ -4,18 +4,17 @@ version = "0.3.0"
 edition = "2021"
 
 [dependencies]
-crossterm = "0.27"
+crossterm = "0.27.0"
 rusqlite = { version = "0.31", features = ["bundled"] }
 thiserror = "1.0"
-tui-textarea = "0.6.1"
-ratatui = "0.28.1"
+tui-textarea = "0.7.0"
+ratatui = "0.29.0" # Updated to match tui-textarea 0.7.0 dependency
 chrono = "0.4"
 
 [profile.release]
 panic = "abort"
 opt-level = "z"
 codegen-units = 1
-#rustflags = ["-C", "target-cpu=native"]
 lto = "fat"
 debug = false
 strip = "symbols"

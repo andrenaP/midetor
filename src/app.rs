@@ -1603,6 +1603,8 @@ impl App {
                     width: 50,
                     height: (self.search_state.results.len().min(10) + 2) as u16,
                 };
+                // Clear the popup area to avoid background artifacts
+                // f.render_widget(Clear, popup_area);
                 f.render_stateful_widget(list, popup_area, &mut self.search_state.list_state);
             }
             Mode::TagFiles => {
@@ -1625,6 +1627,8 @@ impl App {
                     width: 50,
                     height: (self.tag_files.len().min(10) + 2) as u16,
                 };
+                // Clear the popup area to avoid background artifacts
+                // f.render_widget(Clear, popup_area);
                 f.render_stateful_widget(list, popup_area, &mut self.tag_files_state);
             }
             Mode::Normal
@@ -1653,24 +1657,21 @@ impl App {
                                         CompletionType::Tag => "Tags",
                                         CompletionType::None => "",
                                     })
-                                    .style(Style::default().fg(Color::White)),
+                                    .style(Style::default().fg(Color::White).bg(Color::Black)), // .bg(Color::Black), // Set background to avoid transparency
                             )
                             .highlight_style(Style::default().bg(Color::White).fg(Color::Black));
-                        // Position the popup just below the cursor, assuming it's in the viewport
-                        let cursor_row = self.textarea.cursor().0 as u16;
-                        // Use a fixed offset from the top of the TextArea widget
-                        let popup_y = chunks[0].y + 2; // Fixed position near the top of the widget
-                                                       // Ensure the popup doesn't go off-screen
-                        let max_y = chunks[0].y
-                            + chunks[0].height.saturating_sub(
-                                (self.completion_state.suggestions.len().min(5) + 2) as u16,
-                            );
+                        // Position the popup in the top-right corner
+                        let popup_width = 40;
+                        let popup_height =
+                            (self.completion_state.suggestions.len().min(5) + 2) as u16;
                         let popup_area = Rect {
-                            x: chunks[0].x + 2,
-                            y: popup_y.min(max_y),
-                            width: 40,
-                            height: (self.completion_state.suggestions.len().min(5) + 2) as u16,
+                            x: chunks[0].x + chunks[0].width.saturating_sub(popup_width),
+                            y: chunks[0].y + 1,
+                            width: popup_width,
+                            height: popup_height,
                         };
+                        // Clear the popup area to avoid background artifacts
+                        // f.render_widget(Clear, popup_area);
                         f.render_stateful_widget(
                             list,
                             popup_area,
