@@ -1656,9 +1656,18 @@ impl App {
                                     .style(Style::default().fg(Color::White)),
                             )
                             .highlight_style(Style::default().bg(Color::White).fg(Color::Black));
+                        // Position the popup just below the cursor, assuming it's in the viewport
+                        let cursor_row = self.textarea.cursor().0 as u16;
+                        // Use a fixed offset from the top of the TextArea widget
+                        let popup_y = chunks[0].y + 2; // Fixed position near the top of the widget
+                                                       // Ensure the popup doesn't go off-screen
+                        let max_y = chunks[0].y
+                            + chunks[0].height.saturating_sub(
+                                (self.completion_state.suggestions.len().min(5) + 2) as u16,
+                            );
                         let popup_area = Rect {
                             x: chunks[0].x + 2,
-                            y: chunks[0].y + self.textarea.cursor().0 as u16 + 2,
+                            y: popup_y.min(max_y),
                             width: 40,
                             height: (self.completion_state.suggestions.len().min(5) + 2) as u16,
                         };
