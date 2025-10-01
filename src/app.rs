@@ -1646,7 +1646,7 @@ impl App {
                             .completion_state
                             .suggestions
                             .iter()
-                            .map(|s| ListItem::new(s.clone()))
+                            .map(|s| ListItem::new(format!("{s}{}", " ".repeat(50))))
                             .collect();
                         let list = List::new(items)
                             .block(
