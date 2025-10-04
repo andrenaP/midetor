@@ -89,7 +89,7 @@ pub struct App {
     // Syntax highlighting fields
     syntax_set: SyntaxSet,
     theme: Theme, // Use Box to ensure 'static lifetime
-                  // highlighter: HighlightLines<'static>,
+    scroll_offset: usize,
 }
 
 pub struct CompletionState {
@@ -175,7 +175,7 @@ impl App {
             block_insert_col: 0,
             syntax_set,
             theme,
-            // highlighter,
+            scroll_offset: 0, // Initialize scroll offset
         })
     }
 
@@ -994,6 +994,7 @@ impl App {
                     }
                     (ratatui::crossterm::event::KeyCode::Up, _) => {
                         self.textarea.move_cursor(CursorMove::Up);
+                        // self.scroll_offset = self.scroll_offset.saturating_sub(1);
                     }
                     (ratatui::crossterm::event::KeyCode::Down, _) => {
                         self.textarea.move_cursor(CursorMove::Down);
@@ -1670,34 +1671,111 @@ impl App {
                     let mut highlighter = HighlightLines::new(syntax, &self.theme);
                     let mut highlighted_lines = Vec::new();
 
-                    for line in LinesWithEndings::from(&text) {
+                    // Get selection range for Visual/VisualBlock modes
+                    let selection_range = match self.mode {
+                        Mode::Visual | Mode::VisualBlock => self.visual_anchor.map(|anchor| {
+                            let cursor = self.textarea.cursor();
+                            let start_row = anchor.0.min(cursor.0);
+                            let end_row = anchor.0.max(cursor.0);
+                            let start_col = if anchor.0 == start_row {
+                                anchor.1
+                            } else {
+                                cursor.1
+                            };
+                            let end_col = if anchor.0 == end_row {
+                                anchor.1
+                            } else {
+                                cursor.1
+                            };
+                            ((start_row, start_col), (end_row, end_col))
+                        }),
+                        _ => None,
+                    };
+
+                    for (row, line) in LinesWithEndings::from(&text).enumerate() {
                         let ranges = highlighter
                             .highlight_line(line, &self.syntax_set)
                             .map_err(|e| EditorError::SyntaxHighlighting(e.to_string()))?;
-                        let spans: Vec<Span> = ranges
-                            .into_iter()
-                            .map(|(style, text)| {
-                                let color = Color::Rgb(
-                                    style.foreground.r,
-                                    style.foreground.g,
-                                    style.foreground.b,
-                                );
-                                Span::styled(text.to_string(), Style::default().fg(color))
-                            })
-                            .collect();
+                        let mut spans: Vec<Span> = Vec::new();
+                        let mut col = 0;
+
+                        for (style, text) in ranges {
+                            let color = Color::Rgb(
+                                style.foreground.r,
+                                style.foreground.g,
+                                style.foreground.b,
+                            );
+                            let text_len = text.chars().count();
+                            let mut span_style = Style::default().fg(color);
+
+                            // Apply selection styling if within range
+                            if let Some(((start_row, start_col), (end_row, end_col))) =
+                                selection_range
+                            {
+                                if (row > start_row || (row == start_row && col >= start_col))
+                                    && (row < end_row || (row == end_row && col < end_col))
+                                {
+                                    span_style = span_style.bg(Color::LightBlue);
+                                    // Selection highlight
+                                }
+                            }
+
+                            spans.push(Span::styled(text.to_string(), span_style));
+                            col += text_len;
+                        }
                         highlighted_lines.push(Line::from(spans));
                     }
 
+                    // Calculate scroll offset to keep cursor in view only at edges
+                    let cursor_row = self.textarea.cursor().0;
+                    let area_height = chunks[0].height.saturating_sub(2) as usize; // Subtract borders
+                    let visible_lines = area_height.min(highlighted_lines.len());
+
+                    // Only scroll if cursor is outside the visible viewport
+                    if cursor_row < self.scroll_offset {
+                        self.scroll_offset = cursor_row;
+                    } else if cursor_row >= self.scroll_offset + visible_lines {
+                        self.scroll_offset = cursor_row - (visible_lines - 1);
+                    }
+
+                    // Ensure scroll_offset doesn't exceed document bounds
+                    self.scroll_offset = self
+                        .scroll_offset
+                        .min(highlighted_lines.len().saturating_sub(visible_lines));
+
+                    // Slice the highlighted lines to display only the visible portion
+                    let start_line = self.scroll_offset;
+                    let end_line =
+                        (self.scroll_offset + visible_lines).min(highlighted_lines.len());
+                    let visible_text = highlighted_lines[start_line..end_line].to_vec();
+
+                    // Render the text
                     let block = self.textarea.block().cloned().unwrap_or_default();
-                    let paragraph = Paragraph::new(highlighted_lines)
+                    let paragraph = Paragraph::new(visible_text)
                         .block(block)
                         .style(self.textarea.style());
                     f.render_widget(paragraph, chunks[0]);
 
-                    // After f.render_widget(paragraph, chunks[0]);
-                    let cursor_pos = self.textarea.cursor();
-                    // Draw cursor as a styled Span or Rect at cursor_pos
+                    // Render custom cursor
+                    let cursor_col = self.textarea.cursor().1;
+                    if cursor_row >= self.scroll_offset
+                        && cursor_row < self.scroll_offset + visible_lines
+                    {
+                        let screen_row = (cursor_row - self.scroll_offset) as u16;
+                        let max_width = chunks[0].width.saturating_sub(2) as usize; // Subtract borders
+                        let cursor_x = (cursor_col as u16).min(max_width as u16); // Clamp cursor x
+                        let cursor_area = Rect {
+                            x: chunks[0].x + 1 + cursor_x,
+                            y: chunks[0].y + 1 + screen_row,
+                            width: 1,
+                            height: 1,
+                        };
+                        let cursor_span =
+                            Span::styled(" ", Style::default().bg(Color::White).fg(Color::Black));
+                        f.render_widget(Paragraph::new(cursor_span), cursor_area);
+                    }
 
+                    // Render completion popup if active
                     if self.completion_state.active && !self.completion_state.suggestions.is_empty()
                     {
                         let items: Vec<ListItem> = self
