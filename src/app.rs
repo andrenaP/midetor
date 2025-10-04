@@ -90,6 +90,7 @@ pub struct App {
     syntax_set: SyntaxSet,
     theme: Theme, // Use Box to ensure 'static lifetime
     scroll_offset: usize,
+    horizontal_scroll_offset: usize, // New: Horizontal scroll
 }
 
 pub struct CompletionState {
@@ -175,7 +176,8 @@ impl App {
             block_insert_col: 0,
             syntax_set,
             theme,
-            scroll_offset: 0, // Initialize scroll offset
+            scroll_offset: 0,            // Initialize scroll offset
+            horizontal_scroll_offset: 0, // Initialize horizontal scroll
         })
     }
 
@@ -1726,28 +1728,61 @@ impl App {
                         highlighted_lines.push(Line::from(spans));
                     }
 
-                    // Calculate scroll offset to keep cursor in view only at edges
+                    // Calculate scroll offsets
                     let cursor_row = self.textarea.cursor().0;
+                    let cursor_col = self.textarea.cursor().1;
                     let area_height = chunks[0].height.saturating_sub(2) as usize; // Subtract borders
+                    let area_width = chunks[0].width.saturating_sub(2) as usize; // Subtract borders
                     let visible_lines = area_height.min(highlighted_lines.len());
 
-                    // Only scroll if cursor is outside the visible viewport
+                    // Vertical scrolling: only when cursor is outside visible area
                     if cursor_row < self.scroll_offset {
                         self.scroll_offset = cursor_row;
                     } else if cursor_row >= self.scroll_offset + visible_lines {
                         self.scroll_offset = cursor_row - (visible_lines - 1);
                     }
-
-                    // Ensure scroll_offset doesn't exceed document bounds
                     self.scroll_offset = self
                         .scroll_offset
                         .min(highlighted_lines.len().saturating_sub(visible_lines));
 
-                    // Slice the highlighted lines to display only the visible portion
+                    // Horizontal scrolling: only when cursor is outside visible width
+                    if cursor_col < self.horizontal_scroll_offset {
+                        self.horizontal_scroll_offset = cursor_col;
+                    } else if cursor_col >= self.horizontal_scroll_offset + area_width {
+                        self.horizontal_scroll_offset = cursor_col - (area_width - 1);
+                    }
+
+                    // Slice lines and apply horizontal scrolling
                     let start_line = self.scroll_offset;
                     let end_line =
                         (self.scroll_offset + visible_lines).min(highlighted_lines.len());
-                    let visible_text = highlighted_lines[start_line..end_line].to_vec();
+                    let mut visible_text = Vec::new();
+                    for line in highlighted_lines[start_line..end_line].iter() {
+                        let mut new_spans = Vec::new();
+                        let mut col = 0;
+                        for span in &line.spans {
+                            let text = span.content.as_ref();
+                            let span_len = text.chars().count();
+                            let span_start = col;
+                            let span_end = col + span_len;
+
+                            if span_end > self.horizontal_scroll_offset {
+                                let start_char = if span_start < self.horizontal_scroll_offset {
+                                    self.horizontal_scroll_offset - span_start
+                                } else {
+                                    0
+                                };
+                                let text_chars: Vec<char> = text.chars().collect();
+                                let sliced_text =
+                                    text_chars[start_char..].iter().collect::<String>();
+                                if !sliced_text.is_empty() {
+                                    new_spans.push(Span::styled(sliced_text, span.style));
+                                }
+                            }
+                            col += span_len;
+                        }
+                        visible_text.push(Line::from(new_spans));
+                    }
 
                     // Render the text
                     let block = self.textarea.block().cloned().unwrap_or_default();
@@ -1757,13 +1792,14 @@ impl App {
                     f.render_widget(paragraph, chunks[0]);
 
                     // Render custom cursor
-                    let cursor_col = self.textarea.cursor().1;
                     if cursor_row >= self.scroll_offset
                         && cursor_row < self.scroll_offset + visible_lines
                     {
                         let screen_row = (cursor_row - self.scroll_offset) as u16;
-                        let max_width = chunks[0].width.saturating_sub(2) as usize; // Subtract borders
-                        let cursor_x = (cursor_col as u16).min(max_width as u16); // Clamp cursor x
+                        let screen_col =
+                            (cursor_col.saturating_sub(self.horizontal_scroll_offset)) as u16;
+                        let max_width = area_width as u16;
+                        let cursor_x = screen_col.min(max_width); // Clamp cursor x
                         let cursor_area = Rect {
                             x: chunks[0].x + 1 + cursor_x,
                             y: chunks[0].y + 1 + screen_row,
