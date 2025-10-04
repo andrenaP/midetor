@@ -10,6 +10,7 @@ thiserror = "1.0"
 tui-textarea = "0.7.0"
 ratatui = "0.29.0" # Updated to match tui-textarea 0.7.0 dependency
 chrono = "0.4"
+syntect = "5.3.0"
 
 [profile.release]
 panic = "abort"

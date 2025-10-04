@@ -4,6 +4,7 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
+    text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
     Frame, Terminal,
 };
@@ -13,6 +14,12 @@ use std::fs;
 use std::io;
 use std::path::Path;
 use std::process::Command;
+use syntect::{
+    easy::HighlightLines,
+    highlighting::{Theme, ThemeSet},
+    parsing::SyntaxSet,
+    util::LinesWithEndings,
+};
 use tui_textarea::{CursorMove, Input, Key, TextArea};
 
 #[derive(PartialEq)]
@@ -79,6 +86,10 @@ pub struct App {
     visual_anchor: Option<(usize, usize)>,
     insert_position: InsertPosition,
     block_insert_col: usize,
+    // Syntax highlighting fields
+    syntax_set: SyntaxSet,
+    theme: Theme, // Use Box to ensure 'static lifetime
+                  // highlighter: HighlightLines<'static>,
 }
 
 pub struct CompletionState {
@@ -119,6 +130,12 @@ impl App {
         let tags = App::load_tags(&db, file_id)?;
         let backlinks = App::load_backlinks(&db, file_id)?;
 
+        // Initialize syntax highlighting
+        let syntax_set = SyntaxSet::load_defaults_newlines();
+        let theme_set = ThemeSet::load_defaults(); // Load ThemeSet
+        let theme = theme_set.themes["base16-eighties.dark"].clone();
+        // let highlighter = HighlightLines::new(syntax, &theme); // Use reference to boxed Theme
+
         Ok(App {
             db,
             file_path: file_path.to_string(),
@@ -156,6 +173,9 @@ impl App {
             visual_anchor: None,
             insert_position: InsertPosition::Before,
             block_insert_col: 0,
+            syntax_set,
+            theme,
+            // highlighter,
         })
     }
 
@@ -1561,11 +1581,15 @@ impl App {
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     ) -> Result<(), EditorError> {
-        terminal.draw(|f| self.draw(f))?;
+        terminal.draw(|f| {
+            if let Err(e) = self.draw(f) {
+                self.status = format!("Render error: {}", e);
+            }
+        })?;
         Ok(())
     }
 
-    fn draw(&mut self, f: &mut Frame) {
+    fn draw(&mut self, f: &mut Frame) -> Result<(), EditorError> {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -1603,8 +1627,6 @@ impl App {
                     width: 50,
                     height: (self.search_state.results.len().min(10) + 2) as u16,
                 };
-                // Clear the popup area to avoid background artifacts
-                // f.render_widget(Clear, popup_area);
                 f.render_stateful_widget(list, popup_area, &mut self.search_state.list_state);
             }
             Mode::TagFiles => {
@@ -1627,8 +1649,6 @@ impl App {
                     width: 50,
                     height: (self.tag_files.len().min(10) + 2) as u16,
                 };
-                // Clear the popup area to avoid background artifacts
-                // f.render_widget(Clear, popup_area);
                 f.render_stateful_widget(list, popup_area, &mut self.tag_files_state);
             }
             Mode::Normal
@@ -1639,7 +1659,45 @@ impl App {
             | Mode::VisualBlock
             | Mode::BlockInsert => match self.view {
                 View::Editor => {
-                    f.render_widget(&self.textarea, chunks[0]);
+                    // Apply syntax highlighting
+                    let text = self.textarea.lines().join("\n");
+                    let syntax = self
+                        .syntax_set
+                        .find_syntax_by_extension("md")
+                        .unwrap_or_else(|| {
+                            self.syntax_set.find_syntax_by_name("Markdown").unwrap()
+                        });
+                    let mut highlighter = HighlightLines::new(syntax, &self.theme);
+                    let mut highlighted_lines = Vec::new();
+
+                    for line in LinesWithEndings::from(&text) {
+                        let ranges = highlighter
+                            .highlight_line(line, &self.syntax_set)
+                            .map_err(|e| EditorError::SyntaxHighlighting(e.to_string()))?;
+                        let spans: Vec<Span> = ranges
+                            .into_iter()
+                            .map(|(style, text)| {
+                                let color = Color::Rgb(
+                                    style.foreground.r,
+                                    style.foreground.g,
+                                    style.foreground.b,
+                                );
+                                Span::styled(text.to_string(), Style::default().fg(color))
+                            })
+                            .collect();
+                        highlighted_lines.push(Line::from(spans));
+                    }
+
+                    let block = self.textarea.block().cloned().unwrap_or_default();
+                    let paragraph = Paragraph::new(highlighted_lines)
+                        .block(block)
+                        .style(self.textarea.style());
+                    f.render_widget(paragraph, chunks[0]);
+
+                    // After f.render_widget(paragraph, chunks[0]);
+                    let cursor_pos = self.textarea.cursor();
+                    // Draw cursor as a styled Span or Rect at cursor_pos
+
                     if self.completion_state.active && !self.completion_state.suggestions.is_empty()
                     {
                         let items: Vec<ListItem> = self
@@ -1657,10 +1715,9 @@ impl App {
                                         CompletionType::Tag => "Tags",
                                         CompletionType::None => "",
                                     })
-                                    .style(Style::default().fg(Color::White).bg(Color::Black)), // .bg(Color::Black), // Set background to avoid transparency
+                                    .style(Style::default().fg(Color::White).bg(Color::Black)),
                             )
                             .highlight_style(Style::default().bg(Color::White).fg(Color::Black));
-                        // Position the popup in the top-right corner
                         let popup_width = 40;
                         let popup_height =
                             (self.completion_state.suggestions.len().min(5) + 2) as u16;
@@ -1670,8 +1727,6 @@ impl App {
                             width: popup_width,
                             height: popup_height,
                         };
-                        // Clear the popup area to avoid background artifacts
-                        // f.render_widget(Clear, popup_area);
                         f.render_stateful_widget(
                             list,
                             popup_area,
@@ -1699,5 +1754,6 @@ impl App {
         })
         .style(Style::default().fg(Color::White));
         f.render_widget(command, chunks[2]);
+        Ok(())
     }
 }

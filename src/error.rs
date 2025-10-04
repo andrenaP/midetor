@@ -11,6 +11,8 @@ pub enum EditorError {
     #[error("Markdown scanner error: {0}")]
     Scanner(String),
     #[error("Invalid backlink index: {0}")]
+    SyntaxHighlighting(String),
+    #[error("EditorError: {0}")]
     // InvalidBacklinkIndex(usize),
     InvalidBacklink(String),
 }
