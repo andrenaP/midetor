@@ -1,5 +1,5 @@
 # Markdown Editor
-[](images/main.jpg)
+
 ## Description
 
 `markdown-editor` is a terminal-based vim like Markdown editor designed to provide a lightweight, Obsidian-like experience for editing Markdown files. It supports syntax highlighting, tag management, and backlink tracking, storing metadata in a SQLite database (`markdown_data.db`). The editor uses a TUI (Text User Interface) built with Ratatui and Crossterm, offering an ~~intuitive interface~~ for navigating and editing Markdown files.
@@ -8,6 +8,8 @@
 - 3 mb editor that is a single file and work on any system. Android (termux), linux, Windows you name it.
 - It is using 5 mb of RAM. If you low on ram maybe you can use it.
 - You can use [This website](https://github.com/andrenaP/database-reader-sql) and render your data in userfriendly interface.
+
+![images/main.jpg](https://github.com/andrenaP/midetor/blob/aadcee84d86bc2e4686d600950c919c017e5a820/images/main.jpg)
 
 ## Features
 
