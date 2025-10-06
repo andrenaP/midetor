@@ -14,6 +14,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 use std::process::Command;
+use std::time::SystemTime;
 use syntect::{
     easy::HighlightLines,
     highlighting::{Theme, ThemeSet},
@@ -22,7 +23,7 @@ use syntect::{
 };
 use tui_textarea::{CursorMove, Input, Key, TextArea};
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Clone, Copy, Debug)]
 pub enum Mode {
     Normal,
     Insert,
@@ -33,6 +34,8 @@ pub enum Mode {
     Visual,
     VisualBlock,
     BlockInsert,
+    FileTree,
+    FileTreeVisual,
 }
 
 #[derive(PartialEq)]
@@ -60,6 +63,30 @@ pub enum SearchType {
 pub enum InsertPosition {
     Before,
     After,
+}
+
+#[derive(PartialEq, Clone, Debug)]
+pub enum SortBy {
+    Name,
+    Modified,
+}
+
+#[derive(Clone)]
+pub enum TreeNode {
+    File(String), // relative path
+    Dir {
+        path: String,
+        expanded: bool,
+        children: Vec<TreeNode>,
+    },
+}
+
+#[derive(Clone)]
+pub struct TreeItem {
+    display: String,
+    path: String,
+    is_dir: bool,
+    depth: usize,
 }
 
 pub struct App {
@@ -91,6 +118,15 @@ pub struct App {
     theme: Theme, // Use Box to ensure 'static lifetime
     scroll_offset: usize,
     horizontal_scroll_offset: usize, // New: Horizontal scroll
+    // File tree fields
+    file_tree: Vec<TreeNode>,
+    visible_items: Vec<TreeItem>,
+    tree_state: ListState,
+    sort_by: SortBy,
+    sort_asc: bool,
+    yanked_paths: Vec<String>,
+    prev_mode: Option<Mode>,
+    tree_visual_anchor: Option<usize>,
 }
 
 pub struct CompletionState {
@@ -178,6 +214,14 @@ impl App {
             theme,
             scroll_offset: 0,            // Initialize scroll offset
             horizontal_scroll_offset: 0, // Initialize horizontal scroll
+            file_tree: Vec::new(),
+            visible_items: Vec::new(),
+            tree_state: ListState::default(),
+            sort_by: SortBy::Name,
+            sort_asc: true,
+            yanked_paths: Vec::new(),
+            prev_mode: None,
+            tree_visual_anchor: None,
         })
     }
 
@@ -428,6 +472,8 @@ impl App {
             self.textarea.set_cursor_line_style(Style::default());
             self.textarea
                 .set_cursor_style(Style::default().bg(Color::White).fg(Color::Black));
+            self.textarea
+                .set_selection_style(Style::default().bg(Color::LightBlue));
             self.textarea
                 .move_cursor(tui_textarea::CursorMove::Jump(current_row as u16, 0));
         }
@@ -826,6 +872,549 @@ impl App {
         self.key_sequence.clear();
     }
 
+    fn build_root(&self) -> Vec<TreeNode> {
+        let mut root = Vec::new();
+        if let Ok(iter) = fs::read_dir(&self.base_dir) {
+            for entry in iter {
+                if let Ok(entry) = entry {
+                    let p = entry.path();
+                    let rel = entry.file_name().to_string_lossy().to_string();
+                    if p.is_dir() {
+                        root.push(TreeNode::Dir {
+                            path: rel,
+                            expanded: false,
+                            children: Vec::new(),
+                        });
+                    } else if p.extension().and_then(|s| s.to_str()) == Some("md") {
+                        root.push(TreeNode::File(rel));
+                    }
+                }
+            }
+        }
+        let mut sorted = root;
+        Self::sort_entries(
+            &mut sorted,
+            self.sort_by.clone(),
+            self.sort_asc,
+            &self.base_dir,
+        );
+        sorted
+    }
+
+    fn sort_nodes(nodes: &mut Vec<TreeNode>, sort_by: SortBy, sort_asc: bool, base_dir: &str) {
+        Self::sort_entries(nodes, sort_by.clone(), sort_asc, base_dir);
+        for node in nodes.iter_mut() {
+            if let TreeNode::Dir { children, .. } = node {
+                Self::sort_nodes(children, sort_by.clone(), sort_asc, base_dir);
+            }
+        }
+    }
+
+    fn build_tree_node(
+        full_path: &Path,
+        rel_path: &str,
+        sort_by: SortBy,
+        sort_asc: bool,
+        base_dir: &str,
+    ) -> Vec<TreeNode> {
+        let mut entries = Vec::new();
+        if let Ok(iter) = fs::read_dir(full_path) {
+            for entry in iter {
+                if let Ok(entry) = entry {
+                    let p = entry.path();
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    let rel = if rel_path.is_empty() {
+                        name
+                    } else {
+                        format!("{}/{}", rel_path, name)
+                    };
+                    if p.is_dir() {
+                        entries.push(TreeNode::Dir {
+                            path: rel,
+                            expanded: false,
+                            children: Vec::new(),
+                        });
+                    } else if p.extension().and_then(|s| s.to_str()) == Some("md") {
+                        entries.push(TreeNode::File(rel));
+                    }
+                }
+            }
+        }
+        let mut sorted = entries;
+        Self::sort_entries(&mut sorted, sort_by, sort_asc, base_dir);
+        sorted
+    }
+
+    fn sort_entries(entries: &mut Vec<TreeNode>, sort_by: SortBy, sort_asc: bool, base_dir: &str) {
+        entries.sort_by(|a, b| {
+            let (name_a, is_dir_a) = match a {
+                TreeNode::File(p) => (p.as_str(), false),
+                TreeNode::Dir { path, .. } => (path.as_str(), true),
+            };
+            let (name_b, is_dir_b) = match b {
+                TreeNode::File(p) => (p.as_str(), false),
+                TreeNode::Dir { path, .. } => (path.as_str(), true),
+            };
+            if is_dir_a != is_dir_b {
+                is_dir_b.cmp(&is_dir_a) // dirs first
+            } else {
+                if sort_by == SortBy::Name {
+                    if sort_asc {
+                        name_a.cmp(name_b)
+                    } else {
+                        name_b.cmp(name_a)
+                    }
+                } else {
+                    let path_a = Path::new(base_dir).join(name_a);
+                    let path_b = Path::new(base_dir).join(name_b);
+                    let time_a = fs::metadata(&path_a)
+                        .and_then(|m| m.modified())
+                        .map_err(|e| {
+                            eprintln!("Error getting metadata for {}: {}", path_a.display(), e)
+                        })
+                        .unwrap_or(SystemTime::UNIX_EPOCH);
+                    let time_b = fs::metadata(&path_b)
+                        .and_then(|m| m.modified())
+                        .map_err(|e| {
+                            eprintln!("Error getting metadata for {}: {}", path_b.display(), e)
+                        })
+                        .unwrap_or(SystemTime::UNIX_EPOCH);
+                    if sort_asc {
+                        time_a.cmp(&time_b)
+                    } else {
+                        time_b.cmp(&time_a)
+                    }
+                }
+            }
+        });
+    }
+
+    fn toggle_sort_modified(&mut self) {
+        if self.sort_by == SortBy::Modified {
+            self.sort_asc = !self.sort_asc;
+        } else {
+            self.sort_by = SortBy::Modified; // Keep enum variant as Created for compatibility
+            self.sort_asc = true;
+        }
+        self.status = format!(
+            "Sorted by modification time ({})",
+            if self.sort_asc {
+                "ascending"
+            } else {
+                "descending"
+            }
+        );
+    }
+
+    fn update_tree_sort(&mut self) {
+        Self::sort_nodes(
+            &mut self.file_tree,
+            self.sort_by.clone(),
+            self.sort_asc,
+            &self.base_dir,
+        );
+        self.update_visible();
+    }
+
+    fn toggle_sort_name(&mut self) {
+        if self.sort_by == SortBy::Name {
+            self.sort_asc = !self.sort_asc;
+        } else {
+            self.sort_by = SortBy::Name;
+            self.sort_asc = true;
+        }
+    }
+
+    fn update_visible(&mut self) {
+        let mut visible = Vec::new();
+        Self::add_nodes_to_visible(&self.file_tree, 0, &mut visible);
+        self.visible_items = visible;
+    }
+
+    fn add_nodes_to_visible(nodes: &[TreeNode], depth: usize, visible: &mut Vec<TreeItem>) {
+        for node in nodes {
+            match node {
+                TreeNode::File(p) => {
+                    let display = format!(
+                        "{}{}",
+                        "  ".repeat(depth),
+                        Path::new(p)
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("")
+                    );
+                    visible.push(TreeItem {
+                        display,
+                        path: p.clone(),
+                        is_dir: false,
+                        depth,
+                    });
+                }
+                TreeNode::Dir {
+                    path,
+                    expanded,
+                    children,
+                } => {
+                    let display = format!(
+                        "{}{}/",
+                        "  ".repeat(depth),
+                        Path::new(path)
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("")
+                    );
+                    visible.push(TreeItem {
+                        display,
+                        path: path.clone(),
+                        is_dir: true,
+                        depth,
+                    });
+                    if *expanded {
+                        Self::add_nodes_to_visible(children, depth + 1, visible);
+                    }
+                }
+            }
+        }
+    }
+
+    fn find_node_mut<'a>(
+        nodes: &'a mut Vec<TreeNode>,
+        path_segments: &[&str],
+    ) -> Option<&'a mut TreeNode> {
+        if path_segments.is_empty() {
+            return None;
+        }
+        let mut current: &mut Vec<TreeNode> = nodes;
+        for (i, &name) in path_segments.iter().enumerate() {
+            let mut found_idx = None;
+            for (idx, node) in current.iter_mut().enumerate() {
+                let node_name = match node {
+                    TreeNode::File(p) => Path::new(p.as_str())
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(""),
+                    TreeNode::Dir { path, .. } => Path::new(path.as_str())
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(""),
+                };
+                if node_name == name {
+                    found_idx = Some(idx);
+                    break;
+                }
+            }
+            if let Some(idx) = found_idx {
+                if i == path_segments.len() - 1 {
+                    return Some(&mut current[idx]);
+                } else {
+                    if let TreeNode::Dir { children, .. } = &mut current[idx] {
+                        current = children;
+                    } else {
+                        return None;
+                    }
+                }
+            } else {
+                return None;
+            }
+        }
+        None
+    }
+
+    fn toggle_expand_dir(&mut self, index: usize) -> Result<(), EditorError> {
+        if index >= self.visible_items.len() {
+            return Ok(());
+        }
+        let item = self.visible_items[index].clone();
+        if item.is_dir {
+            let segments: Vec<&str> = item.path.split('/').collect();
+            if let Some(node) = Self::find_node_mut(&mut self.file_tree, &segments) {
+                if let TreeNode::Dir {
+                    ref mut expanded,
+                    ref mut children,
+                    ref path,
+                } = *node
+                {
+                    *expanded = !*expanded;
+                    if *expanded && children.is_empty() {
+                        let full = Path::new(&self.base_dir).join(path);
+                        *children = Self::build_tree_node(
+                            &full,
+                            path.as_str(),
+                            self.sort_by.clone(),
+                            self.sort_asc,
+                            &self.base_dir,
+                        );
+                    }
+                    self.update_visible();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn expand_dir(&mut self, index: usize) -> Result<(), EditorError> {
+        if index >= self.visible_items.len() {
+            return Ok(());
+        }
+        let item = self.visible_items[index].clone();
+        if item.is_dir {
+            let segments: Vec<&str> = item.path.split('/').collect();
+            if let Some(node) = Self::find_node_mut(&mut self.file_tree, &segments) {
+                if let TreeNode::Dir {
+                    ref mut expanded,
+                    ref mut children,
+                    ref path,
+                } = *node
+                {
+                    if !*expanded {
+                        *expanded = true;
+                        if children.is_empty() {
+                            let full = Path::new(&self.base_dir).join(path);
+                            *children = Self::build_tree_node(
+                                &full,
+                                path.as_str(),
+                                self.sort_by.clone(),
+                                self.sort_asc,
+                                &self.base_dir,
+                            );
+                        }
+                        self.update_visible();
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn collapse_dir(&mut self, index: usize) -> Result<(), EditorError> {
+        if index >= self.visible_items.len() {
+            return Ok(());
+        }
+        let item = self.visible_items[index].clone();
+        if item.is_dir {
+            let segments: Vec<&str> = item.path.split('/').collect();
+            if let Some(node) = Self::find_node_mut(&mut self.file_tree, &segments) {
+                if let TreeNode::Dir {
+                    ref mut expanded, ..
+                } = *node
+                {
+                    if *expanded {
+                        *expanded = false;
+                        self.update_visible();
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn delete_selected_file(&mut self) -> Result<(), EditorError> {
+        if let Some(selected) = self.tree_state.selected() {
+            let item = self.visible_items[selected].clone();
+            if !item.is_dir {
+                let full_path = Path::new(&self.base_dir)
+                    .join(&item.path)
+                    .to_string_lossy()
+                    .to_string();
+                fs::remove_file(&full_path)?;
+                let output = Command::new("markdown-scanner")
+                    .arg("--delete")
+                    .arg(&full_path)
+                    .arg(&self.base_dir)
+                    .output()?;
+                if !output.status.success() {
+                    let error_msg = String::from_utf8_lossy(&output.stderr).into_owned();
+                    return Err(EditorError::Scanner(error_msg));
+                }
+                self.remove_node(&item.path);
+                self.update_visible();
+            } else {
+                self.status = "Cannot delete directories".to_string();
+            }
+        }
+        Ok(())
+    }
+
+    fn delete_selected_files(&mut self) -> Result<(), EditorError> {
+        let current = self.tree_state.selected().unwrap_or(0);
+        let anchor = self.tree_visual_anchor.unwrap_or(current);
+        let min = anchor.min(current);
+        let max = anchor.max(current);
+        let mut to_delete = Vec::new();
+        for i in min..=max {
+            let item = self.visible_items[i].clone();
+            if !item.is_dir {
+                to_delete.push(item.path);
+            }
+        }
+        for path in to_delete {
+            let full_path = Path::new(&self.base_dir)
+                .join(&path)
+                .to_string_lossy()
+                .to_string();
+            fs::remove_file(&full_path)?;
+            let output = Command::new("markdown-scanner")
+                .arg("--delete")
+                .arg(&full_path)
+                .arg(&self.base_dir)
+                .output()?;
+            if !output.status.success() {
+                let error_msg = String::from_utf8_lossy(&output.stderr).into_owned();
+                return Err(EditorError::Scanner(error_msg));
+            }
+            self.remove_node(&path);
+        }
+        self.update_visible();
+        self.tree_state.select(Some(min));
+        Ok(())
+    }
+
+    fn remove_node(&mut self, path: &str) {
+        let segments: Vec<&str> = path.split('/').collect();
+        if segments.len() == 1 {
+            self.file_tree.retain(|n| match n {
+                TreeNode::File(p) => p.as_str() != path,
+                TreeNode::Dir { path: d, .. } => d.as_str() != path,
+            });
+        } else {
+            let parent_segments = &segments[0..segments.len() - 1];
+            if let Some(parent) = Self::find_node_mut(&mut self.file_tree, parent_segments) {
+                if let TreeNode::Dir {
+                    ref mut children, ..
+                } = *parent
+                {
+                    children.retain(|n| match n {
+                        TreeNode::File(p) => {
+                            p.rsplit('/').next().unwrap() != *segments.last().unwrap()
+                        }
+                        TreeNode::Dir { path: d, .. } => {
+                            d.rsplit('/').next().unwrap() != *segments.last().unwrap()
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    fn yank_selected(&mut self) {
+        let current = self.tree_state.selected().unwrap_or(0);
+        let anchor = self.tree_visual_anchor.unwrap_or(current);
+        let min = anchor.min(current);
+        let max = anchor.max(current);
+        self.yanked_paths.clear();
+        for i in min..=max {
+            let item = &self.visible_items[i];
+            if !item.is_dir {
+                self.yanked_paths.push(item.path.clone());
+            }
+        }
+        self.status = format!("Yanked {} paths", self.yanked_paths.len());
+    }
+
+    fn rename_selected(&mut self, new_name: String) -> Result<(), EditorError> {
+        if let Some(selected) = self.tree_state.selected() {
+            let item = self.visible_items[selected].clone();
+            if item.is_dir {
+                self.status = "Cannot rename directories".to_string();
+                return Ok(());
+            }
+            let old_path = item.path;
+            let old_full = Path::new(&self.base_dir)
+                .join(&old_path)
+                .to_string_lossy()
+                .to_string();
+            let parent = Path::new(&old_path)
+                .parent()
+                .and_then(|p| p.to_str())
+                .unwrap_or("")
+                .to_string();
+            let new_path = if parent.is_empty() {
+                new_name.clone()
+            } else {
+                format!("{}/{}", parent, new_name)
+            };
+            let new_full = Path::new(&self.base_dir)
+                .join(&new_path)
+                .to_string_lossy()
+                .to_string();
+            fs::rename(&old_full, &new_full)?;
+            let output_delete = Command::new("markdown-scanner")
+                .arg("--delete")
+                .arg(&old_full)
+                .arg(&self.base_dir)
+                .output()?;
+            if !output_delete.status.success() {
+                let error_msg = String::from_utf8_lossy(&output_delete.stderr).into_owned();
+                return Err(EditorError::Scanner(error_msg));
+            }
+            let output_scan = Command::new("markdown-scanner")
+                .arg(&new_full)
+                .arg(&self.base_dir)
+                .output()?;
+            if !output_scan.status.success() {
+                let error_msg = String::from_utf8_lossy(&output_scan.stderr).into_owned();
+                return Err(EditorError::Scanner(error_msg));
+            }
+            self.remove_node(&old_path);
+            self.file_tree = self.build_root();
+            self.update_visible();
+        }
+        Ok(())
+    }
+
+    fn move_selected(&mut self, target_dir: String) -> Result<(), EditorError> {
+        let current = self.tree_state.selected().unwrap_or(0);
+        let anchor = self.tree_visual_anchor.unwrap_or(current);
+        let min = anchor.min(current);
+        let max = anchor.max(current);
+        let mut to_move = Vec::new();
+        for i in min..=max {
+            let item = self.visible_items[i].clone();
+            if !item.is_dir {
+                to_move.push(item.path);
+            }
+        }
+        for old_path in to_move {
+            let old_full = Path::new(&self.base_dir)
+                .join(&old_path)
+                .to_string_lossy()
+                .to_string();
+            let filename = Path::new(&old_path)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+            let new_path = format!("{}/{}", target_dir, filename);
+            let new_full = Path::new(&self.base_dir)
+                .join(&new_path)
+                .to_string_lossy()
+                .to_string();
+            fs::rename(&old_full, &new_full)?;
+            let output_delete = Command::new("markdown-scanner")
+                .arg("--delete")
+                .arg(&old_full)
+                .arg(&self.base_dir)
+                .output()?;
+            if !output_delete.status.success() {
+                let error_msg = String::from_utf8_lossy(&output_delete.stderr).into_owned();
+                return Err(EditorError::Scanner(error_msg));
+            }
+            let output_scan = Command::new("markdown-scanner")
+                .arg(&new_full)
+                .arg(&self.base_dir)
+                .output()?;
+            if !output_scan.status.success() {
+                let error_msg = String::from_utf8_lossy(&output_scan.stderr).into_owned();
+                return Err(EditorError::Scanner(error_msg));
+            }
+            self.remove_node(&old_path);
+        }
+        self.file_tree = self.build_root();
+        self.update_visible();
+        self.tree_state.select(Some(min));
+        Ok(())
+    }
+
     pub fn handle_input(
         &mut self,
         event: ratatui::crossterm::event::KeyEvent,
@@ -894,12 +1483,25 @@ impl App {
                                 self.key_sequence.clear();
                                 self.status = "Opened tomorrow's file".to_string();
                             }
+                            "\\e" => {
+                                if self.file_tree.is_empty() {
+                                    self.file_tree = self.build_root();
+                                }
+                                self.update_visible();
+                                if !self.visible_items.is_empty() {
+                                    self.tree_state.select(Some(0));
+                                }
+                                self.mode = Mode::FileTree;
+                                self.key_sequence.clear();
+                                self.status = "Entered File Tree mode".to_string();
+                            }
                             s if !("\\ob".starts_with(s)
                                 || "\\ot".starts_with(s)
                                 || "\\f".starts_with(s)
                                 || "\\oot".starts_with(s)
                                 || "\\ooy".starts_with(s)
-                                || "\\ooT".starts_with(s)) =>
+                                || "\\ooT".starts_with(s)
+                                || "\\e".starts_with(s)) =>
                             {
                                 self.key_sequence.clear();
                                 self.status = format!("Invalid sequence 1: {}", s);
@@ -978,6 +1580,7 @@ impl App {
                         self.textarea.insert_str(&self.yanked.join("\n"));
                     }
                     (ratatui::crossterm::event::KeyCode::Char(':'), _) => {
+                        self.prev_mode = Some(Mode::Normal);
                         self.mode = Mode::Command;
                         self.command.clear();
                         self.status = "Command".to_string();
@@ -1139,22 +1742,33 @@ impl App {
             }
             Mode::Command => match event.code {
                 ratatui::crossterm::event::KeyCode::Esc => {
-                    self.mode = Mode::Normal;
+                    let mode = self.prev_mode.unwrap_or(Mode::Normal);
+                    self.mode = mode;
                     self.status = "Normal".to_string();
                     self.command.clear();
+                    self.prev_mode = None;
                 }
                 ratatui::crossterm::event::KeyCode::Enter => {
-                    match self.command.as_str() {
-                        "w" => self.save_file()?,
-                        "q" => self.should_quit = true,
-                        "wq" => {
-                            self.save_file()?;
-                            self.should_quit = true;
-                        }
-                        _ => self.status = format!("Unknown command: {}", self.command),
+                    if self.command == "w" {
+                        self.save_file()?;
+                    } else if self.command == "q" {
+                        self.should_quit = true;
+                    } else if self.command == "wq" {
+                        self.save_file()?;
+                        self.should_quit = true;
+                    } else if self.command.starts_with("rename ") {
+                        let new_name = self.command.trim_start_matches("rename ").to_string();
+                        self.rename_selected(new_name)?;
+                    } else if self.command.starts_with("move ") {
+                        let new_dir = self.command.trim_start_matches("move ").to_string();
+                        self.move_selected(new_dir)?;
+                    } else {
+                        self.status = format!("Unknown command: {}", self.command);
                     }
-                    self.mode = Mode::Normal;
+                    let mode = self.prev_mode.unwrap_or(Mode::Normal);
+                    self.mode = mode;
                     self.command.clear();
+                    self.prev_mode = None;
                 }
                 ratatui::crossterm::event::KeyCode::Char(c) => {
                     self.command.push(c);
@@ -1501,7 +2115,7 @@ impl App {
                 }
             }
             Mode::BlockInsert => {
-                let input = Input::from(event);
+                let _input = Input::from(event);
                 let (min_row, min_col, max_row, max_col) = if let Some(anchor) = self.visual_anchor
                 {
                     let cursor = self.textarea.cursor();
@@ -1528,15 +2142,16 @@ impl App {
                         for row in min_row..=max_row {
                             let line = self.textarea.lines()[row].clone();
                             let target_col = self.block_insert_col;
-                            let start_byte = line
+                            let char_count = line.chars().count();
+                            let mut new_line = line.clone();
+                            if target_col > char_count {
+                                new_line.push_str(&" ".repeat(target_col - char_count));
+                            }
+                            let start_byte = new_line
                                 .char_indices()
                                 .nth(target_col)
                                 .map(|(b, _)| b)
-                                .unwrap_or(line.len());
-                            let mut new_line = line.clone();
-                            if target_col > line.len() {
-                                new_line.push_str(&" ".repeat(target_col - line.len()));
-                            }
+                                .unwrap_or(new_line.len());
                             new_line.insert_str(start_byte, &c.to_string());
                             self.textarea.move_cursor(CursorMove::Jump(row as u16, 0));
                             self.textarea.delete_line_by_end();
@@ -1560,7 +2175,8 @@ impl App {
                                     .map(|(b, _)| b)
                                     .unwrap_or(line.len());
                                 let mut new_line = line.clone();
-                                if target_col < new_line.len() {
+                                let char_count = new_line.chars().count();
+                                if target_col < char_count {
                                     new_line.remove(start_byte);
                                 }
                                 self.textarea.move_cursor(CursorMove::Jump(row as u16, 0));
@@ -1576,6 +2192,178 @@ impl App {
                     _ => {}
                 }
             }
+            Mode::FileTree => {
+                if !self.key_sequence.is_empty() {
+                    if let ratatui::crossterm::event::KeyCode::Char(c) = event.code {
+                        self.key_sequence.push(c);
+                        let sequence = self.key_sequence.clone();
+                        match sequence.as_str() {
+                            "oc" => {
+                                self.toggle_sort_modified();
+                                self.update_tree_sort();
+                                self.key_sequence.clear();
+                                self.status = format!(
+                                    "Sorted by creation time ({})",
+                                    if self.sort_asc {
+                                        "ascending"
+                                    } else {
+                                        "descending"
+                                    }
+                                );
+                            }
+                            "on" => {
+                                self.toggle_sort_name();
+                                self.update_tree_sort();
+                                self.key_sequence.clear();
+                                self.status = format!(
+                                    "Sorted by name ({})",
+                                    if self.sort_asc {
+                                        "ascending"
+                                    } else {
+                                        "descending"
+                                    }
+                                );
+                            }
+                            s if !s.starts_with("oc") && !s.starts_with("on") => {
+                                self.key_sequence.clear();
+                                self.status = format!("Invalid sequence: {}", s);
+                            }
+                            _ => {}
+                        }
+                        return Ok(());
+                    }
+                }
+                match event.code {
+                    ratatui::crossterm::event::KeyCode::Esc => {
+                        self.mode = Mode::Normal;
+                        self.status = "Normal".to_string();
+                    }
+                    ratatui::crossterm::event::KeyCode::Up => {
+                        let selected = self.tree_state.selected().unwrap_or(0);
+                        if selected > 0 {
+                            self.tree_state.select(Some(selected - 1));
+                        }
+                    }
+                    ratatui::crossterm::event::KeyCode::Down => {
+                        let selected = self.tree_state.selected().unwrap_or(0);
+                        if selected < self.visible_items.len() - 1 {
+                            self.tree_state.select(Some(selected + 1));
+                        }
+                    }
+                    ratatui::crossterm::event::KeyCode::Left => {
+                        if let Some(selected) = self.tree_state.selected() {
+                            let item = &self.visible_items[selected];
+                            if item.is_dir {
+                                self.collapse_dir(selected)?;
+                            } else {
+                                let depth = item.depth;
+                                for i in (0..selected).rev() {
+                                    if self.visible_items[i].depth < depth {
+                                        self.tree_state.select(Some(i));
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    ratatui::crossterm::event::KeyCode::Right => {
+                        if let Some(selected) = self.tree_state.selected() {
+                            let item = &self.visible_items[selected];
+                            if item.is_dir {
+                                self.expand_dir(selected)?;
+                            }
+                        }
+                    }
+                    ratatui::crossterm::event::KeyCode::Enter => {
+                        if let Some(selected) = self.tree_state.selected() {
+                            let item = self.visible_items[selected].clone();
+                            if item.is_dir {
+                                self.toggle_expand_dir(selected)?;
+                            } else {
+                                self.open_wikilink_file(item.path)?;
+                                // self.mode = Mode::Normal;
+                            }
+                        }
+                    }
+                    ratatui::crossterm::event::KeyCode::Char('v') => {
+                        if let Some(selected) = self.tree_state.selected() {
+                            self.tree_visual_anchor = Some(selected);
+                            self.mode = Mode::FileTreeVisual;
+                            self.status = "Visual".to_string();
+                        }
+                    }
+                    ratatui::crossterm::event::KeyCode::Char('d') => {
+                        self.delete_selected_file()?;
+                    }
+                    ratatui::crossterm::event::KeyCode::Char('r') => {
+                        self.prev_mode = Some(Mode::FileTree);
+                        self.mode = Mode::Command;
+                        self.command = "rename ".to_string();
+                        self.status = "Rename to:".to_string();
+                    }
+                    ratatui::crossterm::event::KeyCode::Char('m') => {
+                        self.prev_mode = Some(Mode::FileTree);
+                        self.mode = Mode::Command;
+                        self.command = "move ".to_string();
+                        self.status = "Move to:".to_string();
+                    }
+                    ratatui::crossterm::event::KeyCode::Char('y') => {
+                        self.yank_selected();
+                    }
+                    ratatui::crossterm::event::KeyCode::Char(c) => {
+                        self.key_sequence.push(c);
+                    }
+                    _ => {}
+                }
+            }
+            Mode::FileTreeVisual => match event.code {
+                ratatui::crossterm::event::KeyCode::Esc => {
+                    self.tree_visual_anchor = None;
+                    self.mode = Mode::FileTree;
+                    self.status = "File Tree".to_string();
+                }
+                ratatui::crossterm::event::KeyCode::Up => {
+                    let selected = self.tree_state.selected().unwrap_or(0);
+                    if selected > 0 {
+                        self.tree_state.select(Some(selected - 1));
+                    }
+                }
+                ratatui::crossterm::event::KeyCode::Down => {
+                    let selected = self.tree_state.selected().unwrap_or(0);
+                    if selected < self.visible_items.len() - 1 {
+                        self.tree_state.select(Some(selected + 1));
+                    }
+                }
+                ratatui::crossterm::event::KeyCode::Char('d') => {
+                    self.delete_selected_files()?;
+                    self.tree_visual_anchor = None;
+                    self.mode = Mode::FileTree;
+                }
+                ratatui::crossterm::event::KeyCode::Char('y') => {
+                    self.yank_selected();
+                    self.tree_visual_anchor = None;
+                    self.mode = Mode::FileTree;
+                }
+                ratatui::crossterm::event::KeyCode::Char('m') => {
+                    self.prev_mode = Some(Mode::FileTreeVisual);
+                    self.mode = Mode::Command;
+                    self.command = "move ".to_string();
+                    self.status = "Move to:".to_string();
+                }
+                ratatui::crossterm::event::KeyCode::Char('r') => {
+                    let current = self.tree_state.selected().unwrap_or(0);
+                    let anchor = self.tree_visual_anchor.unwrap_or(current);
+                    if anchor == current {
+                        self.prev_mode = Some(Mode::FileTreeVisual);
+                        self.mode = Mode::Command;
+                        self.command = "rename ".to_string();
+                        self.status = "Rename to:".to_string();
+                    } else {
+                        self.status = "Rename only for single file".to_string();
+                    }
+                }
+                _ => {}
+            },
         }
         Ok(())
     }
@@ -1654,6 +2442,47 @@ impl App {
                 };
                 f.render_stateful_widget(list, popup_area, &mut self.tag_files_state);
             }
+            Mode::FileTree | Mode::FileTreeVisual => {
+                let main_chunks = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+                    .split(chunks[0]);
+
+                let visual_min = self
+                    .tree_visual_anchor
+                    .map(|a| a.min(self.tree_state.selected().unwrap_or(0)))
+                    .unwrap_or(usize::MAX);
+                let visual_max = self
+                    .tree_visual_anchor
+                    .map(|a| a.max(self.tree_state.selected().unwrap_or(0)))
+                    .unwrap_or(0);
+
+                let items: Vec<ListItem> = self
+                    .visible_items
+                    .iter()
+                    .enumerate()
+                    .map(|(i, item)| {
+                        let mut li = ListItem::new(item.display.clone());
+                        if self.mode == Mode::FileTreeVisual && i >= visual_min && i <= visual_max {
+                            li = li.style(Style::default().bg(Color::LightBlue));
+                        } else if Some(i) == self.tree_state.selected() {
+                            li = li.style(Style::default().bg(Color::White).fg(Color::Black));
+                        }
+                        li
+                    })
+                    .collect();
+
+                let list = List::new(items).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("File Tree")
+                        .style(Style::default().fg(Color::White)),
+                );
+                f.render_stateful_widget(list, main_chunks[0], &mut self.tree_state);
+
+                // Render editor on the right
+                self.render_editor(f, main_chunks[1])?;
+            }
             Mode::Normal
             | Mode::Insert
             | Mode::Complete
@@ -1662,191 +2491,7 @@ impl App {
             | Mode::VisualBlock
             | Mode::BlockInsert => match self.view {
                 View::Editor => {
-                    // Apply syntax highlighting
-                    let text = self.textarea.lines().join("\n");
-                    let syntax = self
-                        .syntax_set
-                        .find_syntax_by_extension("md")
-                        .unwrap_or_else(|| {
-                            self.syntax_set.find_syntax_by_name("Markdown").unwrap()
-                        });
-                    let mut highlighter = HighlightLines::new(syntax, &self.theme);
-                    let mut highlighted_lines = Vec::new();
-
-                    // Get selection range for Visual/VisualBlock modes
-                    let selection_range = match self.mode {
-                        Mode::Visual | Mode::VisualBlock => self.visual_anchor.map(|anchor| {
-                            let cursor = self.textarea.cursor();
-                            let start_row = anchor.0.min(cursor.0);
-                            let end_row = anchor.0.max(cursor.0);
-                            let start_col = if anchor.0 == start_row {
-                                anchor.1
-                            } else {
-                                cursor.1
-                            };
-                            let end_col = if anchor.0 == end_row {
-                                anchor.1
-                            } else {
-                                cursor.1
-                            };
-                            ((start_row, start_col), (end_row, end_col))
-                        }),
-                        _ => None,
-                    };
-
-                    for (row, line) in LinesWithEndings::from(&text).enumerate() {
-                        let ranges = highlighter
-                            .highlight_line(line, &self.syntax_set)
-                            .map_err(|e| EditorError::SyntaxHighlighting(e.to_string()))?;
-                        let mut spans: Vec<Span> = Vec::new();
-                        let mut col = 0;
-
-                        for (style, text) in ranges {
-                            let color = Color::Rgb(
-                                style.foreground.r,
-                                style.foreground.g,
-                                style.foreground.b,
-                            );
-                            let text_len = text.chars().count();
-                            let mut span_style = Style::default().fg(color);
-
-                            // Apply selection styling if within range
-                            if let Some(((start_row, start_col), (end_row, end_col))) =
-                                selection_range
-                            {
-                                if (row > start_row || (row == start_row && col >= start_col))
-                                    && (row < end_row || (row == end_row && col < end_col))
-                                {
-                                    span_style = span_style.bg(Color::LightBlue);
-                                    // Selection highlight
-                                }
-                            }
-
-                            spans.push(Span::styled(text.to_string(), span_style));
-                            col += text_len;
-                        }
-                        highlighted_lines.push(Line::from(spans));
-                    }
-
-                    // Calculate scroll offsets
-                    let cursor_row = self.textarea.cursor().0;
-                    let cursor_col = self.textarea.cursor().1;
-                    let area_height = chunks[0].height.saturating_sub(2) as usize; // Subtract borders
-                    let area_width = chunks[0].width.saturating_sub(2) as usize; // Subtract borders
-                    let visible_lines = area_height.min(highlighted_lines.len());
-
-                    // Vertical scrolling: only when cursor is outside visible area
-                    if cursor_row < self.scroll_offset {
-                        self.scroll_offset = cursor_row;
-                    } else if cursor_row >= self.scroll_offset + visible_lines {
-                        self.scroll_offset = cursor_row - (visible_lines - 1);
-                    }
-                    self.scroll_offset = self
-                        .scroll_offset
-                        .min(highlighted_lines.len().saturating_sub(visible_lines));
-
-                    // Horizontal scrolling: only when cursor is outside visible width
-                    if cursor_col < self.horizontal_scroll_offset {
-                        self.horizontal_scroll_offset = cursor_col;
-                    } else if cursor_col >= self.horizontal_scroll_offset + area_width {
-                        self.horizontal_scroll_offset = cursor_col - (area_width - 1);
-                    }
-
-                    // Slice lines and apply horizontal scrolling
-                    let start_line = self.scroll_offset;
-                    let end_line =
-                        (self.scroll_offset + visible_lines).min(highlighted_lines.len());
-                    let mut visible_text = Vec::new();
-                    for line in highlighted_lines[start_line..end_line].iter() {
-                        let mut new_spans = Vec::new();
-                        let mut col = 0;
-                        for span in &line.spans {
-                            let text = span.content.as_ref();
-                            let span_len = text.chars().count();
-                            let span_start = col;
-                            let span_end = col + span_len;
-
-                            if span_end > self.horizontal_scroll_offset {
-                                let start_char = if span_start < self.horizontal_scroll_offset {
-                                    self.horizontal_scroll_offset - span_start
-                                } else {
-                                    0
-                                };
-                                let text_chars: Vec<char> = text.chars().collect();
-                                let sliced_text =
-                                    text_chars[start_char..].iter().collect::<String>();
-                                if !sliced_text.is_empty() {
-                                    new_spans.push(Span::styled(sliced_text, span.style));
-                                }
-                            }
-                            col += span_len;
-                        }
-                        visible_text.push(Line::from(new_spans));
-                    }
-
-                    // Render the text
-                    let block = self.textarea.block().cloned().unwrap_or_default();
-                    let paragraph = Paragraph::new(visible_text)
-                        .block(block)
-                        .style(self.textarea.style());
-                    f.render_widget(paragraph, chunks[0]);
-
-                    // Render custom cursor
-                    if cursor_row >= self.scroll_offset
-                        && cursor_row < self.scroll_offset + visible_lines
-                    {
-                        let screen_row = (cursor_row - self.scroll_offset) as u16;
-                        let screen_col =
-                            (cursor_col.saturating_sub(self.horizontal_scroll_offset)) as u16;
-                        let max_width = area_width as u16;
-                        let cursor_x = screen_col.min(max_width); // Clamp cursor x
-                        let cursor_area = Rect {
-                            x: chunks[0].x + 1 + cursor_x,
-                            y: chunks[0].y + 1 + screen_row,
-                            width: 1,
-                            height: 1,
-                        };
-                        let cursor_span =
-                            Span::styled(" ", Style::default().bg(Color::White).fg(Color::Black));
-                        f.render_widget(Paragraph::new(cursor_span), cursor_area);
-                    }
-
-                    // Render completion popup if active
-                    if self.completion_state.active && !self.completion_state.suggestions.is_empty()
-                    {
-                        let items: Vec<ListItem> = self
-                            .completion_state
-                            .suggestions
-                            .iter()
-                            .map(|s| ListItem::new(format!("{s}{}", " ".repeat(50))))
-                            .collect();
-                        let list = List::new(items)
-                            .block(
-                                Block::default()
-                                    .borders(Borders::ALL)
-                                    .title(match self.completion_state.completion_type {
-                                        CompletionType::File => "Files",
-                                        CompletionType::Tag => "Tags",
-                                        CompletionType::None => "",
-                                    })
-                                    .style(Style::default().fg(Color::White).bg(Color::Black)),
-                            )
-                            .highlight_style(Style::default().bg(Color::White).fg(Color::Black));
-                        let popup_width = 40;
-                        let popup_height =
-                            (self.completion_state.suggestions.len().min(5) + 2) as u16;
-                        let popup_area = Rect {
-                            x: chunks[0].x + chunks[0].width.saturating_sub(popup_width),
-                            y: chunks[0].y + 1,
-                            width: popup_width,
-                            height: popup_height,
-                        };
-                        f.render_stateful_widget(
-                            list,
-                            popup_area,
-                            &mut self.completion_state.list_state,
-                        );
-                    }
+                    self.render_editor(f, chunks[0])?;
                 }
                 View::Info => {
                     let info = Paragraph::new(self.status.clone())
@@ -1863,11 +2508,182 @@ impl App {
 
         let command = Paragraph::new(match self.mode {
             Mode::Command => format!(":{}", self.command),
-            Mode::Normal if !self.key_sequence.is_empty() => format!("{}", self.key_sequence),
+            Mode::Normal | Mode::FileTree if !self.key_sequence.is_empty() => {
+                format!("{}", self.key_sequence)
+            }
             _ => String::new(),
         })
         .style(Style::default().fg(Color::White));
         f.render_widget(command, chunks[2]);
+        Ok(())
+    }
+
+    fn render_editor(&mut self, f: &mut Frame, area: Rect) -> Result<(), EditorError> {
+        // Apply syntax highlighting
+        let text = self.textarea.lines().join("\n");
+        let syntax = self
+            .syntax_set
+            .find_syntax_by_extension("md")
+            .unwrap_or_else(|| self.syntax_set.find_syntax_by_name("Markdown").unwrap());
+        let mut highlighter = HighlightLines::new(syntax, &self.theme);
+        let mut highlighted_lines = Vec::new();
+
+        // Get selection range for Visual/VisualBlock modes
+        let selection_range = match self.mode {
+            Mode::Visual | Mode::VisualBlock => self.visual_anchor.map(|anchor| {
+                let cursor = self.textarea.cursor();
+                let start_row = anchor.0.min(cursor.0);
+                let end_row = anchor.0.max(cursor.0);
+                let start_col = if anchor.0 == start_row {
+                    anchor.1
+                } else {
+                    cursor.1
+                };
+                let end_col = if anchor.0 == end_row {
+                    anchor.1
+                } else {
+                    cursor.1
+                };
+                ((start_row, start_col), (end_row, end_col))
+            }),
+            _ => None,
+        };
+
+        for (row, line) in LinesWithEndings::from(&text).enumerate() {
+            let ranges = highlighter
+                .highlight_line(line, &self.syntax_set)
+                .map_err(|e| EditorError::SyntaxHighlighting(e.to_string()))?;
+            let mut spans: Vec<Span> = Vec::new();
+            let mut col = 0;
+
+            for (style, text) in ranges {
+                let color = Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b);
+                let text_len = text.chars().count();
+                let mut span_style = Style::default().fg(color);
+
+                // Apply selection styling if within range
+                if let Some(((start_row, start_col), (end_row, end_col))) = selection_range {
+                    if (row > start_row || (row == start_row && col >= start_col))
+                        && (row < end_row || (row == end_row && col < end_col))
+                    {
+                        span_style = span_style.bg(Color::LightBlue);
+                        // Selection highlight
+                    }
+                }
+
+                spans.push(Span::styled(text.to_string(), span_style));
+                col += text_len;
+            }
+            highlighted_lines.push(Line::from(spans));
+        }
+
+        // Calculate scroll offsets
+        let cursor_row = self.textarea.cursor().0;
+        let cursor_col = self.textarea.cursor().1;
+        let area_height = area.height.saturating_sub(2) as usize; // Subtract borders
+        let area_width = area.width.saturating_sub(2) as usize; // Subtract borders
+        let visible_lines = area_height.min(highlighted_lines.len());
+
+        // Vertical scrolling: only when cursor is outside visible area
+        if cursor_row < self.scroll_offset {
+            self.scroll_offset = cursor_row;
+        } else if cursor_row >= self.scroll_offset + visible_lines {
+            self.scroll_offset = cursor_row - (visible_lines - 1);
+        }
+        self.scroll_offset = self
+            .scroll_offset
+            .min(highlighted_lines.len().saturating_sub(visible_lines));
+
+        // Horizontal scrolling: only when cursor is outside visible width
+        if cursor_col < self.horizontal_scroll_offset {
+            self.horizontal_scroll_offset = cursor_col;
+        } else if cursor_col >= self.horizontal_scroll_offset + area_width {
+            self.horizontal_scroll_offset = cursor_col - (area_width - 1);
+        }
+
+        // Slice lines and apply horizontal scrolling
+        let start_line = self.scroll_offset;
+        let end_line = (self.scroll_offset + visible_lines).min(highlighted_lines.len());
+        let mut visible_text = Vec::new();
+        for line in highlighted_lines[start_line..end_line].iter() {
+            let mut new_spans = Vec::new();
+            let mut col = 0;
+            for span in &line.spans {
+                let text = span.content.as_ref();
+                let span_len = text.chars().count();
+                let span_start = col;
+                let span_end = col + span_len;
+
+                if span_end > self.horizontal_scroll_offset {
+                    let start_char = if span_start < self.horizontal_scroll_offset {
+                        self.horizontal_scroll_offset - span_start
+                    } else {
+                        0
+                    };
+                    let text_chars: Vec<char> = text.chars().collect();
+                    let sliced_text = text_chars[start_char..].iter().collect::<String>();
+                    if !sliced_text.is_empty() {
+                        new_spans.push(Span::styled(sliced_text, span.style));
+                    }
+                }
+                col += span_len;
+            }
+            visible_text.push(Line::from(new_spans));
+        }
+
+        // Render the text
+        let block = self.textarea.block().cloned().unwrap_or_default();
+        let paragraph = Paragraph::new(visible_text)
+            .block(block)
+            .style(self.textarea.style());
+        f.render_widget(paragraph, area);
+
+        // Render custom cursor
+        if cursor_row >= self.scroll_offset && cursor_row < self.scroll_offset + visible_lines {
+            let screen_row = (cursor_row - self.scroll_offset) as u16;
+            let screen_col = (cursor_col.saturating_sub(self.horizontal_scroll_offset)) as u16;
+            let max_width = area_width as u16;
+            let cursor_x = screen_col.min(max_width); // Clamp cursor x
+            let cursor_area = Rect {
+                x: area.x + 1 + cursor_x,
+                y: area.y + 1 + screen_row,
+                width: 1,
+                height: 1,
+            };
+            let cursor_span = Span::styled(" ", Style::default().bg(Color::White).fg(Color::Black));
+            f.render_widget(Paragraph::new(cursor_span), cursor_area);
+        }
+
+        // Render completion popup if active
+        if self.completion_state.active && !self.completion_state.suggestions.is_empty() {
+            let items: Vec<ListItem> = self
+                .completion_state
+                .suggestions
+                .iter()
+                .map(|s| ListItem::new(format!("{s}{}", " ".repeat(50))))
+                .collect();
+            let list = List::new(items)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(match self.completion_state.completion_type {
+                            CompletionType::File => "Files",
+                            CompletionType::Tag => "Tags",
+                            CompletionType::None => "",
+                        })
+                        .style(Style::default().fg(Color::White).bg(Color::Black)),
+                )
+                .highlight_style(Style::default().bg(Color::White).fg(Color::Black));
+            let popup_width = 40;
+            let popup_height = (self.completion_state.suggestions.len().min(5) + 2) as u16;
+            let popup_area = Rect {
+                x: area.x + area.width.saturating_sub(popup_width),
+                y: area.y + 1,
+                width: popup_width,
+                height: popup_height,
+            };
+            f.render_stateful_widget(list, popup_area, &mut self.completion_state.list_state);
+        }
         Ok(())
     }
 }
