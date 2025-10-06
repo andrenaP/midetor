@@ -89,6 +89,12 @@ pub struct TreeItem {
     depth: usize,
 }
 
+#[derive(PartialEq, Clone, Copy, Debug)]
+pub enum BufferMode {
+    Copy,
+    Cut,
+}
+
 pub struct App {
     db: Connection,
     file_path: String,
@@ -127,8 +133,9 @@ pub struct App {
     yanked_paths: Vec<String>,
     prev_mode: Option<Mode>,
     tree_visual_anchor: Option<usize>,
-    tree_width_percent: u16, // e.g., init to 20 in new()
-    full_tree: bool,         // init to false
+    tree_width_percent: u16,
+    full_tree: bool,
+    buffer_mode: Option<BufferMode>,
 }
 
 pub struct CompletionState {
@@ -226,6 +233,7 @@ impl App {
             tree_visual_anchor: None,
             tree_width_percent: 20,
             full_tree: false,
+            buffer_mode: None,
         })
     }
 
@@ -881,8 +889,12 @@ impl App {
         if let Ok(iter) = fs::read_dir(&self.base_dir) {
             for entry in iter {
                 if let Ok(entry) = entry {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if name.starts_with(".") {
+                        continue;
+                    }
                     let p = entry.path();
-                    let rel = entry.file_name().to_string_lossy().to_string();
+                    let rel = name;
                     if p.is_dir() {
                         root.push(TreeNode::Dir {
                             path: rel,
@@ -925,8 +937,11 @@ impl App {
         if let Ok(iter) = fs::read_dir(full_path) {
             for entry in iter {
                 if let Ok(entry) = entry {
-                    let p = entry.path();
                     let name = entry.file_name().to_string_lossy().to_string();
+                    if name.starts_with(".") {
+                        continue;
+                    }
+                    let p = entry.path();
                     let rel = if rel_path.is_empty() {
                         name
                     } else {
@@ -1317,6 +1332,93 @@ impl App {
         self.status = format!("Yanked {} paths", self.yanked_paths.len());
     }
 
+    fn cut_selected(&mut self) {
+        self.yank_selected();
+        self.buffer_mode = Some(BufferMode::Cut);
+        self.status = format!("Cut {} paths to buffer", self.yanked_paths.len());
+    }
+
+    fn copy_selected(&mut self) {
+        self.yank_selected();
+        self.buffer_mode = Some(BufferMode::Copy);
+        self.status = format!("Copied {} paths to buffer", self.yanked_paths.len());
+    }
+
+    fn paste_buffer(&mut self) -> Result<(), EditorError> {
+        if self.yanked_paths.is_empty() {
+            self.status = "No paths in buffer".to_string();
+            return Ok(());
+        }
+        if let Some(selected) = self.tree_state.selected() {
+            let item = self.visible_items[selected].clone();
+            let target_dir = if item.is_dir {
+                item.path
+            } else {
+                Path::new(&item.path)
+                    .parent()
+                    .unwrap_or(Path::new(""))
+                    .to_string_lossy()
+                    .to_string()
+            };
+            match self.buffer_mode {
+                Some(BufferMode::Cut) => {
+                    self.move_paths(self.yanked_paths.clone(), target_dir)?;
+                    self.yanked_paths.clear();
+                    self.buffer_mode = None;
+                    self.status = "Pasted (moved) from buffer".to_string();
+                }
+                Some(BufferMode::Copy) => {
+                    self.copy_paths(self.yanked_paths.clone(), target_dir)?;
+                    // Do not clear for copy, allow multiple pastes
+                    self.status = "Pasted (cloned) from buffer".to_string();
+                }
+                None => {
+                    self.status = "No buffer mode set".to_string();
+                }
+            }
+            self.file_tree = self.build_root();
+            self.update_visible();
+        }
+        Ok(())
+    }
+
+    fn create_new_file(&mut self, name: String) -> Result<(), EditorError> {
+        if let Some(selected) = self.tree_state.selected() {
+            let item = self.visible_items[selected].clone();
+            let target_dir = if item.is_dir {
+                item.path
+            } else {
+                Path::new(&item.path)
+                    .parent()
+                    .unwrap_or(Path::new(""))
+                    .to_string_lossy()
+                    .to_string()
+            };
+            let new_path = if target_dir.is_empty() {
+                format!("{}.md", name)
+            } else {
+                format!("{}/{}.md", target_dir, name)
+            };
+            let full_path = Path::new(&self.base_dir)
+                .join(&new_path)
+                .to_string_lossy()
+                .to_string();
+            fs::write(&full_path, "")?;
+            let output = Command::new("markdown-scanner")
+                .arg(&full_path)
+                .arg(&self.base_dir)
+                .output()?;
+            if !output.status.success() {
+                let error_msg = String::from_utf8_lossy(&output.stderr).into_owned();
+                return Err(EditorError::Scanner(error_msg));
+            }
+            self.file_tree = self.build_root();
+            self.update_visible();
+            self.status = "Created new file".to_string();
+        }
+        Ok(())
+    }
+
     fn rename_selected(&mut self, new_name: String) -> Result<(), EditorError> {
         if let Some(selected) = self.tree_state.selected() {
             let item = self.visible_items[selected].clone();
@@ -1369,17 +1471,6 @@ impl App {
     }
 
     fn move_paths(&mut self, paths: Vec<String>, target_dir: String) -> Result<(), EditorError> {
-        let current = self.tree_state.selected().unwrap_or(0);
-        let anchor = self.tree_visual_anchor.unwrap_or(current);
-        let min = anchor.min(current);
-        let max = anchor.max(current);
-        let mut to_move = Vec::new();
-        for i in min..=max {
-            let item = self.visible_items[i].clone();
-            if !item.is_dir {
-                to_move.push(item.path);
-            }
-        }
         for old_path in paths {
             let old_full = Path::new(&self.base_dir)
                 .join(&old_path)
@@ -1415,9 +1506,35 @@ impl App {
             }
             self.remove_node(&old_path);
         }
-        self.file_tree = self.build_root();
-        self.update_visible();
-        self.tree_state.select(Some(min));
+        Ok(())
+    }
+
+    fn copy_paths(&mut self, paths: Vec<String>, target_dir: String) -> Result<(), EditorError> {
+        for old_path in paths {
+            let old_full = Path::new(&self.base_dir)
+                .join(&old_path)
+                .to_string_lossy()
+                .to_string();
+            let filename = Path::new(&old_path)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+            let new_path = format!("{}/{}", target_dir, filename);
+            let new_full = Path::new(&self.base_dir)
+                .join(&new_path)
+                .to_string_lossy()
+                .to_string();
+            fs::copy(&old_full, &new_full)?;
+            let output_scan = Command::new("markdown-scanner")
+                .arg(&new_full)
+                .arg(&self.base_dir)
+                .output()?;
+            if !output_scan.status.success() {
+                let error_msg = String::from_utf8_lossy(&output_scan.stderr).into_owned();
+                return Err(EditorError::Scanner(error_msg));
+            }
+        }
         Ok(())
     }
 
@@ -1765,9 +1882,9 @@ impl App {
                     } else if self.command.starts_with("rename ") {
                         let new_name = self.command.trim_start_matches("rename ").to_string();
                         self.rename_selected(new_name)?;
-                    } else if self.command.starts_with("move ") {
-                        let new_dir = self.command.trim_start_matches("move ").to_string();
-                        self.move_paths(self.yanked_paths.clone(), new_dir)?;
+                    } else if self.command.starts_with("new ") {
+                        let name = self.command.trim_start_matches("new ").to_string();
+                        self.create_new_file(name)?;
                     } else {
                         self.status = format!("Unknown command: {}", self.command);
                     }
@@ -2307,38 +2424,20 @@ impl App {
                         self.command = "rename ".to_string();
                         self.status = "Rename to:".to_string();
                     }
-                    ratatui::crossterm::event::KeyCode::Char('m') => {
+                    ratatui::crossterm::event::KeyCode::Char('n') => {
                         self.prev_mode = Some(Mode::FileTree);
                         self.mode = Mode::Command;
-                        self.command = "move ".to_string();
-                        self.status = "Move to:".to_string();
+                        self.command = "new ".to_string();
+                        self.status = "New file name:".to_string();
                     }
                     ratatui::crossterm::event::KeyCode::Char('y') => {
-                        self.yank_selected();
+                        self.copy_selected();
+                    }
+                    ratatui::crossterm::event::KeyCode::Char('x') => {
+                        self.cut_selected();
                     }
                     ratatui::crossterm::event::KeyCode::Char('p') => {
-                        if !self.yanked_paths.is_empty() {
-                            if let Some(selected) = self.tree_state.selected() {
-                                let item = self.visible_items[selected].clone();
-                                let target_dir = if item.is_dir {
-                                    item.path
-                                } else {
-                                    // Use parent if file selected
-                                    Path::new(&item.path)
-                                        .parent()
-                                        .unwrap_or(Path::new(""))
-                                        .to_string_lossy()
-                                        .to_string()
-                                };
-                                self.move_paths(self.yanked_paths.clone(), target_dir)?; // Reuse your move_selected, but pass yanked_paths instead
-                                self.yanked_paths.clear(); // Clear after move
-                                self.file_tree = self.build_root();
-                                self.update_visible();
-                                self.status = "Moved yanked files".to_string();
-                            }
-                        } else {
-                            self.status = "No yanked paths to move".to_string();
-                        }
+                        self.paste_buffer()?;
                     }
                     ratatui::crossterm::event::KeyCode::Char('<') => {
                         if !self.full_tree && self.tree_width_percent > 10 {
@@ -2389,15 +2488,14 @@ impl App {
                     self.mode = Mode::FileTree;
                 }
                 ratatui::crossterm::event::KeyCode::Char('y') => {
-                    self.yank_selected();
+                    self.copy_selected();
                     self.tree_visual_anchor = None;
                     self.mode = Mode::FileTree;
                 }
-                ratatui::crossterm::event::KeyCode::Char('m') => {
-                    self.prev_mode = Some(Mode::FileTreeVisual);
-                    self.mode = Mode::Command;
-                    self.command = "move ".to_string();
-                    self.status = "Move to:".to_string();
+                ratatui::crossterm::event::KeyCode::Char('x') => {
+                    self.cut_selected();
+                    self.tree_visual_anchor = None;
+                    self.mode = Mode::FileTree;
                 }
                 ratatui::crossterm::event::KeyCode::Char('r') => {
                     let current = self.tree_state.selected().unwrap_or(0);
@@ -2487,19 +2585,15 @@ impl App {
                 } else {
                     Constraint::Percentage(self.tree_width_percent)
                 };
+                let editor_constraint = if self.full_tree {
+                    Constraint::Length(0)
+                } else {
+                    Constraint::Percentage(100 - self.tree_width_percent)
+                };
                 let main_chunks = Layout::default()
                     .direction(Direction::Horizontal)
-                    .constraints([
-                        tree_constraint,
-                        Constraint::Percentage(100 - self.tree_width_percent),
-                    ])
+                    .constraints([tree_constraint, editor_constraint])
                     .split(chunks[0]);
-
-                // Render tree in main_chunks[0]
-                // If !self.full_tree, render editor in main_chunks[1]
-                if !self.full_tree {
-                    self.render_editor(f, main_chunks[1])?;
-                }
 
                 let visual_min = self
                     .tree_visual_anchor
@@ -2539,7 +2633,9 @@ impl App {
                 f.render_stateful_widget(list, main_chunks[0], &mut self.tree_state);
 
                 // Render editor on the right
-                self.render_editor(f, main_chunks[1])?;
+                if !self.full_tree {
+                    self.render_editor(f, main_chunks[1])?;
+                }
             }
             Mode::Normal
             | Mode::Insert
@@ -2701,7 +2797,7 @@ impl App {
             let screen_row = (cursor_row - self.scroll_offset) as u16;
             let screen_col = (cursor_col.saturating_sub(self.horizontal_scroll_offset)) as u16;
             let max_width = area_width as u16;
-            let cursor_x = screen_col.min(max_width);
+            let cursor_x = screen_col.min(max_width); // Clamp cursor x
             let cursor_area = Rect {
                 x: area.x + 1 + cursor_x,
                 y: area.y + 1 + screen_row,

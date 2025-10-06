@@ -15,4 +15,6 @@ pub enum EditorError {
     #[error("EditorError: {0}")]
     // InvalidBacklinkIndex(usize),
     InvalidBacklink(String),
+    #[error("Invalid path: {0}")]
+    InvalidPath(String),
 }
