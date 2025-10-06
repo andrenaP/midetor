@@ -127,6 +127,8 @@ pub struct App {
     yanked_paths: Vec<String>,
     prev_mode: Option<Mode>,
     tree_visual_anchor: Option<usize>,
+    tree_width_percent: u16, // e.g., init to 20 in new()
+    full_tree: bool,         // init to false
 }
 
 pub struct CompletionState {
@@ -222,6 +224,8 @@ impl App {
             yanked_paths: Vec::new(),
             prev_mode: None,
             tree_visual_anchor: None,
+            tree_width_percent: 20,
+            full_tree: false,
         })
     }
 
@@ -1036,8 +1040,9 @@ impl App {
             match node {
                 TreeNode::File(p) => {
                     let display = format!(
-                        "{}{}",
+                        "{}{} {}",
                         "  ".repeat(depth),
+                        '',
                         Path::new(p)
                             .file_name()
                             .and_then(|s| s.to_str())
@@ -1056,8 +1061,9 @@ impl App {
                     children,
                 } => {
                     let display = format!(
-                        "{}{}/",
+                        "{}{} {}/",
                         "  ".repeat(depth),
+                        '',
                         Path::new(path)
                             .file_name()
                             .and_then(|s| s.to_str())
@@ -1362,7 +1368,7 @@ impl App {
         Ok(())
     }
 
-    fn move_selected(&mut self, target_dir: String) -> Result<(), EditorError> {
+    fn move_paths(&mut self, paths: Vec<String>, target_dir: String) -> Result<(), EditorError> {
         let current = self.tree_state.selected().unwrap_or(0);
         let anchor = self.tree_visual_anchor.unwrap_or(current);
         let min = anchor.min(current);
@@ -1374,7 +1380,7 @@ impl App {
                 to_move.push(item.path);
             }
         }
-        for old_path in to_move {
+        for old_path in paths {
             let old_full = Path::new(&self.base_dir)
                 .join(&old_path)
                 .to_string_lossy()
@@ -1761,7 +1767,7 @@ impl App {
                         self.rename_selected(new_name)?;
                     } else if self.command.starts_with("move ") {
                         let new_dir = self.command.trim_start_matches("move ").to_string();
-                        self.move_selected(new_dir)?;
+                        self.move_paths(self.yanked_paths.clone(), new_dir)?;
                     } else {
                         self.status = format!("Unknown command: {}", self.command);
                     }
@@ -2310,6 +2316,49 @@ impl App {
                     ratatui::crossterm::event::KeyCode::Char('y') => {
                         self.yank_selected();
                     }
+                    ratatui::crossterm::event::KeyCode::Char('p') => {
+                        if !self.yanked_paths.is_empty() {
+                            if let Some(selected) = self.tree_state.selected() {
+                                let item = self.visible_items[selected].clone();
+                                let target_dir = if item.is_dir {
+                                    item.path
+                                } else {
+                                    // Use parent if file selected
+                                    Path::new(&item.path)
+                                        .parent()
+                                        .unwrap_or(Path::new(""))
+                                        .to_string_lossy()
+                                        .to_string()
+                                };
+                                self.move_paths(self.yanked_paths.clone(), target_dir)?; // Reuse your move_selected, but pass yanked_paths instead
+                                self.yanked_paths.clear(); // Clear after move
+                                self.file_tree = self.build_root();
+                                self.update_visible();
+                                self.status = "Moved yanked files".to_string();
+                            }
+                        } else {
+                            self.status = "No yanked paths to move".to_string();
+                        }
+                    }
+                    ratatui::crossterm::event::KeyCode::Char('<') => {
+                        if !self.full_tree && self.tree_width_percent > 10 {
+                            self.tree_width_percent -= 5;
+                        }
+                    }
+                    ratatui::crossterm::event::KeyCode::Char('>') => {
+                        if !self.full_tree && self.tree_width_percent < 50 {
+                            self.tree_width_percent += 5;
+                        }
+                    }
+                    ratatui::crossterm::event::KeyCode::Char('f') => {
+                        self.full_tree = !self.full_tree;
+                        self.status = if self.full_tree {
+                            "Full-screen FileTree"
+                        } else {
+                            "Split FileTree"
+                        }
+                        .to_string();
+                    }
                     ratatui::crossterm::event::KeyCode::Char(c) => {
                         self.key_sequence.push(c);
                     }
@@ -2399,26 +2448,21 @@ impl App {
                     .map(|(text, _)| ListItem::new(text.clone()))
                     .collect();
                 let title = match self.search_state.search_type {
-                    SearchType::Backlinks => "Backlinks",
-                    SearchType::Tags => "Tags",
-                    SearchType::Files => "Files",
-                    SearchType::None => "Search",
+                    SearchType::Backlinks => format!("Backlinks: {}", self.search_state.query),
+                    SearchType::Tags => format!("Tags: {}", self.search_state.query),
+                    SearchType::Files => format!("Files: {}", self.search_state.query),
+                    SearchType::None => "Search".to_string(),
                 };
                 let list = List::new(items)
                     .block(
                         Block::default()
                             .borders(Borders::ALL)
-                            .title(format!("{}: {}", title, self.search_state.query))
+                            .title(title)
                             .style(Style::default().fg(Color::White)),
                     )
                     .highlight_style(Style::default().bg(Color::White).fg(Color::Black));
-                let popup_area = Rect {
-                    x: chunks[0].x + 2,
-                    y: chunks[0].y + 2,
-                    width: 50,
-                    height: (self.search_state.results.len().min(10) + 2) as u16,
-                };
-                f.render_stateful_widget(list, popup_area, &mut self.search_state.list_state);
+                f.render_stateful_widget(list, chunks[0], &mut self.search_state.list_state);
+                // Use chunks[0] for full screen
             }
             Mode::TagFiles => {
                 let items: Vec<ListItem> = self
@@ -2434,19 +2478,28 @@ impl App {
                             .style(Style::default().fg(Color::White)),
                     )
                     .highlight_style(Style::default().bg(Color::White).fg(Color::Black));
-                let popup_area = Rect {
-                    x: chunks[0].x + 2,
-                    y: chunks[0].y + 2,
-                    width: 50,
-                    height: (self.tag_files.len().min(10) + 2) as u16,
-                };
-                f.render_stateful_widget(list, popup_area, &mut self.tag_files_state);
+                f.render_stateful_widget(list, chunks[0], &mut self.tag_files_state);
+                // Use chunks[0]
             }
             Mode::FileTree | Mode::FileTreeVisual => {
+                let tree_constraint = if self.full_tree {
+                    Constraint::Percentage(100)
+                } else {
+                    Constraint::Percentage(self.tree_width_percent)
+                };
                 let main_chunks = Layout::default()
                     .direction(Direction::Horizontal)
-                    .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+                    .constraints([
+                        tree_constraint,
+                        Constraint::Percentage(100 - self.tree_width_percent),
+                    ])
                     .split(chunks[0]);
+
+                // Render tree in main_chunks[0]
+                // If !self.full_tree, render editor in main_chunks[1]
+                if !self.full_tree {
+                    self.render_editor(f, main_chunks[1])?;
+                }
 
                 let visual_min = self
                     .tree_visual_anchor
@@ -2462,7 +2515,12 @@ impl App {
                     .iter()
                     .enumerate()
                     .map(|(i, item)| {
-                        let mut li = ListItem::new(item.display.clone());
+                        let base_style = if item.is_dir {
+                            Style::default().fg(Color::LightBlue)
+                        } else {
+                            Style::default().fg(Color::White)
+                        };
+                        let mut li = ListItem::new(item.display.clone()).style(base_style);
                         if self.mode == Mode::FileTreeVisual && i >= visual_min && i <= visual_max {
                             li = li.style(Style::default().bg(Color::LightBlue));
                         } else if Some(i) == self.tree_state.selected() {
@@ -2643,14 +2701,26 @@ impl App {
             let screen_row = (cursor_row - self.scroll_offset) as u16;
             let screen_col = (cursor_col.saturating_sub(self.horizontal_scroll_offset)) as u16;
             let max_width = area_width as u16;
-            let cursor_x = screen_col.min(max_width); // Clamp cursor x
+            let cursor_x = screen_col.min(max_width);
             let cursor_area = Rect {
                 x: area.x + 1 + cursor_x,
                 y: area.y + 1 + screen_row,
                 width: 1,
                 height: 1,
             };
-            let cursor_span = Span::styled(" ", Style::default().bg(Color::White).fg(Color::Black));
+
+            // Get the actual char at cursor (or space if beyond line end)
+            let line = self
+                .textarea
+                .lines()
+                .get(cursor_row)
+                .cloned()
+                .unwrap_or_default();
+            let ch: char = line.chars().nth(cursor_col).unwrap_or(' ');
+
+            // Render the char with inverted colors
+            let cursor_style = Style::default().bg(Color::White).fg(Color::Black);
+            let cursor_span = Span::styled(ch.to_string(), cursor_style);
             f.render_widget(Paragraph::new(cursor_span), cursor_area);
         }
 
