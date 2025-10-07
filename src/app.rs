@@ -376,84 +376,55 @@ impl App {
     }
 
     fn open_wikilink_file(&mut self, wikilink: String) -> Result<(), EditorError> {
-        // Normalize the wikilink to a file path
-        let path = if wikilink.ends_with(".md") {
-            wikilink.clone() // Preserve path as-is if it includes .md
+        // Normalize the wikilink to a file name
+        let file_name = if wikilink.ends_with(".md") {
+            wikilink.clone() // Preserve as-is if it includes .md
         } else {
             format!("{}.md", wikilink) // Append .md if not present
         };
 
-        // Try the wikilink as a relative path (e.g., Every day info/2023-04-18.md)
-        let db_path = path.clone();
-        let full_path = Path::new(&self.base_dir)
-            .join(&path)
-            .to_string_lossy()
-            .to_string();
-
-        // Check if the file exists in the database with the exact path
-        let file_id_result = {
-            let mut stmt = self.db.prepare("SELECT id FROM files WHERE path = ?")?;
-            stmt.query_row([&db_path], |row| row.get(0))
+        // Try to find the file by file_name in the database
+        let file_result = {
+            let mut stmt = self
+                .db
+                .prepare("SELECT id, path FROM files WHERE file_name = ?")?;
+            stmt.query_row([&file_name], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
         };
 
-        let file_id = match file_id_result {
-            Ok(id) => id,
+        let (file_id, path) = match file_result {
+            Ok((id, path)) => (id, path),
             Err(rusqlite::Error::QueryReturnedNoRows) => {
-                // Try finding the file by basename (e.g., 2023-04-18.md anywhere in the vault)
-                let basename = Path::new(&path)
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string();
+                // File doesn't exist; create it in the base_dir
+                let path = format!("{}/{}", self.base_dir, file_name);
+                if let Some(parent) = Path::new(&path).parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&path, "")?;
+                let output = Command::new("markdown-scanner")
+                    .arg(&path)
+                    .arg(&self.base_dir)
+                    .output()?;
+                if !output.status.success() {
+                    let error_msg = String::from_utf8_lossy(&output.stderr).into_owned();
+                    return Err(EditorError::Scanner(error_msg));
+                }
                 let mut stmt = self
                     .db
-                    .prepare("SELECT id, path FROM files WHERE path LIKE ?")?;
-                let file_result = stmt.query_row([format!("%/{}", basename)], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-                });
-                drop(stmt);
-
-                match file_result {
-                    Ok((id, found_path)) => {
-                        // Update full_path to the actual file location
-                        let full_path = Path::new(&self.base_dir)
-                            .join(&found_path)
-                            .to_string_lossy()
-                            .to_string();
-                        self.history.truncate(self.history_index + 1);
-                        self.history.push((full_path.clone(), id));
-                        self.history_index += 1;
-                        self.open_file(full_path, id)?;
-                        return Ok(());
-                    }
-                    Err(rusqlite::Error::QueryReturnedNoRows) => {
-                        // File doesn't exist; create it
-                        if let Some(parent) = Path::new(&full_path).parent() {
-                            fs::create_dir_all(parent)?;
-                        }
-                        fs::write(&full_path, "")?;
-                        let output = Command::new("markdown-scanner")
-                            .arg(&full_path)
-                            .arg(&self.base_dir)
-                            .output()?;
-                        if !output.status.success() {
-                            let error_msg = String::from_utf8_lossy(&output.stderr).into_owned();
-                            return Err(EditorError::Scanner(error_msg));
-                        }
-                        let mut stmt = self.db.prepare("SELECT id FROM files WHERE path = ?")?;
-                        stmt.query_row([&db_path], |row| row.get(0))
-                            .map_err(|e| EditorError::Database(e))?
-                    }
-                    Err(e) => return Err(EditorError::Database(e)),
-                }
+                    .prepare("SELECT id FROM files WHERE file_name = ?")?;
+                let file_id = stmt
+                    .query_row([&file_name], |row| row.get(0))
+                    .map_err(|e| EditorError::Database(e))?;
+                (file_id, path)
             }
             Err(e) => return Err(EditorError::Database(e)),
         };
 
         self.history.truncate(self.history_index + 1);
-        self.history.push((full_path.clone(), file_id));
+        self.history.push((path.clone(), file_id));
         self.history_index += 1;
-        self.open_file(full_path, file_id)?;
+        self.open_file(path, file_id)?;
         Ok(())
     }
 
@@ -697,16 +668,16 @@ impl App {
 
     fn load_tag_files(&mut self, tag: &str) -> Result<(), EditorError> {
         let mut stmt = self.db.prepare(
-            "SELECT f.path, f.id FROM files f
+            "SELECT f.file_name, f.id FROM files f
              JOIN file_tags ft ON f.id = ft.file_id
              JOIN tags t ON ft.tag_id = t.id
              WHERE t.tag = ?",
         )?;
         let files = stmt
             .query_map([tag], |row| {
-                let path: String = row.get(0)?;
+                let file_name: String = row.get(0)?;
                 let file_id: i64 = row.get(1)?;
-                Ok((path, file_id))
+                Ok((file_name, file_id))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         self.tag_files = files;
@@ -722,11 +693,18 @@ impl App {
 
     fn select_tag_file(&mut self) -> Result<(), EditorError> {
         if let Some(selected) = self.tag_files_state.selected() {
-            if let Some((path, file_id)) = self.tag_files.get(selected) {
+            if let Some((_file_name, file_id)) = self.tag_files.get(selected) {
+                // Retrieve full path from database
+                let path: String = self
+                    .db
+                    .query_row("SELECT path FROM files WHERE id = ?", [file_id], |row| {
+                        row.get(0)
+                    })
+                    .map_err(|e| EditorError::Database(e))?;
                 self.history.truncate(self.history_index + 1);
                 self.history.push((path.clone(), *file_id));
                 self.history_index += 1;
-                self.open_file(path.clone(), *file_id)?;
+                self.open_file(path, *file_id)?;
             }
         }
         self.cancel_tag_files();
@@ -748,6 +726,7 @@ impl App {
         self.search_state.results = Vec::new();
         self.search_state.list_state = ListState::default();
         self.mode = Mode::Search;
+        self.view = View::Editor;
         self.status = format!("Searching {:?}", search_type);
         self.key_sequence.clear();
         self.update_search_results()?;
@@ -775,29 +754,42 @@ impl App {
         let target = if let Some(wikilink) = self.extract_wikilink(&line) {
             wikilink
         } else {
-            self.file_path.clone()
+            // Use file_name from files table for the current file
+            let file_name: String = self
+                .db
+                .query_row(
+                    "SELECT file_name FROM files WHERE id = ?",
+                    [self.file_id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| EditorError::Database(e))?;
+            file_name
         };
 
-        let query = "SELECT DISTINCT f.path, f.id
+        let query = "SELECT DISTINCT f.file_name, f.id
                      FROM backlinks b
                      JOIN files f ON b.file_id = f.id
                      JOIN files fp ON b.backlink_id = fp.id
-                     WHERE fp.path LIKE ?";
+                     WHERE fp.file_name LIKE ? AND f.id != ?";
         let mut stmt = self.db.prepare(query)?;
         let results = stmt
-            .query_map([format!("%{}%", target)], |row| {
-                let path: String = row.get(0)?;
+            .query_map(params![format!("%{}%", target), self.file_id], |row| {
+                let file_name: String = row.get(0)?;
                 let file_id: i64 = row.get(1)?;
-                Ok((path, Some(file_id)))
+                Ok((file_name, Some(file_id)))
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
         self.search_state.results = results;
+        self.search_state.list_state = ListState::default();
+        if !self.search_state.results.is_empty() {
+            self.search_state.list_state.select(Some(0));
+        }
         Ok(())
     }
 
     fn search_tags(&mut self) -> Result<(), EditorError> {
-        let query = "SELECT DISTINCT tag FROM tags WHERE tag LIKE ? LIMIT 10";
+        let query = "SELECT DISTINCT tag FROM tags WHERE tag LIKE ?";
         let mut stmt = self.db.prepare(query)?;
         let search_pattern = if self.search_state.query.is_empty() {
             "%".to_string()
@@ -816,7 +808,7 @@ impl App {
     }
 
     fn search_files(&mut self) -> Result<(), EditorError> {
-        let query = "SELECT path, id FROM files WHERE path LIKE ? LIMIT 10";
+        let query = "SELECT file_name, id FROM files WHERE file_name LIKE ?";
         let mut stmt = self.db.prepare(query)?;
         let search_pattern = if self.search_state.query.is_empty() {
             "%".to_string()
@@ -825,9 +817,9 @@ impl App {
         };
         let results = stmt
             .query_map(params![search_pattern], |row| {
-                let path: String = row.get(0)?;
+                let file_name: String = row.get(0)?;
                 let file_id: i64 = row.get(1)?;
-                Ok((path, Some(file_id)))
+                Ok((file_name, Some(file_id)))
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -843,18 +835,27 @@ impl App {
 
     fn select_search_result(&mut self) -> Result<(), EditorError> {
         if let Some(selected) = self.search_state.list_state.selected() {
-            if let Some((result, file_id)) = self.search_state.results.get(selected).cloned() {
+            if let Some((file_name, file_id)) = self.search_state.results.get(selected).cloned() {
                 match self.search_state.search_type {
                     SearchType::Backlinks | SearchType::Files => {
                         if let Some(file_id) = file_id {
+                            // Retrieve full path from database
+                            let path: String = self
+                                .db
+                                .query_row(
+                                    "SELECT path FROM files WHERE id = ?",
+                                    [file_id],
+                                    |row| row.get(0),
+                                )
+                                .map_err(|e| EditorError::Database(e))?;
                             self.history.truncate(self.history_index + 1);
-                            self.history.push((result.clone(), file_id));
+                            self.history.push((path.clone(), file_id));
                             self.history_index += 1;
-                            self.open_file(result, file_id)?;
+                            self.open_file(path, file_id)?;
                         }
                     }
                     SearchType::Tags => {
-                        self.load_tag_files(&result)?;
+                        self.load_tag_files(&file_name)?;
                         if !self.tag_files.is_empty() {
                             self.mode = Mode::TagFiles;
                         } else {
@@ -865,7 +866,7 @@ impl App {
                 }
             }
         } else {
-            self.status = "No tag selected".to_string();
+            self.status = "No result selected".to_string();
         }
         if self.mode != Mode::TagFiles {
             self.cancel_search();
@@ -2539,34 +2540,48 @@ impl App {
 
         match self.mode {
             Mode::Search => {
-                let items: Vec<ListItem> = self
-                    .search_state
-                    .results
-                    .iter()
-                    .map(|(text, _)| ListItem::new(text.clone()))
-                    .collect();
+                // Render search input field or results list
                 let title = match self.search_state.search_type {
                     SearchType::Backlinks => format!("Backlinks: {}", self.search_state.query),
                     SearchType::Tags => format!("Tags: {}", self.search_state.query),
                     SearchType::Files => format!("Files: {}", self.search_state.query),
                     SearchType::None => "Search".to_string(),
                 };
-                let list = List::new(items)
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title(title)
-                            .style(Style::default().fg(Color::White)),
-                    )
-                    .highlight_style(Style::default().bg(Color::White).fg(Color::Black));
-                f.render_stateful_widget(list, chunks[0], &mut self.search_state.list_state);
-                // Use chunks[0] for full screen
+                if self.search_state.results.is_empty() && self.search_state.query.is_empty() {
+                    // Render input field for search
+                    let input = Paragraph::new(self.search_state.query.clone())
+                        .block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .title(title)
+                                .style(Style::default().fg(Color::White)),
+                        )
+                        .style(Style::default().fg(Color::Yellow));
+                    f.render_widget(input, chunks[0]);
+                } else {
+                    // Render search results
+                    let items: Vec<ListItem> = self
+                        .search_state
+                        .results
+                        .iter()
+                        .map(|(text, _)| ListItem::new(text.clone()))
+                        .collect();
+                    let list = List::new(items)
+                        .block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .title(title)
+                                .style(Style::default().fg(Color::White)),
+                        )
+                        .highlight_style(Style::default().bg(Color::White).fg(Color::Black));
+                    f.render_stateful_widget(list, chunks[0], &mut self.search_state.list_state);
+                }
             }
             Mode::TagFiles => {
                 let items: Vec<ListItem> = self
                     .tag_files
                     .iter()
-                    .map(|(path, _)| ListItem::new(path.clone()))
+                    .map(|(file_name, _)| ListItem::new(file_name.clone()))
                     .collect();
                 let list = List::new(items)
                     .block(
@@ -2577,7 +2592,6 @@ impl App {
                     )
                     .highlight_style(Style::default().bg(Color::White).fg(Color::Black));
                 f.render_stateful_widget(list, chunks[0], &mut self.tag_files_state);
-                // Use chunks[0]
             }
             Mode::FileTree | Mode::FileTreeVisual => {
                 let tree_constraint = if self.full_tree {
@@ -2632,7 +2646,6 @@ impl App {
                 );
                 f.render_stateful_widget(list, main_chunks[0], &mut self.tree_state);
 
-                // Render editor on the right
                 if !self.full_tree {
                     self.render_editor(f, main_chunks[1])?;
                 }
@@ -2662,6 +2675,7 @@ impl App {
 
         let command = Paragraph::new(match self.mode {
             Mode::Command => format!(":{}", self.command),
+            Mode::Search => format!("/{}", self.search_state.query),
             Mode::Normal | Mode::FileTree if !self.key_sequence.is_empty() => {
                 format!("{}", self.key_sequence)
             }
