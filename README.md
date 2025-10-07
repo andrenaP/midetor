@@ -74,7 +74,7 @@ Well this is complicated. It works like vim `:wq` `:w` `:q`.
 - `\ob` for backlinks.
 - `\f` search
 - `\oot` `\ooT` `\ooy` open dayly files.
-- `\e` open `FileTreeVisual`. `oc`, `on` to sort my time or name. Other: `y` for copy, `x` for cut `p`, for paste, `v` for selection.
+- `\t` open `FileTreeVisual`. `oc`, `on` to sort my time or name. Other: `y` for copy, `x` for cut `p`, for paste, `v` for selection.
 
 
 ## Database

@@ -1606,7 +1606,7 @@ impl App {
                                 self.key_sequence.clear();
                                 self.status = "Opened tomorrow's file".to_string();
                             }
-                            "\\e" => {
+                            "\\t" => {
                                 if self.file_tree.is_empty() {
                                     self.file_tree = self.build_root();
                                 }
@@ -1624,7 +1624,7 @@ impl App {
                                 || "\\oot".starts_with(s)
                                 || "\\ooy".starts_with(s)
                                 || "\\ooT".starts_with(s)
-                                || "\\e".starts_with(s)) =>
+                                || "\\t".starts_with(s)) =>
                             {
                                 self.key_sequence.clear();
                                 self.status = format!("Invalid sequence 1: {}", s);
@@ -2170,7 +2170,7 @@ impl App {
                                 self.textarea.set_block(
                                     Block::default()
                                         .borders(Borders::ALL)
-                                        .title("Markdown Editor")
+                                        .title("Midetor")
                                         .style(Style::default().fg(Color::White)),
                                 );
                                 self.textarea.set_cursor_line_style(Style::default());

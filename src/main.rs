@@ -20,8 +20,8 @@ use error::EditorError;
 fn main() -> Result<(), EditorError> {
     // Define CLI using clap
     let matches = Command::new("midetor")
-        .version("1.0")
-        .about("A terminal-based Markdown editor with Obsidian-like features")
+        .version("0.4.0")
+        .about("A terminal-based vim like Markdown editor with Obsidian-like features")
         .arg(
             Arg::new("file_path")
                 .help("Path to the Markdown file to edit")
@@ -30,7 +30,7 @@ fn main() -> Result<(), EditorError> {
         )
         .arg(
             Arg::new("base_dir")
-                .help("Base directory of the Obsidian vault (defaults to OBSIDIAN_VAULT_MAIN_PATH or current directory)")
+                .help("Base directory of the Obsidian vault (defaults to Obsidian_valt_main_path or current directory)")
                 .index(2)
                 .required(false),
         )
