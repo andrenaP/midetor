@@ -376,12 +376,24 @@ impl App {
     }
 
     fn open_wikilink_file(&mut self, wikilink: String) -> Result<(), EditorError> {
-        // Normalize the wikilink to a file name
-        let file_name = if wikilink.ends_with(".md") {
-            wikilink.clone() // Preserve as-is if it includes .md
-        } else {
-            format!("{}.md", wikilink) // Append .md if not present
-        };
+        // Extract file name from the path
+        let file_name = Path::new(&wikilink)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| {
+                if s.ends_with(".md") {
+                    s.to_string()
+                } else {
+                    format!("{}.md", s)
+                }
+            })
+            .unwrap_or_else(|| {
+                if wikilink.ends_with(".md") {
+                    wikilink.clone()
+                } else {
+                    format!("{}.md", wikilink)
+                }
+            });
 
         // Try to find the file by file_name in the database
         let file_result = {
@@ -397,7 +409,7 @@ impl App {
             Ok((id, path)) => (id, path),
             Err(rusqlite::Error::QueryReturnedNoRows) => {
                 // File doesn't exist; create it in the base_dir
-                let path = format!("{}/{}", self.base_dir, file_name);
+                let path = format!("{}/{}", self.base_dir, wikilink); // Use original wikilink as path
                 if let Some(parent) = Path::new(&path).parent() {
                     fs::create_dir_all(parent)?;
                 }
