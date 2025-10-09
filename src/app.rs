@@ -377,15 +377,20 @@ impl App {
 
     fn open_wikilink_file(&mut self, wikilink: String) -> Result<(), EditorError> {
         // Extract file name from the path
+        let wikilink = if wikilink.ends_with(".md") {
+            wikilink
+        } else {
+            format!("{}.md", wikilink)
+        };
         let file_name = Path::new(&wikilink)
             .file_name()
             .and_then(|s| s.to_str())
             .map(|s| {
-                if s.ends_with(".md") {
-                    s.to_string()
-                } else {
-                    format!("{}.md", s)
-                }
+                // if s.ends_with(".md") {
+                s.to_string()
+                // } else {
+                //     format!("{}.md", s)
+                // }
             })
             .unwrap_or_else(|| {
                 if wikilink.ends_with(".md") {
