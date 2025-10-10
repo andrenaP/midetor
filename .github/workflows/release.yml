@@ -21,6 +21,24 @@ jobs:
         with:
           platforms: arm64
 
+      - name: Install musl tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Install cross-compilers
+        run: |
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
+            sudo apt-get install -y g++-aarch64-linux-gnu
+            rustup target add aarch64-unknown-linux-musl
+            echo "CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+            echo "CXX_aarch64_unknown_linux_musl=aarch64-linux-gnu-g++" >> $GITHUB_ENV
+          else
+            rustup target add x86_64-unknown-linux-musl
+            echo "CC_x86_64_unknown_linux_musl=x86_64-linux-musl-gcc" >> $GITHUB_ENV
+            echo "CXX_x86_64_unknown_linux_musl=x86_64-linux-musl-g++" >> $GITHUB_ENV
+          fi
+
       - name: Install Rust toolchain
         uses: actions-rs/toolchain@v1
         with:
@@ -38,7 +56,7 @@ jobs:
       - name: Package artifact
         shell: bash
         run: |
-          BINARY_NAME=$(basename $(find target/${{ matrix.target }}/release/ -type f -perm +111 | head -1))
+          BINARY_NAME=$(basename $(find target/${{ matrix.target }}/release/ -type f -perm /111 | head -1))
           if [ -z "$BINARY_NAME" ]; then
             echo "No executable binary found"
             exit 1
