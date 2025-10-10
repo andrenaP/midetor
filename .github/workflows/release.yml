@@ -1,4 +1,4 @@
-name: Release Rust Binaries
+name: Release midetor Binary
 
 permissions:
   contents: write # Needed to create releases
@@ -16,20 +16,17 @@ jobs:
       - name: Create GitHub Release
         uses: taiki-e/create-gh-release-action@v1
         with:
-          token: ${{ secrets.GITHUB_TOKEN }} # No changelog to avoid errors
+          token: ${{ secrets.GITHUB_TOKEN }} # No changelog
 
   upload-assets:
     needs: create-release
     strategy:
       matrix:
-        include:
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
-          - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
-          - target: x86_64-pc-windows-gnu
-            os: ubuntu-latest
-    runs-on: ${{ matrix.os }}
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - x86_64-pc-windows-gnu
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Setup Rust
@@ -38,14 +35,22 @@ jobs:
           targets: ${{ matrix.target }}
       - name: Install musl-tools for musl targets
         if: contains(matrix.target, 'musl')
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
       - name: Install mingw-w64 for Windows GNU target
         if: contains(matrix.target, 'windows-gnu')
-        run: sudo apt-get update && sudo apt-get install -y mingw-w64
-      - name: Build and Upload Binary
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mingw-w64
+      - name: Build binary
+        run: |
+          cargo build --release --target ${{ matrix.target }}
+          ls -la target/${{ matrix.target }}/release/
+      - name: Upload midetor
         uses: taiki-e/upload-rust-binary-action@v1
         with:
-          bin: midetor # Your binaries
+          bin: midetor
           target: ${{ matrix.target }}
-          archive: gz # Compress as .tar.gz
+          archive: midetor-${{ matrix.target }}.tar.gz
           token: ${{ secrets.GITHUB_TOKEN }}
