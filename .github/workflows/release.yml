@@ -1,8 +1,7 @@
-name: Release Rust Binaries # Or your workflow name
+name: Release midetor Binary
 
-# Grant permissions at the workflow level (applies to all jobs)
 permissions:
-  contents: write # Required for creating releases
+  contents: write # Grant write access for releases
 
 on:
   push:
@@ -15,73 +14,46 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Create GitHub Release
-        uses: taiki-e/create-gh-release-action@v1 # Or softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v2 # Use your preferred action
         with:
-          token: ${{ secrets.GITHUB_TOKEN }} # Uses the now-permitted token
-
-  upload-assets:
-    # ... your existing upload steps (e.g., building and uploading binaries)
-    needs: create-release
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write # Also grant at job level if needed for uploads
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up QEMU (for ARM)
-        if: matrix.target == 'aarch64-unknown-linux-musl'
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64
-
-      - name: Install musl tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
-
-      - name: Install cross-compilers
-        run: |
-          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
-            sudo apt-get install -y g++-aarch64-linux-gnu
-            rustup target add aarch64-unknown-linux-musl
-            echo "CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
-            echo "CXX_aarch64_unknown_linux_musl=aarch64-linux-gnu-g++" >> $GITHUB_ENV
-          else
-            rustup target add x86_64-unknown-linux-musl
-            echo "CC_x86_64_unknown_linux_musl=x86_64-linux-musl-gcc" >> $GITHUB_ENV
-            echo "CXX_x86_64_unknown_linux_musl=x86_64-linux-musl-g++" >> $GITHUB_ENV
-          fi
-
-      - name: Install Rust toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
-          target: ${{ matrix.target }}
-
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-
-      - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Package artifact
-        shell: bash
-        run: |
-          BINARY_NAME=$(basename $(find target/${{ matrix.target }}/release/ -type f -perm /111 | head -1))
-          if [ -z "$BINARY_NAME" ]; then
-            echo "No executable binary found"
-            exit 1
-          fi
-          mkdir -p dist
-          cp "target/${{ matrix.target }}/release/$BINARY_NAME" "dist/${BINARY_NAME}-${{ matrix.target }}"
-          echo "BINARY_NAME=$BINARY_NAME" >> $GITHUB_ENV
-
-      - name: Upload to release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
+          generate_release_notes: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  upload-assets:
+    needs: create-release
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - x86_64-pc-windows-gnu
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools mingw-w64
+          if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-musl" ]]; then
+            sudo apt-get install -y gcc-aarch64-linux-gnu
+          fi
+      - name: Build binary
+        run: |
+          cargo build --release --target ${{ matrix.target }}
+          ls -la target/${{ matrix.target }}/release/
+      - name: Upload midetor
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: midetor
+          target: ${{ matrix.target }}
+          archive: midetor-${{ matrix.target }}.tar.gz
+          token: ${{ secrets.GITHUB_TOKEN }}
