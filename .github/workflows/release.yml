@@ -1,7 +1,4 @@
-name: Release midetor Binary
-
-permissions:
-  contents: write # Needed to create releases
+name: Rust Build for Linux Releases
 
 on:
   push:
@@ -9,45 +6,50 @@ on:
       - "v[0-9]+.*" # Triggers on tags like v0.1.0
 
 jobs:
-  create-release:
+  build:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Create GitHub Release
-        uses: taiki-e/create-gh-release-action@v1
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }} # No changelog
-
-  upload-assets:
-    needs: create-release
     strategy:
       matrix:
-        target:
-          - x86_64-unknown-linux-musl
-          - aarch64-unknown-linux-musl
-          - x86_64-pc-windows-gnu
-    runs-on: ubuntu-latest
+        target: [aarch64-unknown-linux-musl, x86_64-unknown-linux-musl]
     steps:
-      - uses: actions/checkout@v4
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU (for ARM)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        uses: docker/setup-qemu-action@v3
         with:
-          targets: ${{ matrix.target }}
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools mingw-w64
-          if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-musl" ]]; then
-            sudo apt-get install -y gcc-aarch64-linux-gnu
-          fi
-      - name: Build binary
-        run: |
-          cargo build --release --target ${{ matrix.target }}
-          ls -la target/${{ matrix.target }}/release/
-      - name: Upload midetor
-        uses: taiki-e/upload-rust-binary-action@v1
+          platforms: arm64
+
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
         with:
-          bin: midetor
+          profile: minimal
+          toolchain: stable
+          override: true
           target: ${{ matrix.target }}
-          archive: midetor-${{ matrix.target }}.tar.gz
-          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package artifact
+        shell: bash
+        run: |
+          BINARY_NAME=$(basename $(find target/${{ matrix.target }}/release/ -type f -perm +111 | head -1))
+          if [ -z "$BINARY_NAME" ]; then
+            echo "No executable binary found"
+            exit 1
+          fi
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/$BINARY_NAME" "dist/${BINARY_NAME}-${{ matrix.target }}"
+          echo "BINARY_NAME=$BINARY_NAME" >> $GITHUB_ENV
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
