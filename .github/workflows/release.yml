@@ -36,15 +36,11 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools mingw-w64 libonig-dev
-          # For aarch64, use cross-rs toolchain
+          sudo apt-get install -y musl-tools mingw-w64
           if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-musl" ]]; then
-            rustup target add aarch64-unknown-linux-musl
             sudo apt-get install -y gcc-aarch64-linux-gnu
           fi
       - name: Build binary
-        env:
-          RUSTONIG_SYSTEM_LIBONIG: 1 # Use system oniguruma
         run: |
           cargo build --release --target ${{ matrix.target }}
           ls -la target/${{ matrix.target }}/release/
