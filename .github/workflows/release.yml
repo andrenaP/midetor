@@ -1,16 +1,30 @@
-name: Rust Build for Linux Releases
+name: Release Rust Binaries # Or your workflow name
+
+# Grant permissions at the workflow level (applies to all jobs)
+permissions:
+  contents: write # Required for creating releases
 
 on:
   push:
     tags:
-      - "v[0-9]+.*" # Triggers on tags like v0.1.0
+      - "v[0-9]+.*" # Triggers on tags like v1.0.7
 
 jobs:
-  build:
+  create-release:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        target: [aarch64-unknown-linux-musl, x86_64-unknown-linux-musl]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create GitHub Release
+        uses: taiki-e/create-gh-release-action@v1 # Or softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }} # Uses the now-permitted token
+
+  upload-assets:
+    # ... your existing upload steps (e.g., building and uploading binaries)
+    needs: create-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Also grant at job level if needed for uploads
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
