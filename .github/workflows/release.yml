@@ -40,4 +40,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          asset_paths: '["midetor-gnu-linux-x86_64.tar.gz", "midetor-windows.zip", "midetor-gnu-linux-x86_64.tar.gz.sha256", "midetor-windows.zip.sha256"]'
+          files: |
+            midetor-gnu-linux-x86_64.tar.gz
+            midetor-windows.zip
+            midetor-gnu-linux-x86_64.tar.gz.sha256
+            midetor-windows.zip.sha256
