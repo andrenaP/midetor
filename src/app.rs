@@ -1372,11 +1372,16 @@ impl App {
             let target_dir = if item.is_dir {
                 item.path
             } else {
-                Path::new(&item.path)
+                let path = Path::new(&item.path)
                     .parent()
                     .unwrap_or(Path::new(""))
                     .to_string_lossy()
-                    .to_string()
+                    .to_string();
+                if path == "" {
+                    self.base_dir.clone()
+                } else {
+                    path
+                }
             };
             match self.buffer_mode {
                 Some(BufferMode::Cut) => {
