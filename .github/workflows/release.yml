@@ -1,0 +1,46 @@
+name: Release Rust Binaries
+
+permissions:
+  contents: write # Needed to create releases
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.*" # Triggers on tags like v1.0.0
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create GitHub Release
+        uses: taiki-e/create-gh-release-action@v1
+        with:
+          changelog: CHANGELOG.md # Optional: Path to your changelog
+          token: ${{ secrets.GITHUB_TOKEN }} # Built-in secret for auth
+
+  upload-assets:
+    needs: create-release # Wait for release to be created
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl # Static Linux binary
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin # macOS
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc # Windows
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable # Installs stable Rust
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build and Upload Binary
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: midetor
+          target: ${{ matrix.target }}
+          archive: gz # Compresses to .tar.gz for easier download
+          token: ${{ secrets.GITHUB_TOKEN }}
