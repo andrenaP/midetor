@@ -418,7 +418,6 @@ impl App {
                 if let Some(parent) = Path::new(&path).parent() {
                     fs::create_dir_all(parent)?;
                 }
-                fs::write(&path, "")?;
                 let output = Command::new("markdown-scanner")
                     .arg(&path)
                     .arg(&self.base_dir)
@@ -2427,7 +2426,7 @@ impl App {
                                 self.toggle_expand_dir(selected)?;
                             } else {
                                 self.open_wikilink_file(item.path)?;
-                                // self.mode = Mode::Normal;
+                                self.mode = Mode::Normal;
                             }
                         }
                     }
