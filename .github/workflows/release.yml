@@ -16,7 +16,7 @@ jobs:
       - name: Create GitHub Release
         uses: taiki-e/create-gh-release-action@v1
         with:
-          changelog: CHANGELOG.md # Optional: Path to your changelog
+          # changelog: CHANGELOG.md # Optional: Path to your changelog
           token: ${{ secrets.GITHUB_TOKEN }} # Built-in secret for auth
 
   upload-assets:
