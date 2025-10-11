@@ -613,96 +613,97 @@ impl App {
 
     fn select_completion(&mut self) -> Result<(), EditorError> {
         if let Some(selected) = self.completion_state.list_state.selected() {
-            if let Some(suggestion) = self.completion_state.suggestions.get(selected) {
+            if let Some(suggestion) = self.completion_state.suggestions.get(selected).cloned() {
                 let (current_row, current_col) = self.textarea.cursor();
-                let current_line = self.textarea.lines()[current_row].clone();
+                let mut current_lines = self.textarea.lines().to_vec();
 
-                // Convert character index to byte index
-                let col_bytes = current_line
-                    .char_indices()
-                    .nth(current_col)
-                    .map(|(i, _)| i)
-                    .unwrap_or(current_line.len());
-
-                // Find the most recent trigger in the current line up to cursor
-                let trigger_pos = match self.completion_state.completion_type {
-                    CompletionType::File => current_line[..col_bytes].rfind("[["),
-                    CompletionType::Tag => current_line[..col_bytes].rfind("#"),
-                    CompletionType::Variable => current_line[..col_bytes].rfind("@"),
-                    CompletionType::None => None,
-                };
-
-                let insert_text = match self.completion_state.completion_type {
-                    CompletionType::File => format!("[[{}]]", suggestion),
-                    CompletionType::Tag => format!("#{}", suggestion),
-                    CompletionType::Variable => {
-                        match suggestion.as_str() {
-                            "date" => chrono::Local::now().format("%Y-%m-%d").to_string(),
-                            "time" => chrono::Local::now().format("%H:%M:%S").to_string(),
-                            // "file-name" => self.file_name.clone(), // Assume self.file_name exists
-                            _ => suggestion.clone(),
-                        }
-                    }
-                    CompletionType::None => String::new(),
-                };
-
-                if let Some(start) = trigger_pos {
-                    // Remove text from trigger start (including trigger) to current cursor position
-                    let trigger_length = match self.completion_state.completion_type {
-                        CompletionType::File => 2,     // "[["
-                        CompletionType::Tag => 1,      // "#"
-                        CompletionType::Variable => 1, // "@"
-                        CompletionType::None => 0,
+                if let Some(current_line) = current_lines.get_mut(current_row) {
+                    // Determine the trigger and its length
+                    let (trigger, _trigger_len) = match self.completion_state.completion_type {
+                        CompletionType::File => ("[[", 2),
+                        CompletionType::Tag => ("#", 1),
+                        CompletionType::Variable => ("@", 1),
+                        _ => ("", 0),
                     };
-                    let remove_start = start; // Start at trigger position to include it in removal
-                    let mut new_lines = self.textarea.lines().to_vec();
-                    let new_line = format!("{}{}", &current_line[..remove_start], &insert_text,);
-                    new_lines[current_row] = new_line;
-                    self.textarea = TextArea::new(new_lines);
-                    self.textarea.set_block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title("Markdown Editor")
-                            .style(Style::default().fg(Color::White)),
-                    );
-                    self.textarea.set_cursor_line_style(Style::default());
-                    self.textarea
-                        .set_cursor_style(Style::default().bg(Color::White).fg(Color::Black));
-                    self.textarea
-                        .set_selection_style(Style::default().bg(Color::LightBlue));
 
-                    // Calculate new cursor position in characters (after the inserted text)
-                    let prefix_chars = current_line[..remove_start].chars().count();
-                    let insert_chars = insert_text.chars().count();
-                    let new_col = prefix_chars + insert_chars;
-                    self.textarea.move_cursor(tui_textarea::CursorMove::Jump(
-                        current_row as u16,
-                        new_col as u16,
-                    ));
-                } else {
-                    // Fallback: Delete the query and trigger
-                    let trigger_length = match self.completion_state.completion_type {
-                        CompletionType::File => 2,
-                        CompletionType::Tag => 1,
-                        CompletionType::Variable => 1,
-                        CompletionType::None => 0,
-                    };
-                    let delete_len = self.completion_state.query.len() + trigger_length;
-                    let new_col = current_col.saturating_sub(delete_len);
-                    self.textarea.move_cursor(tui_textarea::CursorMove::Jump(
-                        current_row as u16,
-                        new_col as u16,
-                    ));
-                    for _ in 0..delete_len {
-                        self.textarea.delete_char();
+                    // Get the character indices up to the current cursor position.
+                    // We're iterating over the characters here, but collecting the byte indices.
+                    let char_indices: Vec<(usize, char)> =
+                        current_line.char_indices().take(current_col).collect();
+
+                    // Find the byte index of the trigger by iterating backwards
+                    let trigger_start_byte_option = char_indices
+                        .iter()
+                        .rev()
+                        .find(|(i, _)| current_line[*i..].starts_with(trigger))
+                        .map(|(i, _)| *i);
+
+                    if let Some(start_byte) = trigger_start_byte_option {
+                        // Create the replacement text, without any borrows
+                        let insert_text = match self.completion_state.completion_type {
+                            CompletionType::File => format!("[[{}]]", suggestion),
+                            CompletionType::Tag => format!("#{}", suggestion),
+                            CompletionType::Variable => match suggestion.as_str() {
+                                "date" => chrono::Local::now().format("%Y-%m-%d").to_string(),
+                                "time" => chrono::Local::now().format("%H:%M:%S").to_string(),
+                                "file-name" => Path::new(&self.file_path)
+                                    .file_name()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or_default()
+                                    .to_string(),
+                                _ => suggestion,
+                            },
+                            _ => suggestion,
+                        };
+
+                        // The text after the cursor is needed.
+                        let suffix_start_byte = current_line
+                            .char_indices()
+                            .nth(current_col)
+                            .map(|(i, _)| i)
+                            .unwrap_or(current_line.len());
+
+                        // Now, construct the new line. We can do this because all the necessary
+                        // information (indices and text) has been extracted.
+                        let new_line = format!(
+                            "{}{}{}",
+                            &current_line[..start_byte],
+                            insert_text,
+                            &current_line[suffix_start_byte..]
+                        );
+
+                        // Reassign the line in the vector. This is safe now.
+                        *current_line = new_line.clone();
+
+                        // Re-create the TextArea with the updated lines.
+                        let mut new_textarea = TextArea::new(current_lines);
+                        new_textarea.set_block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .title("Markdown Editor")
+                                .style(Style::default().fg(Color::White)),
+                        );
+                        new_textarea.set_cursor_line_style(Style::default());
+                        new_textarea
+                            .set_cursor_style(Style::default().bg(Color::White).fg(Color::Black));
+                        new_textarea.set_selection_style(Style::default().bg(Color::LightBlue));
+
+                        // Calculate the new cursor position after the insertion.
+                        let new_cursor_col = new_line[..new_line.len()].chars().count();
+                        new_textarea.move_cursor(tui_textarea::CursorMove::Jump(
+                            current_row as u16,
+                            new_cursor_col as u16,
+                        ));
+
+                        self.textarea = new_textarea;
                     }
-
-                    // Insert the insert_text
-                    self.textarea.insert_str(&insert_text);
                 }
             }
         }
+
         self.cancel_completion();
+        self.mode = Mode::Insert;
+        self.status = "Insert".to_string();
         Ok(())
     }
 
@@ -1871,43 +1872,50 @@ impl App {
                         self.textarea.input(input);
                         let (row, col) = self.textarea.cursor();
                         let line = self.textarea.lines()[row].clone();
-                        // Convert character index to byte index
-                        let col_bytes = line
-                            .char_indices()
-                            .nth(col)
-                            .map(|(i, _)| i)
-                            .unwrap_or(line.len());
-                        if line.get(..col_bytes).map_or(false, |s| s.ends_with("[[")) {
-                            self.start_completion(CompletionType::File);
-                            self.update_completion()?;
-                        } else if line.get(..col_bytes).map_or(false, |s| s.ends_with("#")) {
-                            self.start_completion(CompletionType::Tag);
-                            self.update_completion()?;
-                        } else if line.get(..col_bytes).map_or(false, |s| s.ends_with("@")) {
-                            self.start_completion(CompletionType::Variable);
-                            self.update_completion()?;
-                        } else if self.completion_state.active {
+
+                        let check_completion =
+                            |line_ref: &str, cursor_col: usize| -> Option<CompletionType> {
+                                if let Some(s) = line_ref.get(..cursor_col) {
+                                    if s.ends_with("[[") {
+                                        return Some(CompletionType::File);
+                                    } else if s.ends_with("#") {
+                                        return Some(CompletionType::Tag);
+                                    } else if s.ends_with("@") {
+                                        return Some(CompletionType::Variable);
+                                    }
+                                }
+                                None
+                            };
+
+                        if let Some(comp_type) = check_completion(&line, col) {
+                            self.start_completion(comp_type);
                             self.update_completion()?;
                         }
                     }
                     ratatui::crossterm::event::KeyCode::Backspace => {
                         self.textarea.input(input);
+                        let (row, col) = self.textarea.cursor();
+                        let line = self.textarea.lines()[row].clone();
+
+                        let col_bytes = line.chars().take(col).collect::<String>().len();
+
+                        // If the trigger character is deleted, cancel completion.
                         if self.completion_state.active {
-                            let (row, col) = self.textarea.cursor();
-                            let line = self.textarea.lines()[row].clone();
-                            // Convert character index to byte index
-                            let col_bytes = line
-                                .char_indices()
-                                .nth(col)
-                                .map(|(i, _)| i)
-                                .unwrap_or(line.len());
-                            if self.completion_state.completion_type == CompletionType::File
-                                && !line.get(..col_bytes).map_or(false, |s| s.contains("[["))
-                            {
-                                self.cancel_completion();
-                            } else if self.completion_state.completion_type == CompletionType::Tag
-                                && !line.get(..col_bytes).map_or(false, |s| s.contains("#"))
-                            {
+                            let mut should_cancel = false;
+                            match self.completion_state.completion_type {
+                                CompletionType::File => {
+                                    if !line.get(..col_bytes).map_or(false, |s| s.contains("[[")) {
+                                        should_cancel = true;
+                                    }
+                                }
+                                CompletionType::Tag => {
+                                    if !line.get(..col_bytes).map_or(false, |s| s.contains("#")) {
+                                        should_cancel = true;
+                                    }
+                                }
+                                _ => {}
+                            }
+                            if should_cancel {
                                 self.cancel_completion();
                             } else {
                                 self.update_completion()?;
