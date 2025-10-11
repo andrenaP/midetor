@@ -2933,10 +2933,6 @@ impl App {
         }
         Ok(())
     }
-    // Add this new function to your `impl App` block.
-
-    // Add this new function to your `impl App` block.
-
     fn process_template_command(&mut self, template_path_str: &str) -> Result<(), EditorError> {
         // 1. Define the template path. This should be a configurable path.
         let template_path = Path::new(&self.base_dir).join(template_path_str);
@@ -2985,9 +2981,6 @@ impl App {
         new_textarea.set_selection_style(Style::default().bg(Color::LightBlue));
 
         self.textarea = new_textarea;
-
-        // Position cursor at the beginning of the original content
-        self.textarea.move_cursor(CursorMove::Top);
 
         self.status = "Template processed and inserted.".to_string();
         Ok(())
