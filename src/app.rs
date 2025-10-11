@@ -418,6 +418,10 @@ impl App {
                 if let Some(parent) = Path::new(&path).parent() {
                     fs::create_dir_all(parent)?;
                 }
+                // Only write an empty file if it doesn't already exist
+                if !Path::new(&path).exists() {
+                    fs::write(&path, "")?;
+                }
                 let output = Command::new("markdown-scanner")
                     .arg(&path)
                     .arg(&self.base_dir)
