@@ -619,7 +619,7 @@ impl App {
 
                 if let Some(original_line) = current_lines.get(current_row) {
                     // Work with a cloned, owned version of the line
-                    let mut current_line_owned = original_line.clone();
+                    let current_line_owned = original_line.clone();
 
                     let (trigger, _trigger_len) = match self.completion_state.completion_type {
                         CompletionType::File => ("[[", 2),
@@ -1671,13 +1671,17 @@ impl App {
                                 self.key_sequence.clear();
                                 self.status = "Entered File Tree mode".to_string();
                             }
+                            "\\nt" => {
+                                self.process_template_command("Templates/Yaml-Template.md")?;
+                            }
                             s if !("\\ob".starts_with(s)
                                 || "\\ot".starts_with(s)
                                 || "\\f".starts_with(s)
                                 || "\\oot".starts_with(s)
                                 || "\\ooy".starts_with(s)
                                 || "\\ooT".starts_with(s)
-                                || "\\t".starts_with(s)) =>
+                                || "\\t".starts_with(s)
+                                || "\\nt".starts_with(s)) =>
                             {
                                 self.key_sequence.clear();
                                 self.status = format!("Invalid sequence 1: {}", s);
@@ -2927,6 +2931,65 @@ impl App {
             };
             f.render_stateful_widget(list, popup_area, &mut self.completion_state.list_state);
         }
+        Ok(())
+    }
+    // Add this new function to your `impl App` block.
+
+    // Add this new function to your `impl App` block.
+
+    fn process_template_command(&mut self, template_path_str: &str) -> Result<(), EditorError> {
+        // 1. Define the template path. This should be a configurable path.
+        let template_path = Path::new(&self.base_dir).join(template_path_str);
+
+        // 2. Read the template file.
+        let template_content = fs::read_to_string(&template_path).map_err(|e| {
+            EditorError::Io(std::io::Error::new(
+                e.kind(),
+                format!("Could not open template file: {}", e),
+            ))
+        })?;
+
+        // 3. Get current date, time, and title.
+        let now = Local::now();
+        let current_date = now.format("%Y-%m-%d").to_string();
+        let current_time = now.format("%H:%M:%S").to_string();
+        let title = Path::new(&self.file_path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string();
+
+        // 4. Replace template variables.
+        let processed_content = template_content
+            .replace("{{date}}", &current_date)
+            .replace("{{time}}", &current_time)
+            .replace("{{title}}", &title);
+
+        // 5. Get current buffer content.
+        let current_content = self.textarea.lines().join("\n");
+
+        // 6. Combine template and current content.
+        let new_content = format!("{}\n{}", processed_content, current_content);
+        let new_lines: Vec<String> = new_content.lines().map(|s| s.to_string()).collect();
+
+        // 7. Update the textarea.
+        let mut new_textarea = TextArea::new(new_lines);
+        new_textarea.set_block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Markdown Editor")
+                .style(Style::default().fg(Color::White)),
+        );
+        new_textarea.set_cursor_line_style(Style::default());
+        new_textarea.set_cursor_style(Style::default().bg(Color::White).fg(Color::Black));
+        new_textarea.set_selection_style(Style::default().bg(Color::LightBlue));
+
+        self.textarea = new_textarea;
+
+        // Position cursor at the beginning of the original content
+        self.textarea.move_cursor(CursorMove::Top);
+
+        self.status = "Template processed and inserted.".to_string();
         Ok(())
     }
 }
