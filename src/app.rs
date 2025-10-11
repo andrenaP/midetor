@@ -49,6 +49,7 @@ pub enum CompletionType {
     None,
     File,
     Tag,
+    Variable,
 }
 
 #[derive(PartialEq, Clone, Debug)]
@@ -545,42 +546,60 @@ impl App {
             .map(|(i, _)| i)
             .unwrap_or(line.len());
 
-        let query = if self.completion_state.completion_type == CompletionType::File {
-            line.get(..col_bytes)
+        let query = match self.completion_state.completion_type {
+            CompletionType::File => line
+                .get(..col_bytes)
                 .and_then(|s| s.rfind("[["))
                 .map(|start| line[start + 2..col_bytes].to_string())
-                .unwrap_or_default()
-        } else {
-            line.get(..col_bytes)
+                .unwrap_or_default(),
+            CompletionType::Tag => line
+                .get(..col_bytes)
                 .and_then(|s| s.rfind("#"))
                 .map(|start| line[start + 1..col_bytes].to_string())
-                .unwrap_or_default()
+                .unwrap_or_default(),
+            CompletionType::Variable => line
+                .get(..col_bytes)
+                .and_then(|s| s.rfind("@"))
+                .map(|start| line[start + 1..col_bytes].to_string())
+                .unwrap_or_default(),
+            CompletionType::None => return Ok(()),
         };
 
         self.completion_state.query = query.clone();
-        self.completion_state.suggestions = if query.len() >= 2 {
-            let search_pattern = format!("%{}%", query);
-            let sql = match self.completion_state.completion_type {
-                CompletionType::File => {
-                    "SELECT DISTINCT result FROM (
-                        SELECT file_name AS result FROM files WHERE file_name LIKE ?
-                        UNION
-                        SELECT backlink AS result FROM backlinks WHERE backlink LIKE ?
-                    ) LIMIT 10"
-                }
-                CompletionType::Tag => "SELECT tag FROM tags WHERE tag LIKE ? LIMIT 10",
-                CompletionType::None => return Ok(()),
-            };
-            let mut stmt = self.db.prepare(sql)?;
-            let closure = |row: &rusqlite::Row| row.get::<_, String>(0);
-            let rows = if self.completion_state.completion_type == CompletionType::File {
-                stmt.query_map(params![search_pattern, search_pattern], closure)?
-            } else {
-                stmt.query_map(params![search_pattern], closure)?
-            };
-            rows.collect::<Result<Vec<_>, _>>()?
-        } else {
-            Vec::new()
+        self.completion_state.suggestions = match self.completion_state.completion_type {
+            CompletionType::File => {
+                let search_pattern = format!("%{}%", query);
+                let sql = "SELECT DISTINCT result FROM (
+                    SELECT file_name AS result FROM files WHERE file_name LIKE ?
+                    UNION
+                    SELECT backlink AS result FROM backlinks WHERE backlink LIKE ?
+                ) LIMIT 10";
+                let mut stmt = self.db.prepare(sql)?;
+                let closure = |row: &rusqlite::Row| row.get::<_, String>(0);
+                let mapped_rows =
+                    stmt.query_map(params![search_pattern, search_pattern], closure)?;
+                mapped_rows.collect::<Result<Vec<_>, _>>()?
+            }
+            CompletionType::Tag => {
+                let search_pattern = format!("%{}%", query);
+                let sql = "SELECT tag FROM tags WHERE tag LIKE ? LIMIT 10";
+                let mut stmt = self.db.prepare(sql)?;
+                let closure = |row: &rusqlite::Row| row.get::<_, String>(0);
+                let mapped_rows = stmt.query_map(params![search_pattern], closure)?;
+                mapped_rows.collect::<Result<Vec<_>, _>>()?
+            }
+            CompletionType::Variable => {
+                let possible = vec![
+                    "date".to_string(),
+                    "time".to_string(),
+                    // "file-name".to_string(),
+                ];
+                possible
+                    .into_iter()
+                    .filter(|s| s.starts_with(&query))
+                    .collect::<Vec<String>>()
+            }
+            CompletionType::None => Vec::new(),
         };
 
         if !self.completion_state.suggestions.is_empty() {
@@ -606,17 +625,38 @@ impl App {
                     .unwrap_or(current_line.len());
 
                 // Find the most recent trigger in the current line up to cursor
-                let trigger_pos = if self.completion_state.completion_type == CompletionType::File {
-                    current_line[..col_bytes].rfind("[[")
-                } else {
-                    current_line[..col_bytes].rfind("#")
+                let trigger_pos = match self.completion_state.completion_type {
+                    CompletionType::File => current_line[..col_bytes].rfind("[["),
+                    CompletionType::Tag => current_line[..col_bytes].rfind("#"),
+                    CompletionType::Variable => current_line[..col_bytes].rfind("@"),
+                    CompletionType::None => None,
+                };
+
+                let insert_text = match self.completion_state.completion_type {
+                    CompletionType::File => format!("[[{}]]", suggestion),
+                    CompletionType::Tag => format!("#{}", suggestion),
+                    CompletionType::Variable => {
+                        match suggestion.as_str() {
+                            "date" => chrono::Local::now().format("%Y-%m-%d").to_string(),
+                            "time" => chrono::Local::now().format("%H:%M:%S").to_string(),
+                            // "file-name" => self.file_name.clone(), // Assume self.file_name exists
+                            _ => suggestion.clone(),
+                        }
+                    }
+                    CompletionType::None => String::new(),
                 };
 
                 if let Some(start) = trigger_pos {
-                    // Remove text from trigger to current cursor position (in bytes)
+                    // Remove text from trigger start (including trigger) to current cursor position
+                    let trigger_length = match self.completion_state.completion_type {
+                        CompletionType::File => 2,     // "[["
+                        CompletionType::Tag => 1,      // "#"
+                        CompletionType::Variable => 1, // "@"
+                        CompletionType::None => 0,
+                    };
+                    let remove_start = start; // Start at trigger position to include it in removal
                     let mut new_lines = self.textarea.lines().to_vec();
-                    let new_line =
-                        format!("{}{}", &current_line[..start], &current_line[col_bytes..]);
+                    let new_line = format!("{}{}", &current_line[..remove_start], &insert_text,);
                     new_lines[current_row] = new_line;
                     self.textarea = TextArea::new(new_lines);
                     self.textarea.set_block(
@@ -631,28 +671,23 @@ impl App {
                     self.textarea
                         .set_selection_style(Style::default().bg(Color::LightBlue));
 
-                    // Calculate new cursor position in characters (after the trigger)
-                    let prefix_chars = current_line[..start].chars().count();
+                    // Calculate new cursor position in characters (after the inserted text)
+                    let prefix_chars = current_line[..remove_start].chars().count();
+                    let insert_chars = insert_text.chars().count();
+                    let new_col = prefix_chars + insert_chars;
                     self.textarea.move_cursor(tui_textarea::CursorMove::Jump(
                         current_row as u16,
-                        prefix_chars as u16,
+                        new_col as u16,
                     ));
-
-                    // Insert the full suggestion
-                    let insert_text = match self.completion_state.completion_type {
-                        CompletionType::File => format!("[[{}]]", suggestion),
-                        CompletionType::Tag => format!("#{}", suggestion),
-                        CompletionType::None => String::new(),
-                    };
-                    self.textarea.insert_str(&insert_text);
                 } else {
                     // Fallback: Delete the query and trigger
-                    let delete_len = self.completion_state.query.len()
-                        + if self.completion_state.completion_type == CompletionType::File {
-                            2 // Length of "[[" trigger
-                        } else {
-                            1 // Length of "#" trigger
-                        };
+                    let trigger_length = match self.completion_state.completion_type {
+                        CompletionType::File => 2,
+                        CompletionType::Tag => 1,
+                        CompletionType::Variable => 1,
+                        CompletionType::None => 0,
+                    };
+                    let delete_len = self.completion_state.query.len() + trigger_length;
                     let new_col = current_col.saturating_sub(delete_len);
                     self.textarea.move_cursor(tui_textarea::CursorMove::Jump(
                         current_row as u16,
@@ -662,12 +697,7 @@ impl App {
                         self.textarea.delete_char();
                     }
 
-                    // Insert the full suggestion
-                    let insert_text = match self.completion_state.completion_type {
-                        CompletionType::File => format!("[[{}]]", suggestion),
-                        CompletionType::Tag => format!("#{}", suggestion),
-                        CompletionType::None => String::new(),
-                    };
+                    // Insert the insert_text
                     self.textarea.insert_str(&insert_text);
                 }
             }
@@ -1853,6 +1883,9 @@ impl App {
                         } else if line.get(..col_bytes).map_or(false, |s| s.ends_with("#")) {
                             self.start_completion(CompletionType::Tag);
                             self.update_completion()?;
+                        } else if line.get(..col_bytes).map_or(false, |s| s.ends_with("@")) {
+                            self.start_completion(CompletionType::Variable);
+                            self.update_completion()?;
                         } else if self.completion_state.active {
                             self.update_completion()?;
                         }
@@ -2874,6 +2907,7 @@ impl App {
                         .title(match self.completion_state.completion_type {
                             CompletionType::File => "Files",
                             CompletionType::Tag => "Tags",
+                            CompletionType::Variable => "Variable",
                             CompletionType::None => "",
                         })
                         .style(Style::default().fg(Color::White).bg(Color::Black)),
