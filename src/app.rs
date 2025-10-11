@@ -617,8 +617,10 @@ impl App {
                 let (current_row, current_col) = self.textarea.cursor();
                 let mut current_lines = self.textarea.lines().to_vec();
 
-                if let Some(current_line) = current_lines.get_mut(current_row) {
-                    // Determine the trigger and its length
+                if let Some(original_line) = current_lines.get(current_row) {
+                    // Work with a cloned, owned version of the line
+                    let mut current_line_owned = original_line.clone();
+
                     let (trigger, _trigger_len) = match self.completion_state.completion_type {
                         CompletionType::File => ("[[", 2),
                         CompletionType::Tag => ("#", 1),
@@ -627,19 +629,27 @@ impl App {
                     };
 
                     // Get the character indices up to the current cursor position.
-                    // We're iterating over the characters here, but collecting the byte indices.
-                    let char_indices: Vec<(usize, char)> =
-                        current_line.char_indices().take(current_col).collect();
+                    let char_indices: Vec<(usize, char)> = current_line_owned
+                        .char_indices()
+                        .take(current_col)
+                        .collect();
 
                     // Find the byte index of the trigger by iterating backwards
                     let trigger_start_byte_option = char_indices
                         .iter()
                         .rev()
-                        .find(|(i, _)| current_line[*i..].starts_with(trigger))
+                        .find(|(i, _)| current_line_owned[*i..].starts_with(trigger))
                         .map(|(i, _)| *i);
 
                     if let Some(start_byte) = trigger_start_byte_option {
-                        // Create the replacement text, without any borrows
+                        let prefix_text = current_line_owned[..start_byte].to_owned();
+                        let suffix_start_byte = current_line_owned
+                            .char_indices()
+                            .nth(current_col)
+                            .map(|(i, _)| i)
+                            .unwrap_or(current_line_owned.len());
+                        let suffix_text = current_line_owned[suffix_start_byte..].to_owned();
+
                         let insert_text = match self.completion_state.completion_type {
                             CompletionType::File => format!("[[{}]]", suggestion),
                             CompletionType::Tag => format!("#{}", suggestion),
@@ -656,26 +666,12 @@ impl App {
                             _ => suggestion,
                         };
 
-                        // The text after the cursor is needed.
-                        let suffix_start_byte = current_line
-                            .char_indices()
-                            .nth(current_col)
-                            .map(|(i, _)| i)
-                            .unwrap_or(current_line.len());
+                        let new_line = format!("{}{}{}", prefix_text, insert_text, suffix_text);
 
-                        // Now, construct the new line. We can do this because all the necessary
-                        // information (indices and text) has been extracted.
-                        let new_line = format!(
-                            "{}{}{}",
-                            &current_line[..start_byte],
-                            insert_text,
-                            &current_line[suffix_start_byte..]
-                        );
+                        // The mutable borrow is fine now because we're assigning to the element
+                        // in the vector, not the `current_line` reference.
+                        current_lines[current_row] = new_line.clone();
 
-                        // Reassign the line in the vector. This is safe now.
-                        *current_line = new_line.clone();
-
-                        // Re-create the TextArea with the updated lines.
                         let mut new_textarea = TextArea::new(current_lines);
                         new_textarea.set_block(
                             Block::default()
@@ -688,8 +684,8 @@ impl App {
                             .set_cursor_style(Style::default().bg(Color::White).fg(Color::Black));
                         new_textarea.set_selection_style(Style::default().bg(Color::LightBlue));
 
-                        // Calculate the new cursor position after the insertion.
-                        let new_cursor_col = new_line[..new_line.len()].chars().count();
+                        let new_cursor_col =
+                            prefix_text.chars().count() + insert_text.chars().count();
                         new_textarea.move_cursor(tui_textarea::CursorMove::Jump(
                             current_row as u16,
                             new_cursor_col as u16,
