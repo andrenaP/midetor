@@ -1873,21 +1873,28 @@ impl App {
                         let (row, col) = self.textarea.cursor();
                         let line = self.textarea.lines()[row].clone();
 
+                        // This ensures correct string slicing with multi-byte characters.
+                        let col_bytes = line
+                            .char_indices()
+                            .nth(col)
+                            .map(|(i, _)| i)
+                            .unwrap_or(line.len());
+
                         let check_completion =
-                            |line_ref: &str, cursor_col: usize| -> Option<CompletionType> {
-                                if let Some(s) = line_ref.get(..cursor_col) {
+                            |line_ref: &str, cursor_col_bytes: usize| -> Option<CompletionType> {
+                                if let Some(s) = line_ref.get(..cursor_col_bytes) {
                                     if s.ends_with("[[") {
                                         return Some(CompletionType::File);
-                                    } else if s.ends_with("#") {
+                                    } else if s.ends_with('#') {
                                         return Some(CompletionType::Tag);
-                                    } else if s.ends_with("@") {
+                                    } else if s.ends_with('@') {
                                         return Some(CompletionType::Variable);
                                     }
                                 }
                                 None
                             };
 
-                        if let Some(comp_type) = check_completion(&line, col) {
+                        if let Some(comp_type) = check_completion(&line, col_bytes) {
                             self.start_completion(comp_type);
                             self.update_completion()?;
                         }
