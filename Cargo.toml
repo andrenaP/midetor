@@ -1,7 +1,12 @@
 [package]
 name = "midetor"
-version = "1.0.0"
+version = "1.0.16"
 edition = "2021"
+license-file="LICENSE"
+keywords = ["editor", "markdown"]
+categories = ["text-editors"]
+description = "midetor is a terminal-based vim like Markdown editor. You markdown-scanner installed for it to work"
+readme = "README.md"
 
 [dependencies]
 crossterm = "0.27.0"
