@@ -592,7 +592,7 @@ impl App {
                 let possible = vec![
                     "date".to_string(),
                     "time".to_string(),
-                    // "file-name".to_string(),
+                    "file-name".to_string(),
                 ];
                 possible
                     .into_iter()

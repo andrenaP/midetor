@@ -2,26 +2,26 @@
 
 ## Description
 
-`markdown-editor` is a terminal-based vim like Markdown editor designed to provide a lightweight, Obsidian-like experience for editing Markdown files. It supports syntax highlighting, tag management, and backlink tracking, storing metadata in a SQLite database (`markdown_data.db`). The editor uses a TUI (Text User Interface) built with Ratatui and Crossterm, offering an ~~intuitive interface~~ for navigating and editing Markdown files.
+`midetor` (MY-EDITOR) is a terminal-based vim like Markdown editor designed to provide a lightweight, Obsidian-like experience for editing Markdown files. Works only with [markdown-scanner](https://github.com/andrenaP/markdown-scanner). It supports syntax highlighting, tag management, and backlink tracking, storing metadata in a SQLite database (`markdown_data.db`). The editor uses a TUI (Text User Interface) built with Ratatui and Crossterm, offering an ~~intuitive interface~~ for navigating and editing Markdown files.
 
 ## Why?
-- 3 mb editor that is a single file and work on any system. Android (termux), linux, Windows you name it.
-- It is using 5 mb of RAM. If you low on ram maybe you can use it.
+- Do you want nvim that don't break a few times a week? This thing will not break. And the best part **You can just copy it on any device with terminal and it will work out of a box**
 - You can use [This website](https://github.com/andrenaP/database-reader-sql) and render your data in userfriendly interface.
+- This editor is just an `example of how you can work with markdown-scanner`
 
 ![images/main.jpg](https://github.com/andrenaP/midetor/blob/aadcee84d86bc2e4686d600950c919c017e5a820/images/main.jpg)
 
 ## Features
 
 - Edit Markdown files with syntax highlighting.
-- Manage tags and backlinks, stored in a SQLite database.
+- Manage tags `#`, backlinks `[[` stored in a SQLite database and custom autocomplete options `@`.
 - Support for Obsidian-like vault structures. (For now only `[[this type]]`)
 
 ## Requirements
 
 - **Rust**: Version 1.87.0 or higher.
 - **Cargo**: The Rust package manager.
-- A `markdown-scanner` binary (assumed to be available in the system PATH) to populate the database.
+- A [markdown-scanner](https://github.com/andrenaP/markdown-scanner) binary (assumed to be available in the system PATH) to populate the database.
 
 ## Installation
 
@@ -75,6 +75,7 @@ Well this is complicated. It works like vim `:wq` `:w` `:q`.
 - `\f` search
 - `\oot` `\ooT` `\ooy` open dayly files.
 - `\t` open `FileTreeVisual`. `oc`, `on` to sort my time or name. Other: `y` for copy, `x` for cut `p`, for paste, `v` for selection.
+- `\nt` Makes autocomplete from Templates `Look Obsidian Templates if you are interested`.
 
 
 ## Database
