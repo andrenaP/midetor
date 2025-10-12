@@ -7,6 +7,7 @@ keywords = ["editor", "markdown"]
 categories = ["text-editors"]
 description = "midetor is a terminal-based vim like Markdown editor. You markdown-scanner installed for it to work"
 readme = "README.md"
+exclude = ["images/*",]
 
 [dependencies]
 crossterm = "0.27.0"
