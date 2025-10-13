@@ -1,6 +1,6 @@
 [package]
 name = "midetor"
-version = "1.0.16"
+version = "1.0.17"
 edition = "2021"
 license-file="LICENSE"
 keywords = ["editor", "markdown"]
