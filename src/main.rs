@@ -20,7 +20,7 @@ use error::EditorError;
 fn main() -> Result<(), EditorError> {
     // Define CLI using clap
     let matches = Command::new("midetor")
-        .version("1.0.0")
+        .version("1.0.18")
         .about("A terminal-based vim like Markdown editor with Obsidian-like features")
         .arg(
             Arg::new("file_path")
