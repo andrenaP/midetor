@@ -802,14 +802,11 @@ impl App {
             wikilink
         } else {
             // Use file_name from files table for the current file
-            let file_name: String = self
-                .db
-                .query_row(
-                    "SELECT file_name FROM files WHERE id = ?",
-                    [self.file_id],
-                    |row| row.get(0),
-                )
-                .map_err(|e| EditorError::Database(e))?;
+            let file_name: String = Path::new(&self.file_path)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_string();
             file_name
         };
 
