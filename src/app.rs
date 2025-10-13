@@ -10,6 +10,8 @@ use ratatui::{
 };
 use rusqlite::params;
 use rusqlite::Connection;
+use serde_json::Value;
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -96,8 +98,15 @@ pub enum BufferMode {
     Cut,
 }
 
+#[derive(PartialEq, Clone, Copy, Debug)]
+pub enum ScannerMode {
+    Local,
+    Server,
+}
+
 pub struct App {
-    db: Connection,
+    db: Option<Connection>,
+    scanner_mode: ScannerMode,
     file_path: String,
     base_dir: String,
     textarea: TextArea<'static>,
@@ -157,9 +166,20 @@ pub struct SearchState {
 }
 
 impl App {
-    pub fn new(file_path: &str, base_dir: &str) -> Result<Self, EditorError> {
-        let db = Connection::open("markdown_data.db")?;
-        db.execute("PRAGMA foreign_keys = ON;", [])?;
+    pub fn new(file_path: &str, base_dir: &str, mode: &str) -> Result<Self, EditorError> {
+        let scanner_mode = match mode {
+            "server" => ScannerMode::Server,
+            _ => ScannerMode::Local,
+        };
+
+        let db = if scanner_mode == ScannerMode::Local {
+            let db_path = Path::new(base_dir).join("markdown_data.db");
+            let conn = Connection::open(db_path)?;
+            conn.execute("PRAGMA foreign_keys = ON;", [])?;
+            Some(conn)
+        } else {
+            None
+        };
 
         let content = fs::read_to_string(file_path).unwrap_or_default();
         let mut textarea = TextArea::new(content.lines().map(|s| s.to_string()).collect());
@@ -173,9 +193,9 @@ impl App {
         textarea.set_cursor_style(Style::default().bg(Color::White).fg(Color::Black));
         textarea.set_selection_style(Style::default().bg(Color::LightBlue));
 
-        let file_id = App::get_file_id(&db, file_path)?;
-        let tags = App::load_tags(&db, file_id)?;
-        let backlinks = App::load_backlinks(&db, file_id)?;
+        // let file_id = App::get_file_id(&db, file_path)?;
+        // let tags = App::load_tags(&db, file_id)?;
+        // let backlinks = App::load_backlinks(&db, file_id)?;
 
         // Initialize syntax highlighting
         let syntax_set = SyntaxSet::load_defaults_newlines();
@@ -183,20 +203,21 @@ impl App {
         let theme = theme_set.themes["base16-eighties.dark"].clone();
         // let highlighter = HighlightLines::new(syntax, &theme); // Use reference to boxed Theme
 
-        Ok(App {
+        let mut app = App {
             db,
+            scanner_mode,
             file_path: file_path.to_string(),
             base_dir: base_dir.to_string(),
             textarea,
             mode: Mode::Normal,
-            tags,
-            backlinks,
+            tags: Vec::new(),
+            backlinks: Vec::new(),
             view: View::Editor,
             command: String::new(),
             status: "Normal".to_string(),
-            file_id,
+            file_id: -1,
             should_quit: false,
-            history: vec![(file_path.to_string(), file_id)],
+            history: Vec::new(),
             history_index: 0,
             completion_state: CompletionState {
                 active: false,
@@ -235,102 +256,20 @@ impl App {
             tree_width_percent: 20,
             full_tree: false,
             buffer_mode: None,
-        })
+        };
+
+        app.file_id = app.get_file_id(file_path)?;
+        app.tags = app.load_tags(app.file_id)?;
+        app.backlinks = app.load_backlinks(app.file_id)?;
+        app.history = vec![(file_path.to_string(), app.file_id)];
+
+        Ok(app)
     }
 
-    fn get_file_id(db: &Connection, path: &str) -> Result<i64, EditorError> {
-        let mut stmt = db.prepare("SELECT id FROM files WHERE path = ?")?;
-        stmt.query_row([path], |row| row.get(0))
-            .map_err(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => EditorError::FileNotFound(path.to_string()),
-                e => EditorError::Database(e),
-            })
-    }
-
-    fn load_tags(db: &Connection, file_id: i64) -> Result<Vec<String>, EditorError> {
-        let mut stmt = db.prepare(
-            "SELECT t.tag FROM tags t
-             JOIN file_tags ft ON t.id = ft.tag_id
-             WHERE ft.file_id = ?",
-        )?;
-        let tags = stmt
-            .query_map([file_id], |row| row.get(0))?
-            .collect::<Result<Vec<String>, _>>()?;
-        Ok(tags)
-    }
-
-    fn load_backlinks(db: &Connection, file_id: i64) -> Result<Vec<(String, i64)>, EditorError> {
-        let mut stmt = db.prepare(
-            "SELECT DISTINCT b.backlink, f.id
-             FROM backlinks b
-             JOIN files f ON b.backlink_id = f.id
-             WHERE b.file_id = ?",
-        )?;
-        let mut backlinks = Vec::new();
-        let rows = stmt.query_map([file_id], |row| {
-            let backlink: String = row.get(0)?;
-            let backlink_id: i64 = row.get(1)?;
-            Ok((backlink, backlink_id))
-        })?;
-
-        for row in rows {
-            match row {
-                Ok((backlink, backlink_id)) => {
-                    backlinks.push((backlink, backlink_id));
-                }
-                Err(e) => {
-                    eprintln!("Error loading backlink: {}", e);
-                }
-            }
-        }
-
-        let mut unique_backlinks = Vec::new();
-        let mut seen_backlinks = std::collections::HashSet::new();
-        for (backlink, backlink_id) in backlinks {
-            if seen_backlinks.insert(backlink.clone()) {
-                unique_backlinks.push((backlink, backlink_id));
-            } else {
-                let existing = unique_backlinks
-                    .iter_mut()
-                    .find(|(b, _)| b == &backlink)
-                    .expect("Backlink should exist");
-                let existing_path = db
-                    .query_row("SELECT path FROM files WHERE id = ?", [existing.1], |row| {
-                        row.get::<_, String>(0)
-                    })
-                    .unwrap_or_default();
-                let new_path = db
-                    .query_row(
-                        "SELECT path FROM files WHERE id = ?",
-                        [backlink_id],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .unwrap_or_default();
-
-                let existing_basename = Path::new(&existing_path)
-                    .file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                let new_basename = Path::new(&new_path)
-                    .file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-
-                if new_basename.len() < existing_basename.len() {
-                    *existing = (backlink, backlink_id);
-                }
-            }
-        }
-
-        Ok(unique_backlinks)
-    }
-
-    fn save_file(&mut self) -> Result<(), EditorError> {
-        fs::write(&self.file_path, self.textarea.lines().join("\n"))?;
-
+    fn execute_sql_query(&self, query: &str) -> Result<Value, EditorError> {
         let output = Command::new("markdown-scanner")
-            .arg(&self.file_path)
-            .arg(&self.base_dir)
+            .arg("sql")
+            .arg(query)
             .output()?;
 
         if !output.status.success() {
@@ -338,6 +277,137 @@ impl App {
             return Err(EditorError::Scanner(error_msg));
         }
 
+        let result: Value = serde_json::from_slice(&output.stdout)?;
+
+        if let Some(err_msg) = result["error"].as_str() {
+            if !err_msg.is_empty() {
+                return Err(EditorError::ServerError(err_msg.to_string()));
+            }
+        }
+
+        Ok(result)
+    }
+
+    fn run_scanner_command(&self, args: &[&str]) -> Result<(), EditorError> {
+        let output = Command::new("markdown-scanner").args(args).output()?;
+        if !output.status.success() {
+            let error_msg = String::from_utf8_lossy(&output.stderr).into_owned();
+            Err(EditorError::Scanner(error_msg))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn get_file_id(&self, path: &str) -> Result<i64, EditorError> {
+        match self.scanner_mode {
+            ScannerMode::Local => {
+                let db = self
+                    .db
+                    .as_ref()
+                    .ok_or(EditorError::InvalidPath("DB not connected".into()))?;
+                let mut stmt = db.prepare("SELECT id FROM files WHERE path = ?")?;
+                stmt.query_row([path], |row| row.get(0))
+                    .map_err(|e| match e {
+                        rusqlite::Error::QueryReturnedNoRows => {
+                            EditorError::FileNotFound(path.to_string())
+                        }
+                        _ => e.into(),
+                    })
+            }
+            ScannerMode::Server => {
+                let query = format!("SELECT id FROM files WHERE path = '{}'", path);
+                let json_result = self.execute_sql_query(&query)?;
+                json_result["rows"]
+                    .as_array()
+                    .and_then(|rows| rows.get(0))
+                    .and_then(|row| row[0].as_i64())
+                    .ok_or_else(|| EditorError::FileNotFound(path.to_string()))
+            }
+        }
+    }
+
+    fn load_tags(&self, file_id: i64) -> Result<Vec<String>, EditorError> {
+        let query = format!(
+            "SELECT t.tag FROM tags t JOIN file_tags ft ON t.id = ft.tag_id WHERE ft.file_id = {}",
+            file_id
+        );
+        match self.scanner_mode {
+            ScannerMode::Local => {
+                let db = self
+                    .db
+                    .as_ref()
+                    .ok_or(EditorError::InvalidPath("DB not connected".into()))?;
+                let mut stmt = db.prepare(&query)?;
+                stmt.query_map([], |row| row.get(0))?
+                    .collect::<Result<Vec<String>, _>>()
+                    .map_err(Into::into)
+            }
+            ScannerMode::Server => {
+                let json_result = self.execute_sql_query(&query)?;
+                Ok(json_result["rows"]
+                    .as_array()
+                    .map_or_else(Vec::new, |rows| {
+                        rows.iter()
+                            .filter_map(|row| row[0].as_str().map(String::from))
+                            .collect()
+                    }))
+            }
+        }
+    }
+
+    fn load_backlinks(&self, file_id: i64) -> Result<Vec<(String, i64)>, EditorError> {
+        let query = format!("SELECT DISTINCT b.backlink, f.id FROM backlinks b JOIN files f ON b.backlink_id = f.id WHERE b.file_id = {}", file_id);
+        let backlinks = match self.scanner_mode {
+            ScannerMode::Local => {
+                let db = self
+                    .db
+                    .as_ref()
+                    .ok_or(EditorError::InvalidPath("DB not connected".into()))?;
+                let mut stmt = db.prepare(&query)?;
+                let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            }
+            ScannerMode::Server => {
+                let json_result = self.execute_sql_query(&query)?;
+                json_result["rows"]
+                    .as_array()
+                    .map_or_else(Vec::new, |rows| {
+                        rows.iter()
+                            .filter_map(|row| {
+                                if let (Some(link), Some(id)) = (row[0].as_str(), row[1].as_i64()) {
+                                    Some((link.to_string(), id))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect()
+                    })
+            }
+        };
+
+        let mut unique_backlinks = Vec::new();
+        let mut seen_backlinks = HashSet::new();
+        for (backlink, backlink_id) in backlinks {
+            if seen_backlinks.insert(backlink.clone()) {
+                unique_backlinks.push((backlink, backlink_id));
+            }
+        }
+        Ok(unique_backlinks)
+    }
+
+    fn save_file(&mut self) -> Result<(), EditorError> {
+        fs::write(&self.file_path, self.textarea.lines().join("\n"))?;
+        let args = match self.scanner_mode {
+            ScannerMode::Local => vec![
+                "local",
+                "--file",
+                &self.file_path,
+                "--base-dir",
+                &self.base_dir,
+            ],
+            ScannerMode::Server => vec!["scan", &self.file_path],
+        };
+        self.run_scanner_command(&args)?;
         self.status = "Saved".to_string();
         Ok(())
     }
@@ -356,10 +426,9 @@ impl App {
         textarea.set_cursor_line_style(Style::default());
         textarea.set_cursor_style(Style::default().bg(Color::White).fg(Color::Black));
         textarea.set_selection_style(Style::default().bg(Color::LightBlue));
-        textarea.move_cursor(tui_textarea::CursorMove::Jump(0, 0)); // Reset cursor
-                                                                    // Clear undo/redo history
+        textarea.move_cursor(tui_textarea::CursorMove::Jump(0, 0));
         while textarea.undo() {}
-        self.textarea = textarea; // Replace with fresh TextArea
+        self.textarea = textarea;
         self.completion_state = CompletionState {
             active: false,
             completion_type: CompletionType::None,
@@ -368,8 +437,8 @@ impl App {
             list_state: ListState::default(),
             trigger_start: (0, 0),
         };
-        self.tags = App::load_tags(&self.db, self.file_id)?;
-        self.backlinks = App::load_backlinks(&self.db, self.file_id)?;
+        self.tags = self.load_tags(self.file_id)?;
+        self.backlinks = self.load_backlinks(self.file_id)?;
         self.view = View::Editor;
         self.mode = Mode::Normal;
         self.status = "Normal".to_string();
@@ -538,8 +607,6 @@ impl App {
     fn update_completion(&mut self) -> Result<(), EditorError> {
         let (row, col) = self.textarea.cursor();
         let line = self.textarea.lines()[row].clone();
-
-        // Convert character index to byte index
         let col_bytes = line
             .char_indices()
             .nth(col)
@@ -554,53 +621,74 @@ impl App {
                 .unwrap_or_default(),
             CompletionType::Tag => line
                 .get(..col_bytes)
-                .and_then(|s| s.rfind("#"))
+                .and_then(|s| s.rfind('#'))
                 .map(|start| line[start + 1..col_bytes].to_string())
                 .unwrap_or_default(),
             CompletionType::Variable => line
                 .get(..col_bytes)
-                .and_then(|s| s.rfind("@"))
+                .and_then(|s| s.rfind('@'))
                 .map(|start| line[start + 1..col_bytes].to_string())
                 .unwrap_or_default(),
             CompletionType::None => return Ok(()),
         };
 
         self.completion_state.query = query.clone();
-        self.completion_state.suggestions = match self.completion_state.completion_type {
+
+        let suggestions: Vec<String> = match self.completion_state.completion_type {
             CompletionType::File => {
-                let search_pattern = format!("%{}%", query);
-                let sql = "SELECT DISTINCT result FROM (
-                    SELECT file_name AS result FROM files WHERE file_name LIKE ?
-                    UNION
-                    SELECT backlink AS result FROM backlinks WHERE backlink LIKE ?
-                ) LIMIT 10";
-                let mut stmt = self.db.prepare(sql)?;
-                let closure = |row: &rusqlite::Row| row.get::<_, String>(0);
-                let mapped_rows =
-                    stmt.query_map(params![search_pattern, search_pattern], closure)?;
-                mapped_rows.collect::<Result<Vec<_>, _>>()?
+                let sql = format!("SELECT DISTINCT result FROM (SELECT file_name AS result FROM files WHERE file_name LIKE '%{}%' UNION SELECT backlink AS result FROM backlinks WHERE backlink LIKE '%{}%') LIMIT 10", query, query);
+                match self.scanner_mode {
+                    ScannerMode::Local => {
+                        let db = self
+                            .db
+                            .as_ref()
+                            .ok_or(EditorError::InvalidPath("DB not connected".into()))?;
+                        let mut stmt = db.prepare("SELECT DISTINCT result FROM (SELECT file_name AS result FROM files WHERE file_name LIKE ?1 UNION SELECT backlink AS result FROM backlinks WHERE backlink LIKE ?1) LIMIT 10")?;
+                        stmt.query_map([format!("%{}%", query)], |r| r.get(0))?
+                            .collect::<Result<_, _>>()?
+                    }
+                    ScannerMode::Server => {
+                        let json = self.execute_sql_query(&sql)?;
+                        json["rows"].as_array().map_or(vec![], |rows| {
+                            rows.iter()
+                                .filter_map(|r| r[0].as_str().map(String::from))
+                                .collect()
+                        })
+                    }
+                }
             }
             CompletionType::Tag => {
-                let search_pattern = format!("%{}%", query);
-                let sql = "SELECT tag FROM tags WHERE tag LIKE ? LIMIT 10";
-                let mut stmt = self.db.prepare(sql)?;
-                let closure = |row: &rusqlite::Row| row.get::<_, String>(0);
-                let mapped_rows = stmt.query_map(params![search_pattern], closure)?;
-                mapped_rows.collect::<Result<Vec<_>, _>>()?
+                let sql = format!("SELECT tag FROM tags WHERE tag LIKE '%{}%' LIMIT 10", query);
+                match self.scanner_mode {
+                    ScannerMode::Local => {
+                        let db = self
+                            .db
+                            .as_ref()
+                            .ok_or(EditorError::InvalidPath("DB not connected".into()))?;
+                        let mut stmt =
+                            db.prepare("SELECT tag FROM tags WHERE tag LIKE ? LIMIT 10")?;
+                        stmt.query_map([format!("%{}%", query)], |r| r.get(0))?
+                            .collect::<Result<_, _>>()?
+                    }
+                    ScannerMode::Server => {
+                        let json = self.execute_sql_query(&sql)?;
+                        json["rows"].as_array().map_or(vec![], |rows| {
+                            rows.iter()
+                                .filter_map(|r| r[0].as_str().map(String::from))
+                                .collect()
+                        })
+                    }
+                }
             }
-            CompletionType::Variable => {
-                let possible = vec![
-                    "date".to_string(),
-                    "time".to_string(),
-                    "file-name".to_string(),
-                ];
-                possible
-                    .into_iter()
-                    .filter(|s| s.starts_with(&query))
-                    .collect::<Vec<String>>()
-            }
-            CompletionType::None => Vec::new(),
+            CompletionType::Variable => ["date", "time", "file-name"]
+                .iter()
+                .filter(|s| s.starts_with(&query))
+                .map(|s| s.to_string())
+                .collect(),
+            _ => vec![],
         };
+
+        self.completion_state.suggestions = suggestions;
 
         if !self.completion_state.suggestions.is_empty() {
             self.completion_state.list_state.select(Some(0));
