@@ -450,16 +450,17 @@ impl App {
     }
 
     fn follow_backlink(&mut self, index: usize) -> Result<(), EditorError> {
-        let current_row = self.textarea.cursor().0;
+        let (current_row, current_col) = self.textarea.cursor();
         let line = self.textarea.lines()[current_row].clone();
 
-        // Extract wikilink from the current line if no valid backlink index
-        let wikilink = if index >= self.backlinks.len() {
-            self.extract_wikilink(&line).ok_or_else(|| {
-                EditorError::InvalidBacklink("No valid wikilink found".to_string())
-            })?
-        } else {
+        // If a specific index from the old logic is passed, use it.
+        // Otherwise (when index is usize::MAX), extract the link from the cursor position.
+        let wikilink = if index < self.backlinks.len() {
             self.backlinks[index].0.clone()
+        } else {
+            self.extract_wikilink(&line, current_col).ok_or_else(|| {
+                EditorError::InvalidBacklink("No valid wikilink found at cursor".to_string())
+            })?
         };
 
         // Clean incomplete autocompletions
@@ -796,9 +797,9 @@ impl App {
     }
 
     fn search_backlinks(&mut self) -> Result<(), EditorError> {
-        let (row, _col) = self.textarea.cursor();
+        let (row, current_col) = self.textarea.cursor();
         let line = self.textarea.lines()[row].clone();
-        let target = if let Some(wikilink) = self.extract_wikilink(&line) {
+        let mut target = if let Some(wikilink) = self.extract_wikilink(&line, current_col) {
             wikilink
         } else {
             // Use file_name from files table for the current file
@@ -810,6 +811,9 @@ impl App {
             file_name
         };
 
+        if !target.ends_with(".md") {
+            target = format!("{}.md", target).clone();
+        };
         let query = "SELECT DISTINCT f.file_name, f.id
                      FROM backlinks b
                      JOIN files f ON b.file_id = f.id
@@ -817,7 +821,7 @@ impl App {
                      WHERE fp.file_name LIKE ? AND f.id != ?";
         let mut stmt = self.db.prepare(query)?;
         let results = stmt
-            .query_map(params![format!("%{}%", target), self.file_id], |row| {
+            .query_map(params![format!("{}", target), self.file_id], |row| {
                 let file_name: String = row.get(0)?;
                 let file_id: i64 = row.get(1)?;
                 Ok((file_name, Some(file_id)))
@@ -871,12 +875,21 @@ impl App {
         Ok(())
     }
 
-    fn extract_wikilink(&self, line: &str) -> Option<String> {
-        let start = line.find("[[")?;
-        let end = line[start..].find("]]").map(|i| i + start + 2)?;
-        Some(line[start + 2..end - 2].to_string())
+    fn extract_wikilink(&self, line: &str, cursor_col: usize) -> Option<String> {
+        for (start_byte_index, _) in line.match_indices("[[") {
+            if let Some(end_byte_index_relative) = line[start_byte_index..].find("]]") {
+                let end_byte_index = start_byte_index + end_byte_index_relative;
+                let start_char_index = line[..start_byte_index].chars().count();
+                let end_char_index = line[..end_byte_index].chars().count() + 2;
+                if cursor_col >= start_char_index && cursor_col <= end_char_index {
+                    let content_start_byte = start_byte_index + 2;
+                    let content_end_byte = end_byte_index;
+                    return Some(line[content_start_byte..content_end_byte].to_string());
+                }
+            }
+        }
+        None
     }
-
     fn select_search_result(&mut self) -> Result<(), EditorError> {
         if let Some(selected) = self.search_state.list_state.selected() {
             if let Some((file_name, file_id)) = self.search_state.results.get(selected).cloned() {
@@ -1832,16 +1845,9 @@ impl App {
                     }
                     (ratatui::crossterm::event::KeyCode::Enter, _) => {
                         if self.view == View::Editor {
-                            let current_row = self.textarea.cursor().0;
+                            let (current_row, current_col) = self.textarea.cursor();
                             let line = self.textarea.lines()[current_row].clone();
-                            if let Some(index) = self
-                                .backlinks
-                                .iter()
-                                .position(|(text, _)| line.contains(text))
-                            {
-                                self.follow_backlink(index)?;
-                            } else if let Some(_wikilink) = self.extract_wikilink(&line) {
-                                // Handle wikilink not in backlinks by passing an invalid index
+                            if self.extract_wikilink(&line, current_col).is_some() {
                                 self.follow_backlink(usize::MAX)?;
                             } else if let Some(tag) =
                                 self.tags.iter().find(|tag| line.contains(&**tag)).cloned()
