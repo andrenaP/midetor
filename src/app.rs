@@ -1,15 +1,15 @@
 use crate::error::EditorError;
 use chrono::{Duration, Local};
 use ratatui::{
+    Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
-    Frame, Terminal,
 };
-use rusqlite::params;
 use rusqlite::Connection;
+use rusqlite::params;
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -357,7 +357,7 @@ impl App {
         textarea.set_cursor_style(Style::default().bg(Color::White).fg(Color::Black));
         textarea.set_selection_style(Style::default().bg(Color::LightBlue));
         textarea.move_cursor(tui_textarea::CursorMove::Jump(0, 0)); // Reset cursor
-                                                                    // Clear undo/redo history
+        // Clear undo/redo history
         while textarea.undo() {}
         self.textarea = textarea; // Replace with fresh TextArea
         self.completion_state = CompletionState {
@@ -510,17 +510,8 @@ impl App {
         Ok(())
     }
 
-    fn show_tag_files(&mut self, tag: &str) -> Result<(), EditorError> {
-        let mut stmt = self.db.prepare(
-            "SELECT f.path FROM files f
-             JOIN file_tags ft ON f.id = ft.file_id
-             JOIN tags t ON ft.tag_id = t.id
-             WHERE t.tag = ?",
-        )?;
-        let paths = stmt
-            .query_map([tag], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        self.status = format!("Files with tag '{}': {}", tag, paths.join(", "));
+    fn echo(&mut self, message: &str) -> Result<(), EditorError> {
+        self.status = format!("{}", message);
         self.view = View::Info;
         Ok(())
     }
@@ -875,20 +866,47 @@ impl App {
         Ok(())
     }
 
-    fn extract_wikilink(&self, line: &str, cursor_col: usize) -> Option<String> {
-        for (start_byte_index, _) in line.match_indices("[[") {
-            if let Some(end_byte_index_relative) = line[start_byte_index..].find("]]") {
-                let end_byte_index = start_byte_index + end_byte_index_relative;
-                let start_char_index = line[..start_byte_index].chars().count();
-                let end_char_index = line[..end_byte_index].chars().count() + 2;
-                if cursor_col >= start_char_index && cursor_col <= end_char_index {
-                    let content_start_byte = start_byte_index + 2;
-                    let content_end_byte = end_byte_index;
-                    return Some(line[content_start_byte..content_end_byte].to_string());
+    fn extract(&self, line: &str, cursor_col: usize, start: &str, end: &str) -> Option<String> {
+        for (start_byte_index, _) in line.match_indices(start) {
+            let mut content_start_byte = start_byte_index + start.len();
+            // Skip whitespace after start delimiter
+            while content_start_byte < line.len() && line[content_start_byte..].starts_with(' ') {
+                content_start_byte += 1;
+            }
+            // Use end of line if end delimiter is empty, otherwise find end delimiter
+            let end_byte_index = if end.is_empty() {
+                line.len()
+            } else {
+                line[content_start_byte..]
+                    .find(end)
+                    .map(|relative| content_start_byte + relative)
+                    .unwrap_or(line.len())
+            };
+            let start_char_index = line[..start_byte_index].chars().count();
+            let end_char_index = line[..end_byte_index].chars().count();
+            if cursor_col >= start_char_index && cursor_col <= end_char_index {
+                if content_start_byte <= end_byte_index {
+                    let content = line[content_start_byte..end_byte_index].trim();
+                    if !content.is_empty() {
+                        return Some(content.to_string());
+                    }
                 }
             }
         }
         None
+    }
+
+    fn extract_tag(&self, line: &str, cursor_col: usize) -> Option<String> {
+        // Try normal tag (#tag)
+        if let Some(result) = self.extract(line, cursor_col, "#", " ") {
+            return Some(result);
+        }
+        // Fallback to YAML tag (- tag)
+        self.extract(line, cursor_col, " - ", "")
+    }
+
+    fn extract_wikilink(&self, line: &str, cursor_col: usize) -> Option<String> {
+        self.extract(line, cursor_col, "[[", "]]")
     }
     fn select_search_result(&mut self) -> Result<(), EditorError> {
         if let Some(selected) = self.search_state.list_state.selected() {
@@ -1287,25 +1305,30 @@ impl App {
         Ok(())
     }
 
+    fn delete_file(&mut self, path: &str) -> Result<(), EditorError> {
+        let full_path = Path::new(&self.base_dir)
+            .join(path)
+            .to_string_lossy()
+            .to_string();
+        fs::remove_file(&full_path)?;
+        let output = Command::new("markdown-scanner")
+            .arg("--delete")
+            .arg(&full_path)
+            .arg(&self.base_dir)
+            .output()?;
+        if !output.status.success() {
+            let error_msg = String::from_utf8_lossy(&output.stderr).into_owned();
+            return Err(EditorError::Scanner(error_msg));
+        }
+        self.remove_node(path);
+        Ok(())
+    }
+
     fn delete_selected_file(&mut self) -> Result<(), EditorError> {
         if let Some(selected) = self.tree_state.selected() {
             let item = self.visible_items[selected].clone();
             if !item.is_dir {
-                let full_path = Path::new(&self.base_dir)
-                    .join(&item.path)
-                    .to_string_lossy()
-                    .to_string();
-                fs::remove_file(&full_path)?;
-                let output = Command::new("markdown-scanner")
-                    .arg("--delete")
-                    .arg(&full_path)
-                    .arg(&self.base_dir)
-                    .output()?;
-                if !output.status.success() {
-                    let error_msg = String::from_utf8_lossy(&output.stderr).into_owned();
-                    return Err(EditorError::Scanner(error_msg));
-                }
-                self.remove_node(&item.path);
+                self.delete_file(&item.path)?;
                 self.update_visible();
             } else {
                 self.status = "Cannot delete directories".to_string();
@@ -1327,21 +1350,7 @@ impl App {
             }
         }
         for path in to_delete {
-            let full_path = Path::new(&self.base_dir)
-                .join(&path)
-                .to_string_lossy()
-                .to_string();
-            fs::remove_file(&full_path)?;
-            let output = Command::new("markdown-scanner")
-                .arg("--delete")
-                .arg(&full_path)
-                .arg(&self.base_dir)
-                .output()?;
-            if !output.status.success() {
-                let error_msg = String::from_utf8_lossy(&output.stderr).into_owned();
-                return Err(EditorError::Scanner(error_msg));
-            }
-            self.remove_node(&path);
+            self.delete_file(&path)?;
         }
         self.update_visible();
         self.tree_state.select(Some(min));
@@ -1849,10 +1858,11 @@ impl App {
                             let line = self.textarea.lines()[current_row].clone();
                             if self.extract_wikilink(&line, current_col).is_some() {
                                 self.follow_backlink(usize::MAX)?;
-                            } else if let Some(tag) =
-                                self.tags.iter().find(|tag| line.contains(&**tag)).cloned()
-                            {
-                                self.show_tag_files(&tag)?;
+                            } else if let Some(tag) = self.extract_tag(&line, current_col) {
+                                //First load
+                                self.load_tag_files(&tag)?;
+                                //Then open the mode
+                                self.mode = Mode::TagFiles;
                             }
                         } else {
                             self.view = View::Editor;
@@ -1962,6 +1972,16 @@ impl App {
                     } else if self.command.starts_with("new ") {
                         let name = self.command.trim_start_matches("new ").to_string();
                         self.create_new_file(name)?;
+                    } else if self.command.starts_with("echo ") {
+                        let message = self.command.trim_start_matches("echo ").to_string();
+                        self.echo(&message)?;
+                    } else if self.command.starts_with("delete") {
+                        // tree view is good but this also need.
+                        let delete_path = self.file_path.clone();
+                        self.delete_file(&delete_path)?;
+                        self.textarea.clear_mask_char();
+                        self.open_wikilink_file("index.md".to_string())?; //TODO open something else in the future
+                        self.status = format!("Deleted file: {}", delete_path);
                     } else {
                         self.status = format!("Unknown command: {}", self.command);
                     }
@@ -2118,10 +2138,10 @@ impl App {
                                 .collect();
                         } else {
                             if let Some(range) = self.textarea.selection_range() {
-                                let start_row = range.0 .0;
-                                let start_col = range.0 .1;
-                                let end_row = range.1 .0;
-                                let end_col = range.1 .1;
+                                let start_row = range.0.0;
+                                let start_col = range.0.1;
+                                let end_row = range.1.0;
+                                let end_col = range.1.1;
                                 if start_row == end_row {
                                     let line = self.textarea.lines()[start_row].clone();
                                     let start_byte = line
@@ -2203,10 +2223,10 @@ impl App {
                         } else {
                             // Custom delete selection logic
                             if let Some(range) = self.textarea.selection_range() {
-                                let start_row = range.0 .0;
-                                let start_col = range.0 .1;
-                                let end_row = range.1 .0;
-                                let end_col = range.1 .1;
+                                let start_row = range.0.0;
+                                let start_col = range.0.1;
+                                let end_row = range.1.0;
+                                let end_col = range.1.1;
                                 let mut new_lines = self.textarea.lines().to_vec();
                                 if start_row == end_row {
                                     let line = new_lines[start_row].clone();
