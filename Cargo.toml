@@ -1,11 +1,12 @@
 [package]
 name = "midetor"
 version = "1.0.18"
-edition = "2021"
+edition = "2024"
 license-file="LICENSE"
 keywords = ["editor", "markdown"]
 categories = ["text-editors"]
 description = "midetor is a terminal-based vim like Markdown editor. You markdown-scanner installed for it to work"
+repository = "https://github.com/andrenaP/midetor"
 readme = "README.md"
 exclude = ["images/*",]
 
