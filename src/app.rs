@@ -23,6 +23,21 @@ use syntect::{
 };
 use tui_textarea::{CursorMove, Input, Key, TextArea};
 
+macro_rules! set_textarea_delafult_style {
+    ($textarea:expr) => {
+        $textarea.set_block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Midetor")
+                .style(Style::default().fg(Color::White)),
+        );
+
+        $textarea.set_cursor_line_style(Style::default());
+        $textarea.set_cursor_style(Style::default().bg(Color::White).fg(Color::Black));
+        $textarea.set_selection_style(Style::default().bg(Color::LightBlue));
+    };
+}
+
 #[derive(PartialEq, Clone, Copy, Debug)]
 pub enum Mode {
     Normal,
@@ -163,16 +178,7 @@ impl App {
 
         let content = fs::read_to_string(file_path).unwrap_or_default();
         let mut textarea = TextArea::new(content.lines().map(|s| s.to_string()).collect());
-        textarea.set_block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Markdown Editor")
-                .style(Style::default().fg(Color::White)),
-        );
-        textarea.set_cursor_line_style(Style::default());
-        textarea.set_cursor_style(Style::default().bg(Color::White).fg(Color::Black));
-        textarea.set_selection_style(Style::default().bg(Color::LightBlue));
-
+        set_textarea_delafult_style!(textarea);
         let file_id = App::get_file_id(&db, file_path)?;
         let tags = App::load_tags(&db, file_id)?;
         let backlinks = App::load_backlinks(&db, file_id)?;
@@ -347,15 +353,7 @@ impl App {
         self.file_id = file_id;
         let content = fs::read_to_string(&self.file_path).unwrap_or_default();
         let mut textarea = TextArea::new(content.lines().map(|s| s.to_string()).collect());
-        textarea.set_block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Markdown Editor")
-                .style(Style::default().fg(Color::White)),
-        );
-        textarea.set_cursor_line_style(Style::default());
-        textarea.set_cursor_style(Style::default().bg(Color::White).fg(Color::Black));
-        textarea.set_selection_style(Style::default().bg(Color::LightBlue));
+        set_textarea_delafult_style!(textarea);
         textarea.move_cursor(tui_textarea::CursorMove::Jump(0, 0)); // Reset cursor
         // Clear undo/redo history
         while textarea.undo() {}
@@ -468,17 +466,7 @@ impl App {
             let mut new_lines = self.textarea.lines().to_vec();
             new_lines[current_row] = line[..line.rfind("[[").unwrap_or(line.len())].to_string();
             self.textarea = TextArea::new(new_lines);
-            self.textarea.set_block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Markdown Editor")
-                    .style(Style::default().fg(Color::White)),
-            );
-            self.textarea.set_cursor_line_style(Style::default());
-            self.textarea
-                .set_cursor_style(Style::default().bg(Color::White).fg(Color::Black));
-            self.textarea
-                .set_selection_style(Style::default().bg(Color::LightBlue));
+            set_textarea_delafult_style!(self.textarea);
             self.textarea
                 .move_cursor(tui_textarea::CursorMove::Jump(current_row as u16, 0));
         }
@@ -665,17 +653,7 @@ impl App {
                         current_lines[current_row] = new_line.clone();
 
                         let mut new_textarea = TextArea::new(current_lines);
-                        new_textarea.set_block(
-                            Block::default()
-                                .borders(Borders::ALL)
-                                .title("Markdown Editor")
-                                .style(Style::default().fg(Color::White)),
-                        );
-                        new_textarea.set_cursor_line_style(Style::default());
-                        new_textarea
-                            .set_cursor_style(Style::default().bg(Color::White).fg(Color::Black));
-                        new_textarea.set_selection_style(Style::default().bg(Color::LightBlue));
-
+                        set_textarea_delafult_style!(new_textarea);
                         let new_cursor_col =
                             prefix_text.chars().count() + insert_text.chars().count();
                         new_textarea.move_cursor(tui_textarea::CursorMove::Jump(
@@ -3000,16 +2978,7 @@ impl App {
 
         // 7. Update the textarea.
         let mut new_textarea = TextArea::new(new_lines);
-        new_textarea.set_block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Markdown Editor")
-                .style(Style::default().fg(Color::White)),
-        );
-        new_textarea.set_cursor_line_style(Style::default());
-        new_textarea.set_cursor_style(Style::default().bg(Color::White).fg(Color::Black));
-        new_textarea.set_selection_style(Style::default().bg(Color::LightBlue));
-
+        set_textarea_delafult_style!(new_textarea);
         self.textarea = new_textarea;
 
         self.status = "Template processed and inserted.".to_string();
