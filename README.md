@@ -5,7 +5,7 @@
 `midetor` (MY-EDITOR) is a terminal-based vim like Markdown editor designed to provide a lightweight, Obsidian-like experience for editing Markdown files. Works only with [markdown-scanner](https://github.com/andrenaP/markdown-scanner). It supports syntax highlighting, tag management, and backlink tracking, storing metadata in a SQLite database (`markdown_data.db`). The editor uses a TUI (Text User Interface) built with Ratatui and Crossterm, offering an ~~intuitive interface~~ for navigating and editing Markdown files.
 
 ## Trying it out
-Go to [this repo](https://github.com/andrenaP/midetor-docker-tesiting) and run it inside `Docker`. You can pass `-v` to volume Your folder if You want. 
+Go to [this repo](https://github.com/andrenaP/midetor-docker-tesiting) and run it inside `Docker`. You can pass `-v` to volume Your folder if You want.
 
 ## Why?
 - Do you want nvim that don't break a few times a week? This thing will not break. And the best part **You can just copy it on any device with terminal and it will work out of a box**
@@ -44,7 +44,7 @@ Go to [this repo](https://github.com/andrenaP/midetor-docker-tesiting) and run i
 Run the editor with the following command:
 
 ```bash
-markdown-editor <file_path> [base_dir]
+midetor <file_path> [base_dir]
 ```
 
 - `<file_path>`: Path to the Markdown file to edit (required).
@@ -54,17 +54,17 @@ markdown-editor <file_path> [base_dir]
 
 - Edit a file using the default vault path:
   ```bash
-  markdown-editor notes.md
+  midetor notes.md
   ```
 
 - Edit a file with a specific vault directory:
   ```bash
-  markdown-editor notes.md /path/to/vault
+  midetor notes.md /path/to/vault
   ```
 
 - View help:
   ```bash
-  markdown-editor --help
+  midetor --help
   ```
 
 ### Key Bindings
