@@ -3,7 +3,7 @@ use chrono::{Duration, Local};
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
@@ -22,6 +22,9 @@ use syntect::{
     util::LinesWithEndings,
 };
 use tui_textarea::{CursorMove, Input, Key, TextArea};
+
+use image::DynamicImage;
+use ratatui_image::{picker::Picker, protocol::StatefulProtocol};
 
 macro_rules! set_textarea_delafult_style {
     ($textarea:expr) => {
@@ -66,6 +69,7 @@ pub enum Mode {
 pub enum View {
     Editor,
     Info,
+    FullScreenImage,
 }
 
 #[derive(PartialEq, Clone, Debug)]
@@ -161,6 +165,13 @@ pub struct App {
     tree_width_percent: u16,
     full_tree: bool,
     buffer_mode: Option<BufferMode>,
+    image_picker: Option<Picker>,
+    image_protocol: Option<StatefulProtocol>, // Use enum directly, no Box<dyn ...>
+    current_image: Option<DynamicImage>,
+    current_image_line: Option<usize>, // Line number of the current image reference
+    current_image_index: usize,
+    image_paths: Vec<(String, usize)>, // Cached image paths and their line numbers
+    last_wikilink: Option<String>,     // Last processed wikilink to avoid redundant loads
 }
 
 pub struct CompletionState {
@@ -197,8 +208,16 @@ impl App {
         let theme_set = ThemeSet::load_defaults(); // Load ThemeSet
         let theme = theme_set.themes["base16-eighties.dark"].clone();
         // let highlighter = HighlightLines::new(syntax, &theme); // Use reference to boxed Theme
+        let picker = Picker::from_query_stdio().map_err(|e| {
+            EditorError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to initialize image picker: {}", e),
+            ))
+        })?;
 
-        Ok(App {
+        // Optionally load an initial image (e.g., if file_path is an image or referenced in Markdown)
+        // let (image_protocol, current_image) = (None, None);
+        let mut app = App {
             db,
             file_path: file_path.to_string(),
             base_dir: base_dir.to_string(),
@@ -250,7 +269,17 @@ impl App {
             tree_width_percent: 20,
             full_tree: false,
             buffer_mode: None,
-        })
+            image_picker: Some(picker),
+            image_protocol: None,
+            current_image: None,
+            current_image_line: None,
+            current_image_index: 0,
+            image_paths: Vec::new(),
+            last_wikilink: None,
+        };
+        app.open_file(file_path.to_string(), file_id)?;
+
+        Ok(app)
     }
 
     fn get_file_id(db: &Connection, path: &str) -> Result<i64, EditorError> {
@@ -363,10 +392,9 @@ impl App {
         let content = fs::read_to_string(&self.file_path).unwrap_or_default();
         let mut textarea = TextArea::new(content.lines().map(|s| s.to_string()).collect());
         set_textarea_delafult_style!(textarea);
-        textarea.move_cursor(tui_textarea::CursorMove::Jump(0, 0)); // Reset cursor
-        // Clear undo/redo history
+        textarea.move_cursor(tui_textarea::CursorMove::Jump(0, 0));
         while textarea.undo() {}
-        self.textarea = textarea; // Replace with fresh TextArea
+        self.textarea = textarea;
         self.completion_state = CompletionState {
             active: false,
             completion_type: CompletionType::None,
@@ -380,6 +408,13 @@ impl App {
         self.view = View::Editor;
         self.mode = Mode::Normal;
         self.status = "Normal".to_string();
+        self.current_image_index = 0;
+        self.image_paths = self.extract_image_paths();
+        self.last_wikilink = None;
+
+        // Load image at cursor or first image
+        self.load_image_at_cursor()?;
+
         Ok(())
     }
 
@@ -2766,6 +2801,41 @@ impl App {
                         .style(Style::default().fg(Color::White));
                     f.render_widget(info, chunks[0]);
                 }
+                View::FullScreenImage => {
+                    // Render full-screen image
+                    if let Some(image_protocol) = self.image_protocol.as_mut() {
+                        let block = Block::default()
+                            .borders(Borders::ALL)
+                            .title("Full-Screen Image (Press Esc to return)");
+                        let image_widget = ratatui_image::StatefulImage::default();
+
+                        f.render_widget(
+                            block,
+                            Rect {
+                                x: (0),
+                                y: (0),
+                                width: (100),
+                                height: (100),
+                            },
+                        );
+                        f.render_stateful_widget(
+                            image_widget,
+                            Rect {
+                                x: (0),
+                                y: (0),
+                                width: (100),
+                                height: (100),
+                            },
+                            image_protocol,
+                        );
+                        if let Some(Err(e)) = image_protocol.last_encoding_result() {
+                            self.status = format!("Image encoding error: {}", e);
+                        }
+                    } else {
+                        self.status = "No image to display".to_string();
+                        self.view = View::Editor; // Fallback to Editor if no image
+                    }
+                }
             },
         }
 
@@ -2787,7 +2857,20 @@ impl App {
     }
 
     fn render_editor(&mut self, f: &mut Frame, area: Rect) -> Result<(), EditorError> {
-        // Apply syntax highlighting
+        // Full area for text, no split for image
+        let text_area = area;
+
+        // Check if cursor moved and update image
+        let cursor_row = self.textarea.cursor().0;
+        let cursor_col = self.textarea.cursor().1;
+        let last_cursor_row = self.completion_state.trigger_start.0;
+        let last_cursor_col = self.completion_state.trigger_start.1;
+        if cursor_row != last_cursor_row || cursor_col != last_cursor_col {
+            self.load_image_at_cursor()?;
+            self.completion_state.trigger_start = (cursor_row, cursor_col);
+        }
+
+        // Existing text rendering code...
         let text = self.textarea.lines().join("\n");
         let syntax = self
             .syntax_set
@@ -2829,13 +2912,11 @@ impl App {
                 let text_len = text.chars().count();
                 let mut span_style = Style::default().fg(color);
 
-                // Apply selection styling if within range
                 if let Some(((start_row, start_col), (end_row, end_col))) = selection_range {
                     if (row > start_row || (row == start_row && col >= start_col))
                         && (row < end_row || (row == end_row && col < end_col))
                     {
                         span_style = span_style.bg(Color::LightBlue);
-                        // Selection highlight
                     }
                 }
 
@@ -2848,11 +2929,10 @@ impl App {
         // Calculate scroll offsets
         let cursor_row = self.textarea.cursor().0;
         let cursor_col = self.textarea.cursor().1;
-        let area_height = area.height.saturating_sub(2) as usize; // Subtract borders
-        let area_width = area.width.saturating_sub(2) as usize; // Subtract borders
+        let area_height = text_area.height.saturating_sub(2) as usize; // Subtract borders
+        let area_width = text_area.width.saturating_sub(2) as usize; // Subtract borders
         let visible_lines = area_height.min(highlighted_lines.len());
 
-        // Vertical scrolling: only when cursor is outside visible area
         if cursor_row < self.scroll_offset {
             self.scroll_offset = cursor_row;
         } else if cursor_row >= self.scroll_offset + visible_lines {
@@ -2862,14 +2942,12 @@ impl App {
             .scroll_offset
             .min(highlighted_lines.len().saturating_sub(visible_lines));
 
-        // Horizontal scrolling: only when cursor is outside visible width
         if cursor_col < self.horizontal_scroll_offset {
             self.horizontal_scroll_offset = cursor_col;
         } else if cursor_col >= self.horizontal_scroll_offset + area_width {
             self.horizontal_scroll_offset = cursor_col - (area_width - 1);
         }
 
-        // Slice lines and apply horizontal scrolling
         let start_line = self.scroll_offset;
         let end_line = (self.scroll_offset + visible_lines).min(highlighted_lines.len());
         let mut visible_text = Vec::new();
@@ -2899,27 +2977,25 @@ impl App {
             visible_text.push(Line::from(new_spans));
         }
 
-        // Render the text
         let block = self.textarea.block().cloned().unwrap_or_default();
         let paragraph = Paragraph::new(visible_text)
             .block(block)
             .style(self.textarea.style());
-        f.render_widget(paragraph, area);
+        f.render_widget(paragraph, text_area);
 
         // Render custom cursor
         if cursor_row >= self.scroll_offset && cursor_row < self.scroll_offset + visible_lines {
             let screen_row = (cursor_row - self.scroll_offset) as u16;
             let screen_col = (cursor_col.saturating_sub(self.horizontal_scroll_offset)) as u16;
             let max_width = area_width as u16;
-            let cursor_x = screen_col.min(max_width); // Clamp cursor x
+            let cursor_x = screen_col.min(max_width);
             let cursor_area = Rect {
-                x: area.x + 1 + cursor_x,
-                y: area.y + 1 + screen_row,
+                x: text_area.x + 1 + cursor_x,
+                y: text_area.y + 1 + screen_row,
                 width: 1,
                 height: 1,
             };
 
-            // Get the actual char at cursor (or space if beyond line end)
             let line = self
                 .textarea
                 .lines()
@@ -2928,10 +3004,50 @@ impl App {
                 .unwrap_or_default();
             let ch: char = line.chars().nth(cursor_col).unwrap_or(' ');
 
-            // Render the char with inverted colors
             let cursor_style = Style::default().bg(Color::White).fg(Color::Black);
             let cursor_span = Span::styled(ch.to_string(), cursor_style);
             f.render_widget(Paragraph::new(cursor_span), cursor_area);
+        }
+
+        // Render image in a popup near the cursor, ensuring it's on-screen
+        if let (Some(image_protocol), Some(image_row)) =
+            (self.image_protocol.as_mut(), self.current_image_line)
+        {
+            let popup_width = 120;
+            let popup_height = 36;
+            let max_y = text_area.y + text_area.height.saturating_sub(popup_height);
+            let max_x = text_area.x + text_area.width.saturating_sub(popup_width);
+
+            // Default to cursor's screen row if possible
+            let mut screen_row = (cursor_row - self.scroll_offset) as u16;
+            let mut popup_y = text_area.y + 1 + screen_row;
+
+            // If image_row is off-screen, anchor to top-right
+            if image_row < self.scroll_offset || image_row >= self.scroll_offset + visible_lines {
+                popup_y = text_area.y + 1; // Top of text_area
+            } else {
+                // Use image_row if within viewport
+                screen_row = (image_row - self.scroll_offset) as u16;
+                popup_y = text_area.y + 1 + screen_row;
+            }
+
+            // Ensure popup stays within text_area bounds
+            popup_y = popup_y.min(max_y);
+
+            let popup_area = Rect {
+                x: max_x, // Right-aligned
+                y: popup_y,
+                width: popup_width,
+                height: popup_height,
+            };
+            let block = Block::default().borders(Borders::ALL).title("Image");
+            let image_widget = ratatui_image::StatefulImage::default();
+            f.render_widget(block, popup_area);
+            let margin = Margin::new(1, 1);
+            f.render_stateful_widget(image_widget, popup_area.inner(margin), image_protocol);
+            if let Some(Err(e)) = image_protocol.last_encoding_result() {
+                self.status = format!("Image encoding error: {}", e);
+            }
         }
 
         // Render completion popup if active
@@ -2958,13 +3074,14 @@ impl App {
             let popup_width = 40;
             let popup_height = (self.completion_state.suggestions.len().min(5) + 2) as u16;
             let popup_area = Rect {
-                x: area.x + area.width.saturating_sub(popup_width),
-                y: area.y + 1,
+                x: text_area.x + text_area.width.saturating_sub(popup_width),
+                y: text_area.y + 1,
                 width: popup_width,
                 height: popup_height,
             };
             f.render_stateful_widget(list, popup_area, &mut self.completion_state.list_state);
         }
+
         Ok(())
     }
     fn process_template_command(&mut self, template_path_str: &str) -> Result<(), EditorError> {
@@ -3009,6 +3126,144 @@ impl App {
         self.textarea = new_textarea;
 
         self.status = "Template processed and inserted.".to_string();
+        Ok(())
+    }
+
+    fn extract_image_paths(&self) -> Vec<(String, usize)> {
+        let mut image_paths = Vec::new();
+        let lines = self.textarea.lines();
+        let re = regex::Regex::new(r"\[\[(.*?)\.(jpg|jpeg|avif|png|webp)\]\]").unwrap();
+        for (row, line) in lines.iter().enumerate() {
+            for cap in re.captures_iter(line) {
+                if let Some(filename) = cap.get(1) {
+                    let full_filename = format!("{}.{}", filename.as_str(), cap[2].to_string());
+                    image_paths.push((full_filename, row));
+                }
+            }
+        }
+        image_paths
+    }
+
+    fn resolve_image_path(&self, image_path: &str) -> Result<String, EditorError> {
+        // println!("Resolving image path for: {}", image_path);
+
+        let query = "SELECT path FROM files WHERE file_name = ? OR path = ?";
+        let mut stmt = self.db.prepare(query)?;
+        let path_result = stmt.query_row(params![image_path, image_path], |row| {
+            row.get::<_, String>(0)
+        });
+
+        match path_result {
+            Ok(path) => {
+                // println!("Found in database: {}", path);
+                let full_path = Path::new(&path)
+                    .canonicalize()
+                    .map_err(|e| {
+                        EditorError::FileNotFound(format!("Invalid path {}: {}", path, e))
+                    })?
+                    .to_string_lossy()
+                    .to_string();
+                // println!("Canonicalized path: {}", full_path);
+                Ok(full_path)
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                let full_path = Path::new(&self.base_dir)
+                    .join(image_path)
+                    .canonicalize()
+                    .map_err(|e| {
+                        EditorError::FileNotFound(format!("Invalid path {}: {}", image_path, e))
+                    })?
+                    .to_string_lossy()
+                    .to_string();
+                // println!("Fallback path: {}", full_path);
+                Ok(full_path)
+            }
+            Err(e) => Err(EditorError::Scanner(format!("Database error: {}", e))),
+        }
+    }
+
+    fn load_image_at_cursor(&mut self) -> Result<(), EditorError> {
+        let cursor_row = self.textarea.cursor().0;
+        let cursor_col = self.textarea.cursor().1;
+        let current_line = self
+            .textarea
+            .lines()
+            .get(cursor_row)
+            .cloned()
+            .unwrap_or_default();
+
+        // Check current line for wikilink
+        let wikilink = self.extract_wikilink(&current_line, cursor_col);
+        let is_image = wikilink.as_ref().map_or(false, |link| {
+            link.to_lowercase().ends_with(".jpg")
+                || link.to_lowercase().ends_with(".jpeg")
+                || link.to_lowercase().ends_with(".avif")
+                || link.to_lowercase().ends_with(".png")
+                || link.to_lowercase().ends_with(".webp")
+        });
+
+        // Only load if wikilink is a valid image and different from last
+        if is_image && wikilink != self.last_wikilink {
+            self.last_wikilink = wikilink.clone();
+            if let Some(image_path) = wikilink {
+                match self.resolve_image_path(&image_path) {
+                    Ok(full_path) => match image::ImageReader::open(&full_path) {
+                        Ok(reader) => match reader.decode() {
+                            Ok(dyn_img) => {
+                                if let Some(picker) = self.image_picker.as_mut() {
+                                    let resized_img = dyn_img.clone();
+                                    //     .resize(
+                                    //     120,
+                                    //     36,
+                                    //     image::imageops::FilterType::Lanczos3,
+                                    // );
+                                    self.image_protocol =
+                                        Some(picker.new_resize_protocol(resized_img.clone()));
+                                    self.current_image = Some(resized_img);
+                                    self.current_image_line = Some(cursor_row);
+                                    self.current_image_index = self
+                                        .image_paths
+                                        .iter()
+                                        .position(|(path, _)| path == &image_path)
+                                        .unwrap_or(0);
+                                    self.status = format!("Loaded image: {}", image_path);
+                                }
+                            }
+                            Err(e) => {
+                                self.image_protocol = None;
+                                self.current_image = None;
+                                self.current_image_line = None;
+                                self.current_image_index = 0;
+                                self.status = format!("Failed to load image {}: {}", image_path, e);
+                            }
+                        },
+                        Err(e) => {
+                            self.image_protocol = None;
+                            self.current_image = None;
+                            self.current_image_line = None;
+                            self.current_image_index = 0;
+                            self.status = format!("No valid image at {}: {}", image_path, e);
+                        }
+                    },
+                    Err(e) => {
+                        self.image_protocol = None;
+                        self.current_image = None;
+                        self.current_image_line = None;
+                        self.current_image_index = 0;
+                        self.status = format!("Failed to resolve image path {}: {}", image_path, e);
+                    }
+                }
+            }
+        } else if !is_image {
+            // Clear image if no valid image wikilink
+            self.image_protocol = None;
+            self.current_image = None;
+            self.current_image_line = None;
+            self.current_image_index = 0;
+            self.last_wikilink = None;
+            self.status = "No image wikilink at cursor".to_string();
+        }
+
         Ok(())
     }
 }
