@@ -37,6 +37,15 @@ macro_rules! set_textarea_delafult_style {
         $textarea.set_selection_style(Style::default().bg(Color::LightBlue));
     };
 }
+macro_rules! gettitle {
+    ($file_path:expr ) => {
+        Path::new($file_path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+}
 
 #[derive(PartialEq, Clone, Copy, Debug)]
 pub enum Mode {
@@ -1822,6 +1831,23 @@ impl App {
                     {
                         self.textarea.move_cursor(CursorMove::Bottom);
                     }
+                    (
+                        ratatui::crossterm::event::KeyCode::Char('q'),
+                        ratatui::crossterm::event::KeyModifiers::CONTROL,
+                    ) => {
+                        self.should_quit = true;
+                    }
+                    (
+                        ratatui::crossterm::event::KeyCode::Char('s'),
+                        ratatui::crossterm::event::KeyModifiers::CONTROL,
+                    ) => {
+                        self.save_file()?;
+                        let mode = self.prev_mode.unwrap_or(Mode::Normal);
+                        self.mode = mode;
+                        self.command.clear();
+                        self.prev_mode = None;
+                        self.status = format!("Saved file: {}", gettitle!(&self.file_path));
+                    }
                     (ratatui::crossterm::event::KeyCode::Char(c), _) => {
                         //TODO IF I DELETE THAT THAN gg dd and yy in not working.
                         self.key_sequence.push(c);
@@ -2957,11 +2983,12 @@ impl App {
         let now = Local::now();
         let current_date = now.format("%Y-%m-%d").to_string();
         let current_time = now.format("%H:%M:%S").to_string();
-        let title = Path::new(&self.file_path)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or_default()
-            .to_string();
+        let title = gettitle!(&self.file_path);
+        // Path::new(&self.file_path)
+        // .file_stem()
+        // .and_then(|s| s.to_str())
+        // .unwrap_or_default()
+        // .to_string();
 
         // 4. Replace template variables.
         let processed_content = template_content
