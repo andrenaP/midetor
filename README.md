@@ -15,7 +15,7 @@ Go to [this repo](https://github.com/andrenaP/midetor-docker-tesiting) and run i
 ![images/main.jpg](https://github.com/andrenaP/midetor/blob/aadcee84d86bc2e4686d600950c919c017e5a820/images/main.jpg)
 
 And now it can render images (using backlinks) in terminal.
-![images/main.jpg](https://github.com/andrenaP/midetor/blob/aadcee84d86bc2e4686d600950c919c017e5a820/images/images-render-example.png)
+![images/images-render-example.png](https://github.com/andrenaP/midetor/blob/2c23333e6a1ea811a73961963ba739051a3099f1/images/images-render-example.png)
 
 ## Features
 
