@@ -69,7 +69,6 @@ pub enum Mode {
 pub enum View {
     Editor,
     Info,
-    FullScreenImage,
 }
 
 #[derive(PartialEq, Clone, Debug)]
@@ -280,6 +279,30 @@ impl App {
         app.open_file(file_path.to_string(), file_id)?;
 
         Ok(app)
+    }
+
+    pub fn handle_paste(&mut self, text: String) -> Result<(), EditorError> {
+        match self.mode {
+            Mode::Normal => {
+                self.textarea.insert_str(&text);
+            }
+            Mode::Insert => {
+                self.textarea.insert_str(&text);
+            }
+            Mode::Command => {
+                self.command.push_str(&text);
+            }
+            Mode::Search => {
+                self.search_state.query.push_str(&text);
+                self.update_search_results()?;
+            }
+            Mode::BlockInsert => {
+                self.textarea.insert_str(&text);
+                self.status = "Pasted (simple) in BlockInsert".to_string();
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     fn get_file_id(db: &Connection, path: &str) -> Result<i64, EditorError> {
@@ -1908,8 +1931,21 @@ impl App {
                             self.status = "Normal".to_string();
                         }
                     }
+
+                    (
+                        ratatui::crossterm::event::KeyCode::Esc,
+                        ratatui::crossterm::event::KeyModifiers::CONTROL,
+                    ) => {
+                        self.mode = Mode::Normal;
+                        self.status = "Normal".to_string();
+                    }
                     _ => {
-                        self.status = format!("Unsupported key: {:?}", event.code);
+                        // self.status = format!(
+                        //     "Unsupported key on line {}: {:?}",
+                        //     line!(), // This will be replaced with the actual line number
+                        //     event.code
+                        // );
+                        // This looks bad.
                     }
                 }
             }
@@ -2801,41 +2837,6 @@ impl App {
                         .style(Style::default().fg(Color::White));
                     f.render_widget(info, chunks[0]);
                 }
-                View::FullScreenImage => {
-                    // Render full-screen image
-                    if let Some(image_protocol) = self.image_protocol.as_mut() {
-                        let block = Block::default()
-                            .borders(Borders::ALL)
-                            .title("Full-Screen Image (Press Esc to return)");
-                        let image_widget = ratatui_image::StatefulImage::default();
-
-                        f.render_widget(
-                            block,
-                            Rect {
-                                x: (0),
-                                y: (0),
-                                width: (100),
-                                height: (100),
-                            },
-                        );
-                        f.render_stateful_widget(
-                            image_widget,
-                            Rect {
-                                x: (0),
-                                y: (0),
-                                width: (100),
-                                height: (100),
-                            },
-                            image_protocol,
-                        );
-                        if let Some(Err(e)) = image_protocol.last_encoding_result() {
-                            self.status = format!("Image encoding error: {}", e);
-                        }
-                    } else {
-                        self.status = "No image to display".to_string();
-                        self.view = View::Editor; // Fallback to Editor if no image
-                    }
-                }
             },
         }
 
@@ -3009,24 +3010,21 @@ impl App {
             f.render_widget(Paragraph::new(cursor_span), cursor_area);
         }
 
-        // Render image in a popup near the cursor, ensuring it's on-screen
+        // Render image
         if let (Some(image_protocol), Some(image_row)) =
             (self.image_protocol.as_mut(), self.current_image_line)
         {
-            let popup_width = 120;
-            let popup_height = 36;
+            let popup_width = 60;
+            let popup_height = 20;
             let max_y = text_area.y + text_area.height.saturating_sub(popup_height);
             let max_x = text_area.x + text_area.width.saturating_sub(popup_width);
 
-            // Default to cursor's screen row if possible
-            let mut screen_row = (cursor_row - self.scroll_offset) as u16;
-            let mut popup_y = text_area.y + 1 + screen_row;
+            let screen_row;
+            let mut popup_y;
 
-            // If image_row is off-screen, anchor to top-right
             if image_row < self.scroll_offset || image_row >= self.scroll_offset + visible_lines {
                 popup_y = text_area.y + 1; // Top of text_area
             } else {
-                // Use image_row if within viewport
                 screen_row = (image_row - self.scroll_offset) as u16;
                 popup_y = text_area.y + 1 + screen_row;
             }
@@ -3211,12 +3209,11 @@ impl App {
                         Ok(reader) => match reader.decode() {
                             Ok(dyn_img) => {
                                 if let Some(picker) = self.image_picker.as_mut() {
-                                    let resized_img = dyn_img.clone();
-                                    //     .resize(
-                                    //     120,
-                                    //     36,
-                                    //     image::imageops::FilterType::Lanczos3,
-                                    // );
+                                    let resized_img = dyn_img.resize(
+                                        600,
+                                        600,
+                                        ratatui_image::FilterType::CatmullRom,
+                                    );
                                     self.image_protocol =
                                         Some(picker.new_resize_protocol(resized_img.clone()));
                                     self.current_image = Some(resized_img);
