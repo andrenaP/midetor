@@ -3,9 +3,9 @@ use crossterm::{
     cursor::Show,
     event::{self, Event},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ratatui::{backend::CrosstermBackend, Terminal};
+use ratatui::{Terminal, backend::CrosstermBackend};
 use std::env;
 use std::io::stdout;
 use std::path::Path;
@@ -67,7 +67,7 @@ fn main() -> Result<(), EditorError> {
             [],
         )?;
 
-        // Files table (add CASCADE for folder_id if desired; here it's optional)
+        // Files table
         db.execute(
                 "CREATE TABLE IF NOT EXISTS files (
                     id INTEGER PRIMARY KEY,
@@ -80,7 +80,7 @@ fn main() -> Result<(), EditorError> {
                 [],
             )?;
 
-        // Tags table (no changes)
+        // Tags table
         db.execute(
             "CREATE TABLE IF NOT EXISTS tags (
                     id INTEGER PRIMARY KEY,
@@ -146,47 +146,60 @@ fn main() -> Result<(), EditorError> {
 
     while !app.should_quit {
         app.render(&mut terminal)?;
-        if let Event::Key(event) = event::read()? {
-            let ratatui_event = ratatui::crossterm::event::KeyEvent {
-                code: match event.code {
-                    crossterm::event::KeyCode::Char(c) => {
-                        ratatui::crossterm::event::KeyCode::Char(c)
-                    }
-                    crossterm::event::KeyCode::Enter => ratatui::crossterm::event::KeyCode::Enter,
-                    crossterm::event::KeyCode::Backspace => {
-                        ratatui::crossterm::event::KeyCode::Backspace
-                    }
-                    crossterm::event::KeyCode::Esc => ratatui::crossterm::event::KeyCode::Esc,
-                    crossterm::event::KeyCode::Left => ratatui::crossterm::event::KeyCode::Left,
-                    crossterm::event::KeyCode::Right => ratatui::crossterm::event::KeyCode::Right,
-                    crossterm::event::KeyCode::Up => ratatui::crossterm::event::KeyCode::Up,
-                    crossterm::event::KeyCode::Down => ratatui::crossterm::event::KeyCode::Down,
-                    crossterm::event::KeyCode::Home => ratatui::crossterm::event::KeyCode::Home,
-                    crossterm::event::KeyCode::End => ratatui::crossterm::event::KeyCode::End,
-                    other => {
-                        eprintln!("Unsupported key: {:?}", other);
-                        continue;
-                    }
-                },
-                modifiers: ratatui::crossterm::event::KeyModifiers::from_bits(
-                    event.modifiers.bits(),
-                )
-                .unwrap_or(ratatui::crossterm::event::KeyModifiers::NONE),
-                kind: match event.kind {
-                    crossterm::event::KeyEventKind::Press => {
-                        ratatui::crossterm::event::KeyEventKind::Press
-                    }
-                    crossterm::event::KeyEventKind::Release => {
-                        ratatui::crossterm::event::KeyEventKind::Release
-                    }
-                    crossterm::event::KeyEventKind::Repeat => {
-                        ratatui::crossterm::event::KeyEventKind::Repeat
-                    }
-                },
-                state: ratatui::crossterm::event::KeyEventState::from_bits(event.state.bits())
-                    .unwrap_or(ratatui::crossterm::event::KeyEventState::empty()),
-            };
-            app.handle_input(ratatui_event)?;
+        match event::read()? {
+            Event::Paste(s) => {
+                app.handle_paste(s)?;
+            }
+            Event::Key(event) => {
+                let ratatui_event = ratatui::crossterm::event::KeyEvent {
+                    code: match event.code {
+                        crossterm::event::KeyCode::Char(c) => {
+                            ratatui::crossterm::event::KeyCode::Char(c)
+                        }
+                        crossterm::event::KeyCode::Enter => {
+                            ratatui::crossterm::event::KeyCode::Enter
+                        }
+                        crossterm::event::KeyCode::Backspace => {
+                            ratatui::crossterm::event::KeyCode::Backspace
+                        }
+                        crossterm::event::KeyCode::Esc => ratatui::crossterm::event::KeyCode::Esc,
+                        crossterm::event::KeyCode::Left => ratatui::crossterm::event::KeyCode::Left,
+                        crossterm::event::KeyCode::Right => {
+                            ratatui::crossterm::event::KeyCode::Right
+                        }
+                        crossterm::event::KeyCode::Up => ratatui::crossterm::event::KeyCode::Up,
+                        crossterm::event::KeyCode::Down => ratatui::crossterm::event::KeyCode::Down,
+                        crossterm::event::KeyCode::Home => ratatui::crossterm::event::KeyCode::Home,
+                        crossterm::event::KeyCode::End => ratatui::crossterm::event::KeyCode::End,
+                        other => {
+                            eprintln!("Unsupported key: {:?}", other);
+                            continue;
+                        }
+                    },
+                    modifiers: ratatui::crossterm::event::KeyModifiers::from_bits(
+                        event.modifiers.bits(),
+                    )
+                    .unwrap_or(ratatui::crossterm::event::KeyModifiers::NONE),
+                    kind: match event.kind {
+                        crossterm::event::KeyEventKind::Press => {
+                            ratatui::crossterm::event::KeyEventKind::Press
+                        }
+                        crossterm::event::KeyEventKind::Release => {
+                            ratatui::crossterm::event::KeyEventKind::Release
+                        }
+                        crossterm::event::KeyEventKind::Repeat => {
+                            ratatui::crossterm::event::KeyEventKind::Repeat
+                        }
+                    },
+                    state: ratatui::crossterm::event::KeyEventState::from_bits(event.state.bits())
+                        .unwrap_or(ratatui::crossterm::event::KeyEventState::empty()),
+                };
+                app.handle_input(ratatui_event)?;
+            }
+
+            Event::Resize(_, _) => {}
+
+            _ => {}
         }
     }
 

@@ -14,6 +14,9 @@ Go to [this repo](https://github.com/andrenaP/midetor-docker-tesiting) and run i
 
 ![images/main.jpg](https://github.com/andrenaP/midetor/blob/aadcee84d86bc2e4686d600950c919c017e5a820/images/main.jpg)
 
+And now it can render images (using backlinks) in terminal.
+![images/images-render-example.png](https://github.com/andrenaP/midetor/blob/2c23333e6a1ea811a73961963ba739051a3099f1/images/images-render-example.png)
+
 ## Features
 
 - Edit Markdown files with syntax highlighting.
@@ -79,6 +82,8 @@ Well this is complicated. It works like vim `:wq` `:w` `:q`.
 - `\oot` `\ooT` `\ooy` open dayly files.
 - `\t` open `FileTreeVisual`. `oc`, `on` to sort my time or name. Other: `y` for copy, `x` for cut `p`, for paste, `v` for selection.
 - `\nt` Makes autocomplete from Templates `Look Obsidian Templates if you are interested`.
+
+Now you can paste text in.
 
 
 ## Database
