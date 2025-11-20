@@ -24,7 +24,7 @@ use syntect::{
 use tui_textarea::{CursorMove, Input, Key, TextArea};
 
 use image::DynamicImage;
-use ratatui_image::{picker::Picker, protocol::StatefulProtocol};
+use ratatui_image::{FilterType, Resize, picker::Picker, protocol::StatefulProtocol};
 
 macro_rules! set_textarea_delafult_style {
     ($textarea:expr) => {
@@ -171,6 +171,8 @@ pub struct App {
     current_image_index: usize,
     image_paths: Vec<(String, usize)>, // Cached image paths and their line numbers
     last_wikilink: Option<String>,     // Last processed wikilink to avoid redundant loads
+    image_full_screen: bool,           // Toggle for full-screen image
+    last_image_area: Option<Rect>,     // Track last render area to regenerate protocol
 }
 
 pub struct CompletionState {
@@ -275,6 +277,8 @@ impl App {
             current_image_index: 0,
             image_paths: Vec::new(),
             last_wikilink: None,
+            image_full_screen: false,
+            last_image_area: None,
         };
         app.open_file(file_path.to_string(), file_id)?;
 
@@ -1738,6 +1742,21 @@ impl App {
                             "\\nt" => {
                                 self.process_template_command("Templates/Yaml-Template.md")?;
                             }
+                            "\\if" => {
+                                if self.current_image.is_some() {
+                                    self.image_full_screen = !self.image_full_screen;
+                                    self.status = if self.image_full_screen {
+                                        "Image full screen".to_string()
+                                    } else {
+                                        "Image popup".to_string()
+                                    };
+                                    self.last_image_area = None; // Force protocol regen
+                                } else {
+                                    self.status = "No image to toggle full screen".to_string();
+                                }
+                                self.key_sequence.clear();
+                            }
+
                             s if !("\\ob".starts_with(s)
                                 || "\\ot".starts_with(s)
                                 || "\\f".starts_with(s)
@@ -1745,7 +1764,8 @@ impl App {
                                 || "\\ooy".starts_with(s)
                                 || "\\ooT".starts_with(s)
                                 || "\\t".starts_with(s)
-                                || "\\nt".starts_with(s)) =>
+                                || "\\nt".starts_with(s)
+                                || "\\if".starts_with(s)) =>
                             {
                                 self.key_sequence.clear();
                                 self.status = format!("Invalid sequence 1: {}", s);
@@ -1938,6 +1958,17 @@ impl App {
                     ) => {
                         self.mode = Mode::Normal;
                         self.status = "Normal".to_string();
+                    }
+
+                    (ratatui::crossterm::event::KeyCode::Esc, _) => {
+                        if self.image_full_screen {
+                            self.image_full_screen = false;
+                            self.status = "Image popup".to_string();
+                            self.last_image_area = None; // Force protocol regen
+                        } else if !self.key_sequence.is_empty() {
+                            self.key_sequence.clear();
+                            self.status = "Sequence cancelled".to_string();
+                        }
                     }
                     _ => {
                         // self.status = format!(
@@ -2858,9 +2889,6 @@ impl App {
     }
 
     fn render_editor(&mut self, f: &mut Frame, area: Rect) -> Result<(), EditorError> {
-        // Full area for text, no split for image
-        let text_area = area;
-
         // Check if cursor moved and update image
         let cursor_row = self.textarea.cursor().0;
         let cursor_col = self.textarea.cursor().1;
@@ -2871,7 +2899,7 @@ impl App {
             self.completion_state.trigger_start = (cursor_row, cursor_col);
         }
 
-        // Existing text rendering code...
+        // text rendering code
         let text = self.textarea.lines().join("\n");
         let syntax = self
             .syntax_set
@@ -2928,10 +2956,8 @@ impl App {
         }
 
         // Calculate scroll offsets
-        let cursor_row = self.textarea.cursor().0;
-        let cursor_col = self.textarea.cursor().1;
-        let area_height = text_area.height.saturating_sub(2) as usize; // Subtract borders
-        let area_width = text_area.width.saturating_sub(2) as usize; // Subtract borders
+        let area_height = area.height.saturating_sub(2) as usize;
+        let area_width = area.width.saturating_sub(2) as usize;
         let visible_lines = area_height.min(highlighted_lines.len());
 
         if cursor_row < self.scroll_offset {
@@ -2978,73 +3004,112 @@ impl App {
             visible_text.push(Line::from(new_spans));
         }
 
-        let block = self.textarea.block().cloned().unwrap_or_default();
-        let paragraph = Paragraph::new(visible_text)
-            .block(block)
-            .style(self.textarea.style());
-        f.render_widget(paragraph, text_area);
+        if !self.image_full_screen {
+            let block = self.textarea.block().cloned().unwrap_or_default();
 
-        // Render custom cursor
-        if cursor_row >= self.scroll_offset && cursor_row < self.scroll_offset + visible_lines {
-            let screen_row = (cursor_row - self.scroll_offset) as u16;
-            let screen_col = (cursor_col.saturating_sub(self.horizontal_scroll_offset)) as u16;
-            let max_width = area_width as u16;
-            let cursor_x = screen_col.min(max_width);
-            let cursor_area = Rect {
-                x: text_area.x + 1 + cursor_x,
-                y: text_area.y + 1 + screen_row,
-                width: 1,
-                height: 1,
-            };
+            let paragraph = Paragraph::new(visible_text)
+                .block(block)
+                .style(self.textarea.style());
 
-            let line = self
-                .textarea
-                .lines()
-                .get(cursor_row)
-                .cloned()
-                .unwrap_or_default();
-            let ch: char = line.chars().nth(cursor_col).unwrap_or(' ');
+            f.render_widget(paragraph, area);
 
-            let cursor_style = Style::default().bg(Color::White).fg(Color::Black);
-            let cursor_span = Span::styled(ch.to_string(), cursor_style);
-            f.render_widget(Paragraph::new(cursor_span), cursor_area);
+            if cursor_row >= self.scroll_offset && cursor_row < self.scroll_offset + visible_lines {
+                let screen_row = (cursor_row - self.scroll_offset) as u16;
+                let screen_col = (cursor_col.saturating_sub(self.horizontal_scroll_offset)) as u16;
+                let max_width = area_width as u16;
+                let cursor_x = screen_col.min(max_width);
+
+                let cursor_area = Rect {
+                    x: area.x + 1 + cursor_x,
+                    y: area.y + 1 + screen_row,
+                    width: 1,
+                    height: 1,
+                };
+
+                let line = self
+                    .textarea
+                    .lines()
+                    .get(cursor_row)
+                    .cloned()
+                    .unwrap_or_default();
+
+                let ch: char = line.chars().nth(cursor_col).unwrap_or(' ');
+                let cursor_style = Style::default().bg(Color::White).fg(Color::Black);
+                let cursor_span = Span::styled(ch.to_string(), cursor_style);
+
+                f.render_widget(Paragraph::new(cursor_span), cursor_area); // <-- Fixed
+            }
         }
 
-        // Render image
-        if let (Some(image_protocol), Some(image_row)) =
-            (self.image_protocol.as_mut(), self.current_image_line)
-        {
-            let popup_width = 60;
-            let popup_height = 20;
-            let max_y = text_area.y + text_area.height.saturating_sub(popup_height);
-            let max_x = text_area.x + text_area.width.saturating_sub(popup_width);
-
-            let screen_row;
-            let mut popup_y;
-
-            if image_row < self.scroll_offset || image_row >= self.scroll_offset + visible_lines {
-                popup_y = text_area.y + 1; // Top of text_area
+        if let (Some(picker), Some(dyn_img), Some(image_row)) = (
+            self.image_picker.as_mut(),
+            self.current_image.as_ref(),
+            self.current_image_line,
+        ) {
+            let (image_area, title_str) = if self.image_full_screen {
+                (area, "Image (Full Screen)") // Use the whole editor area
             } else {
-                screen_row = (image_row - self.scroll_offset) as u16;
-                popup_y = text_area.y + 1 + screen_row;
+                // Ensure popup stays within text_area bounds
+                let popup_width = (area.width as f32 * 0.4).max(30.0).min(area.width as f32) as u16;
+
+                let popup_height =
+                    (area.height as f32 * 0.6).max(10.0).min(area.height as f32) as u16;
+
+                let max_y = area.y + area.height.saturating_sub(popup_height);
+
+                let max_x = area.x + area.width.saturating_sub(popup_width);
+
+                let mut popup_y;
+
+                if image_row < self.scroll_offset || image_row >= self.scroll_offset + visible_lines
+                {
+                    popup_y = area.y + 1; // Top of text_area
+                } else {
+                    let screen_row = (image_row - self.scroll_offset) as u16;
+
+                    popup_y = area.y + 1 + screen_row;
+                }
+
+                popup_y = popup_y.min(max_y);
+
+                let popup_area = Rect {
+                    x: max_x, // Right-aligned
+
+                    y: popup_y,
+
+                    width: popup_width,
+
+                    height: popup_height,
+                };
+
+                (popup_area, "Image")
+            };
+
+            if self.image_protocol.is_none() || self.last_image_area != Some(image_area) {
+                self.image_protocol = Some(picker.new_resize_protocol(dyn_img.clone()));
+
+                self.last_image_area = Some(image_area);
             }
 
-            // Ensure popup stays within text_area bounds
-            popup_y = popup_y.min(max_y);
+            if let Some(image_protocol) = self.image_protocol.as_mut() {
+                let block = Block::default().borders(Borders::ALL).title(title_str);
+                let image_widget = ratatui_image::StatefulImage::default()
+                    .resize(Resize::Scale(Some(FilterType::Triangle)));
+                if self.image_full_screen {
+                    // Clear text underneath
 
-            let popup_area = Rect {
-                x: max_x, // Right-aligned
-                y: popup_y,
-                width: popup_width,
-                height: popup_height,
-            };
-            let block = Block::default().borders(Borders::ALL).title("Image");
-            let image_widget = ratatui_image::StatefulImage::default();
-            f.render_widget(block, popup_area);
-            let margin = Margin::new(1, 1);
-            f.render_stateful_widget(image_widget, popup_area.inner(margin), image_protocol);
-            if let Some(Err(e)) = image_protocol.last_encoding_result() {
-                self.status = format!("Image encoding error: {}", e);
+                    f.render_widget(ratatui::widgets::Clear, image_area);
+                }
+
+                f.render_widget(block, image_area);
+
+                let margin = Margin::new(1, 1);
+
+                f.render_stateful_widget(image_widget, image_area.inner(margin), image_protocol);
+
+                if let Some(Err(e)) = image_protocol.last_encoding_result() {
+                    self.status = format!("Image encoding error: {}", e);
+                }
             }
         }
 
@@ -3072,8 +3137,8 @@ impl App {
             let popup_width = 40;
             let popup_height = (self.completion_state.suggestions.len().min(5) + 2) as u16;
             let popup_area = Rect {
-                x: text_area.x + text_area.width.saturating_sub(popup_width),
-                y: text_area.y + 1,
+                x: area.x + area.width.saturating_sub(popup_width),
+                y: area.y + 1,
                 width: popup_width,
                 height: popup_height,
             };
@@ -3208,59 +3273,49 @@ impl App {
                     Ok(full_path) => match image::ImageReader::open(&full_path) {
                         Ok(reader) => match reader.decode() {
                             Ok(dyn_img) => {
-                                if let Some(picker) = self.image_picker.as_mut() {
-                                    let resized_img = dyn_img.resize(
-                                        600,
-                                        600,
-                                        ratatui_image::FilterType::CatmullRom,
-                                    );
-                                    self.image_protocol =
-                                        Some(picker.new_resize_protocol(resized_img.clone()));
-                                    self.current_image = Some(resized_img);
-                                    self.current_image_line = Some(cursor_row);
-                                    self.current_image_index = self
-                                        .image_paths
-                                        .iter()
-                                        .position(|(path, _)| path == &image_path)
-                                        .unwrap_or(0);
-                                    self.status = format!("Loaded image: {}", image_path);
-                                }
+                                self.current_image = Some(dyn_img);
+                                self.current_image_line = Some(cursor_row);
+
+                                self.image_protocol = None;
+                                self.last_image_area = None;
+
+                                self.current_image_index = self
+                                    .image_paths
+                                    .iter()
+                                    .position(|(path, _)| path == &image_path)
+                                    .unwrap_or(0);
+                                self.status = format!("Loaded image: {}", image_path);
                             }
                             Err(e) => {
-                                self.image_protocol = None;
-                                self.current_image = None;
-                                self.current_image_line = None;
-                                self.current_image_index = 0;
+                                self.clear_image_state();
                                 self.status = format!("Failed to load image {}: {}", image_path, e);
                             }
                         },
                         Err(e) => {
-                            self.image_protocol = None;
-                            self.current_image = None;
-                            self.current_image_line = None;
-                            self.current_image_index = 0;
+                            self.clear_image_state();
                             self.status = format!("No valid image at {}: {}", image_path, e);
                         }
                     },
                     Err(e) => {
-                        self.image_protocol = None;
-                        self.current_image = None;
-                        self.current_image_line = None;
-                        self.current_image_index = 0;
+                        self.clear_image_state();
                         self.status = format!("Failed to resolve image path {}: {}", image_path, e);
                     }
                 }
             }
-        } else if !is_image {
-            // Clear image if no valid image wikilink
-            self.image_protocol = None;
-            self.current_image = None;
-            self.current_image_line = None;
-            self.current_image_index = 0;
+        } else if !is_image && self.current_image.is_some() {
+            // Clear image if no valid image wikilink at cursor
+            self.clear_image_state();
             self.last_wikilink = None;
-            self.status = "No image wikilink at cursor".to_string();
         }
 
         Ok(())
+    }
+    fn clear_image_state(&mut self) {
+        self.image_protocol = None;
+        self.current_image = None;
+        self.current_image_line = None;
+        self.current_image_index = 0;
+        self.last_image_area = None;
+        self.image_full_screen = false;
     }
 }
