@@ -1138,7 +1138,7 @@ impl App {
             self.sort_asc = !self.sort_asc;
         } else {
             self.sort_by = SortBy::Modified; // Keep enum variant as Created for compatibility
-            self.sort_asc = true;
+            self.sort_asc = false;
         }
         self.status = format!(
             "Sorted by modification time ({})",
