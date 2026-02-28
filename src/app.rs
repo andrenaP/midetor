@@ -4,7 +4,7 @@ use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Margin, Rect},
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
 };
@@ -19,12 +19,16 @@ use syntect::{
     easy::HighlightLines,
     highlighting::{Theme, ThemeSet},
     parsing::SyntaxSet,
-    util::LinesWithEndings,
 };
 use tui_textarea::{CursorMove, Input, Key, TextArea};
 
 use image::DynamicImage;
 use ratatui_image::{FilterType, Resize, picker::Picker, protocol::StatefulProtocol};
+
+use std::collections::HashMap;
+use std::process::Child;
+use std::process::Stdio;
+use walkdir::WalkDir;
 
 macro_rules! set_textarea_delafult_style {
     ($textarea:expr) => {
@@ -85,6 +89,7 @@ pub enum SearchType {
     Backlinks,
     Tags,
     Files,
+    CustomSql,
 }
 
 #[derive(PartialEq, Clone, Debug)]
@@ -127,6 +132,7 @@ pub struct App {
     db: Connection,
     file_path: String,
     base_dir: String,
+    music_path: String,
     textarea: TextArea<'static>,
     mode: Mode,
     tags: Vec<String>,
@@ -173,6 +179,9 @@ pub struct App {
     last_wikilink: Option<String>,     // Last processed wikilink to avoid redundant loads
     image_full_screen: bool,           // Toggle for full-screen image
     last_image_area: Option<Rect>,     // Track last render area to regenerate protocol
+    audio_child: Option<Child>,
+    read_mode: bool,
+    yt_videos: HashMap<String, String>,
 }
 
 pub struct CompletionState {
@@ -193,7 +202,7 @@ pub struct SearchState {
 }
 
 impl App {
-    pub fn new(file_path: &str, base_dir: &str) -> Result<Self, EditorError> {
+    pub fn new(file_path: &str, base_dir: &str, music_path: &str) -> Result<Self, EditorError> {
         let db = Connection::open("markdown_data.db")?;
         db.execute("PRAGMA foreign_keys = ON;", [])?;
 
@@ -222,6 +231,7 @@ impl App {
             db,
             file_path: file_path.to_string(),
             base_dir: base_dir.to_string(),
+            music_path: music_path.to_string(),
             textarea,
             mode: Mode::Normal,
             tags,
@@ -262,13 +272,13 @@ impl App {
             file_tree: Vec::new(),
             visible_items: Vec::new(),
             tree_state: ListState::default(),
-            sort_by: SortBy::Name,
-            sort_asc: true,
+            sort_by: SortBy::Modified,
+            sort_asc: false,
             yanked_paths: Vec::new(),
             prev_mode: None,
             tree_visual_anchor: None,
-            tree_width_percent: 20,
-            full_tree: false,
+            tree_width_percent: 40,
+            full_tree: true,
             buffer_mode: None,
             image_picker: Some(picker),
             image_protocol: None,
@@ -279,6 +289,9 @@ impl App {
             last_wikilink: None,
             image_full_screen: false,
             last_image_area: None,
+            audio_child: None,
+            read_mode: false,
+            yt_videos: HashMap::new(),
         };
         app.open_file(file_path.to_string(), file_id)?;
 
@@ -439,6 +452,27 @@ impl App {
         self.image_paths = self.extract_image_paths();
         self.last_wikilink = None;
 
+        self.yt_videos.clear();
+        let query = "SELECT json_extract(metadata, '$.ytVideos') FROM files WHERE path = ?1";
+
+        if let Ok(Some(json_str)) = self.db.query_row(query, params![path], |row| {
+            row.get::<usize, Option<String>>(0)
+        }) {
+            // Parse as an array of JSON objects instead of tuples
+            match serde_json::from_str::<Vec<HashMap<String, String>>>(&json_str) {
+                Ok(videos) => {
+                    for video in videos {
+                        // Safely extract the "url" and "title" keys from the JSON object
+                        if let (Some(url), Some(title)) = (video.get("url"), video.get("title")) {
+                            self.yt_videos.insert(url.trim().to_string(), title.clone());
+                        }
+                    }
+                }
+                Err(e) => {
+                    self.status = format!("JSON parse error: {}", e);
+                }
+            }
+        }
         // Load image at cursor or first image
         self.load_image_at_cursor()?;
 
@@ -826,6 +860,8 @@ impl App {
             SearchType::Backlinks => self.search_backlinks()?,
             SearchType::Tags => self.search_tags()?,
             SearchType::Files => self.search_files()?,
+            // --- New Call ---
+            SearchType::CustomSql => self.search_custom_sql()?,
             SearchType::None => {}
         }
         if !self.search_state.results.is_empty() {
@@ -896,7 +932,7 @@ impl App {
     }
 
     fn search_files(&mut self) -> Result<(), EditorError> {
-        let query = "SELECT file_name, id FROM files WHERE file_name LIKE ?";
+        let query = "SELECT file_name, id, json_extract (files.metadata, '$.created_at') as created_at FROM files WHERE file_name LIKE ? ORDER BY created_at DESC";
         let mut stmt = self.db.prepare(query)?;
         let search_pattern = if self.search_state.query.is_empty() {
             "%".to_string()
@@ -959,9 +995,10 @@ impl App {
     }
     fn select_search_result(&mut self) -> Result<(), EditorError> {
         if let Some(selected) = self.search_state.list_state.selected() {
-            if let Some((file_name, file_id)) = self.search_state.results.get(selected).cloned() {
+            if let Some((_display_text, file_id)) = self.search_state.results.get(selected).cloned()
+            {
                 match self.search_state.search_type {
-                    SearchType::Backlinks | SearchType::Files => {
+                    SearchType::Backlinks | SearchType::Files | SearchType::CustomSql => {
                         if let Some(file_id) = file_id {
                             // Retrieve full path from database
                             let path: String = self
@@ -976,10 +1013,15 @@ impl App {
                             self.history.push((path.clone(), file_id));
                             self.history_index += 1;
                             self.open_file(path, file_id)?;
+                        } else if self.search_state.search_type == SearchType::CustomSql {
+                            self.status =
+                                "Custom SQL query result does not contain a file ID. Cannot open."
+                                    .to_string();
+                            return Ok(()); //Cancel search immediately
                         }
                     }
                     SearchType::Tags => {
-                        self.load_tag_files(&file_name)?;
+                        self.load_tag_files(&_display_text)?;
                         if !self.tag_files.is_empty() {
                             self.mode = Mode::TagFiles;
                         } else {
@@ -1359,7 +1401,6 @@ impl App {
             .join(path)
             .to_string_lossy()
             .to_string();
-        fs::remove_file(&full_path)?;
         let output = Command::new("markdown-scanner")
             .arg("--delete")
             .arg(&full_path)
@@ -1369,6 +1410,7 @@ impl App {
             let error_msg = String::from_utf8_lossy(&output.stderr).into_owned();
             return Err(EditorError::Scanner(error_msg));
         }
+        fs::remove_file(&full_path)?;
         self.remove_node(path);
         Ok(())
     }
@@ -1566,7 +1608,6 @@ impl App {
                 .join(&new_path)
                 .to_string_lossy()
                 .to_string();
-            fs::rename(&old_full, &new_full)?;
             let output_delete = Command::new("markdown-scanner")
                 .arg("--delete")
                 .arg(&old_full)
@@ -1576,6 +1617,7 @@ impl App {
                 let error_msg = String::from_utf8_lossy(&output_delete.stderr).into_owned();
                 return Err(EditorError::Scanner(error_msg));
             }
+            fs::rename(&old_full, &new_full)?;
             let output_scan = Command::new("markdown-scanner")
                 .arg(&new_full)
                 .arg(&self.base_dir)
@@ -1590,7 +1632,6 @@ impl App {
         }
         Ok(())
     }
-
     fn move_paths(&mut self, paths: Vec<String>, target_dir: String) -> Result<(), EditorError> {
         for old_path in paths {
             let old_full = Path::new(&self.base_dir)
@@ -1607,7 +1648,6 @@ impl App {
                 .join(&new_path)
                 .to_string_lossy()
                 .to_string();
-            fs::rename(&old_full, &new_full)?;
             let output_delete = Command::new("markdown-scanner")
                 .arg("--delete")
                 .arg(&old_full)
@@ -1617,6 +1657,9 @@ impl App {
                 let error_msg = String::from_utf8_lossy(&output_delete.stderr).into_owned();
                 return Err(EditorError::Scanner(error_msg));
             }
+
+            fs::rename(&old_full, &new_full)?;
+
             let output_scan = Command::new("markdown-scanner")
                 .arg(&new_full)
                 .arg(&self.base_dir)
@@ -1742,6 +1785,18 @@ impl App {
                             "\\nt" => {
                                 self.process_template_command("Templates/Yaml-Template.md")?;
                             }
+                            "\\nm" => {
+                                self.process_template_command("Templates/meeting.md")?;
+                            }
+                            "\\os" => {
+                                self.start_search(SearchType::CustomSql)?;
+                                self.key_sequence.clear();
+                                // self.search_state
+                                //     .query
+                                //     .push_str("Select id from files where id=3;");
+                                self.status = "Started custom SQL search".to_string();
+                            }
+
                             "\\if" => {
                                 if self.current_image.is_some() {
                                     self.image_full_screen = !self.image_full_screen;
@@ -1756,6 +1811,18 @@ impl App {
                                 }
                                 self.key_sequence.clear();
                             }
+                            "\\s" => {
+                                self.stop_audio();
+                            }
+                            "\\w" => {
+                                self.read_mode = !self.read_mode;
+                                self.key_sequence.clear();
+                                self.status = if self.read_mode {
+                                    "Read Mode (Wrapping ON)".to_string()
+                                } else {
+                                    "Edit Mode (Wrapping OFF)".to_string()
+                                };
+                            }
 
                             s if !("\\ob".starts_with(s)
                                 || "\\ot".starts_with(s)
@@ -1765,7 +1832,11 @@ impl App {
                                 || "\\ooT".starts_with(s)
                                 || "\\t".starts_with(s)
                                 || "\\nt".starts_with(s)
-                                || "\\if".starts_with(s)) =>
+                                || "\\if".starts_with(s)
+                                || "\\os".starts_with(s)
+                                || "\\nm".starts_with(s)
+                                || "\\s".starts_with(s)
+                                || "\\w".starts_with(s)) =>
                             {
                                 self.key_sequence.clear();
                                 self.status = format!("Invalid sequence 1: {}", s);
@@ -1938,8 +2009,12 @@ impl App {
                         if self.view == View::Editor {
                             let (current_row, current_col) = self.textarea.cursor();
                             let line = self.textarea.lines()[current_row].clone();
-                            if self.extract_wikilink(&line, current_col).is_some() {
-                                self.follow_backlink(usize::MAX)?;
+                            if let Some(wikilinkline) = self.extract_wikilink(&line, current_col) {
+                                if wikilinkline.ends_with(".mp3") {
+                                    self.playaudio(usize::MAX, &self.music_path.clone())?;
+                                } else {
+                                    self.follow_backlink(usize::MAX)?;
+                                }
                             } else if let Some(tag) = self.extract_tag(&line, current_col) {
                                 //First load
                                 self.load_tag_files(&tag)?;
@@ -2158,7 +2233,16 @@ impl App {
                     self.cancel_search();
                 }
                 ratatui::crossterm::event::KeyCode::Enter => {
-                    self.select_search_result()?;
+                    if self.search_state.search_type == SearchType::CustomSql
+                        && self.search_state.results.is_empty()
+                    {
+                        // Execute the custom query
+                        self.update_search_results()?;
+                        // The next input will either be Up/Down or a second Enter.
+                    } else if !self.search_state.results.is_empty() {
+                        // 2. Second Enter: Select the file from the displayed list
+                        self.select_search_result()?;
+                    }
                 }
                 ratatui::crossterm::event::KeyCode::Up => {
                     let selected = self.search_state.list_state.selected().unwrap_or(0);
@@ -2174,11 +2258,21 @@ impl App {
                 }
                 ratatui::crossterm::event::KeyCode::Char(c) => {
                     self.search_state.query.push(c);
-                    self.update_search_results()?;
+                    // Standard search types (Tags, Files, Backlinks) update instantly
+                    if self.search_state.search_type != SearchType::CustomSql {
+                        self.update_search_results()?;
+                    }
                 }
                 ratatui::crossterm::event::KeyCode::Backspace => {
                     self.search_state.query.pop();
-                    self.update_search_results()?;
+                    // Clear the previous results if the query is being modified
+                    if self.search_state.search_type == SearchType::CustomSql {
+                        self.search_state.results.clear();
+                        self.search_state.list_state.select(None);
+                    }
+                    if self.search_state.search_type != SearchType::CustomSql {
+                        self.update_search_results()?;
+                    }
                 }
                 _ => {}
             },
@@ -2742,26 +2836,27 @@ impl App {
 
         match self.mode {
             Mode::Search => {
-                // Render search input field or results list
-                let title = match self.search_state.search_type {
-                    SearchType::Backlinks => format!("Backlinks: {}", self.search_state.query),
-                    SearchType::Tags => format!("Tags: {}", self.search_state.query),
-                    SearchType::Files => format!("Files: {}", self.search_state.query),
-                    SearchType::None => "Search".to_string(),
-                };
-                if self.search_state.results.is_empty() && self.search_state.query.is_empty() {
-                    // Render input field for search
-                    let input = Paragraph::new(self.search_state.query.clone())
-                        .block(
-                            Block::default()
-                                .borders(Borders::ALL)
-                                .title(title)
-                                .style(Style::default().fg(Color::White)),
-                        )
-                        .style(Style::default().fg(Color::Yellow));
-                    f.render_widget(input, chunks[0]);
+                // If CustomSql is active, we don't display results until Enter is hit.
+                if self.search_state.search_type == SearchType::CustomSql
+                    && self.search_state.results.is_empty()
+                    && !self.search_state.query.is_empty()
+                {
+                    // If typing a custom query, show the editor content in chunks[0]
+                    self.render_editor(f, chunks[0])?;
+                    // The actual query input is handled below in chunks[2]
                 } else {
-                    // Render search results
+                    // Render search results for all modes (Backlinks, Tags, Files, and results of CustomSql)
+                    let title = match self.search_state.search_type {
+                        SearchType::Backlinks => format!("Backlinks: {}", self.search_state.query),
+                        SearchType::Tags => format!("Tags: {}", self.search_state.query),
+                        SearchType::Files => format!("Files: {}", self.search_state.query),
+                        SearchType::CustomSql => format!(
+                            "Custom SQL Results (Press Enter to Open): {}",
+                            self.search_state.query
+                        ),
+                        SearchType::None => "Search".to_string(),
+                    };
+
                     let items: Vec<ListItem> = self
                         .search_state
                         .results
@@ -2875,153 +2970,235 @@ impl App {
             .style(Style::default().fg(Color::Yellow));
         f.render_widget(status, chunks[1]);
 
-        let command = Paragraph::new(match self.mode {
+        let command_text = match self.mode {
             Mode::Command => format!(":{}", self.command),
-            Mode::Search => format!("/{}", self.search_state.query),
+            Mode::Search => {
+                if self.search_state.search_type == SearchType::CustomSql {
+                    format!("SQL: {}", self.search_state.query)
+                } else {
+                    format!("/{}", self.search_state.query)
+                }
+            }
             Mode::Normal | Mode::FileTree if !self.key_sequence.is_empty() => {
                 format!("{}", self.key_sequence)
             }
             _ => String::new(),
-        })
-        .style(Style::default().fg(Color::White));
+        };
+
+        let command = Paragraph::new(command_text).style(Style::default().fg(Color::White));
         f.render_widget(command, chunks[2]);
+
         Ok(())
     }
 
     fn render_editor(&mut self, f: &mut Frame, area: Rect) -> Result<(), EditorError> {
-        // Check if cursor moved and update image
-        let cursor_row = self.textarea.cursor().0;
-        let cursor_col = self.textarea.cursor().1;
-        let last_cursor_row = self.completion_state.trigger_start.0;
-        let last_cursor_col = self.completion_state.trigger_start.1;
+        // 1. Check if the cursor moved to an image
+        self.check_image_at_cursor()?;
+
+        // 2. Draw outer borders and get the safe inner drawing area
+        let inner_area = self.render_borders(f, area);
+
+        // 3. Update scroll positions based on the cursor and inner area
+        self.update_scrolling(inner_area);
+
+        // 4. Process text (highlighting, virtual text) and render the paragraph/cursor
+        self.render_text_and_cursor(f, inner_area)?;
+
+        // 5. Render the image overlay if one is active
+        self.render_image_overlay(f, area, inner_area);
+
+        // 6. Render the completion popup if active
+        self.render_completion_popup(f, inner_area);
+
+        Ok(())
+    }
+
+    // --- 1. Cursor check for images ---
+    fn check_image_at_cursor(&mut self) -> Result<(), EditorError> {
+        let (cursor_row, cursor_col) = self.textarea.cursor();
+        let (last_cursor_row, last_cursor_col) = self.completion_state.trigger_start;
+
         if cursor_row != last_cursor_row || cursor_col != last_cursor_col {
             self.load_image_at_cursor()?;
             self.completion_state.trigger_start = (cursor_row, cursor_col);
         }
+        Ok(())
+    }
 
-        // text rendering code
-        let text = self.textarea.lines().join("\n");
+    // --- 2. Draw Borders and Calculate Safe Inner Area ---
+    fn render_borders(&self, f: &mut Frame, area: Rect) -> Rect {
+        let mode_title = if self.read_mode {
+            "[Read Mode - Wrapped]"
+        } else {
+            "[Edit Mode]"
+        };
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(format!("Midetor {}", mode_title))
+            .style(Style::default().fg(Color::White));
+
+        let inner_area = block.inner(area);
+
+        if !self.image_full_screen {
+            f.render_widget(block, area);
+        }
+
+        inner_area
+    }
+
+    // --- 3. Adjust Scrolling ---
+    fn update_scrolling(&mut self, inner_area: Rect) {
+        let area_height = inner_area.height as usize;
+        let area_width = inner_area.width as usize;
+        let total_lines = self.textarea.lines().len();
+        let visible_lines_count = area_height.min(total_lines);
+        let cursor_row = self.textarea.cursor().0;
+        let cursor_col = self.textarea.cursor().1;
+
+        let logical_scroll_margin = if self.read_mode {
+            3.min(visible_lines_count)
+        } else {
+            visible_lines_count
+        };
+
+        if cursor_row < self.scroll_offset {
+            self.scroll_offset = cursor_row;
+        } else if cursor_row >= self.scroll_offset + logical_scroll_margin {
+            self.scroll_offset = cursor_row.saturating_sub(logical_scroll_margin.saturating_sub(1));
+        }
+
+        let max_scroll = if self.read_mode {
+            total_lines.saturating_sub(1)
+        } else {
+            total_lines.saturating_sub(visible_lines_count)
+        };
+
+        self.scroll_offset = self.scroll_offset.min(max_scroll);
+
+        if !self.read_mode {
+            if cursor_col < self.horizontal_scroll_offset {
+                self.horizontal_scroll_offset = cursor_col;
+            } else if cursor_col >= self.horizontal_scroll_offset + area_width {
+                self.horizontal_scroll_offset =
+                    cursor_col.saturating_sub(area_width.saturating_sub(1));
+            }
+        } else {
+            self.horizontal_scroll_offset = 0;
+        }
+    }
+
+    // --- 4 & 5. Process Text & Render Paragraph/Cursor ---
+    fn render_text_and_cursor(
+        &mut self,
+        f: &mut Frame,
+        inner_area: Rect,
+    ) -> Result<(), EditorError> {
+        let area_height = inner_area.height as usize;
+        let total_lines = self.textarea.lines().len();
+        let visible_lines_count = area_height.min(total_lines);
+
+        let start_line = self.scroll_offset;
+        let end_line = (self.scroll_offset + visible_lines_count).min(total_lines);
+
         let syntax = self
             .syntax_set
             .find_syntax_by_extension("md")
             .unwrap_or_else(|| self.syntax_set.find_syntax_by_name("Markdown").unwrap());
+
         let mut highlighter = HighlightLines::new(syntax, &self.theme);
-        let mut highlighted_lines = Vec::new();
+        let mut visible_text = Vec::new();
+        let selection_range = self.textarea.selection_range();
 
-        // Get selection range for Visual/VisualBlock modes
-        let selection_range = match self.mode {
-            Mode::Visual | Mode::VisualBlock => self.visual_anchor.map(|anchor| {
-                let cursor = self.textarea.cursor();
-                let start_row = anchor.0.min(cursor.0);
-                let end_row = anchor.0.max(cursor.0);
-                let start_col = if anchor.0 == start_row {
-                    anchor.1
-                } else {
-                    cursor.1
-                };
-                let end_col = if anchor.0 == end_row {
-                    anchor.1
-                } else {
-                    cursor.1
-                };
-                ((start_row, start_col), (end_row, end_col))
-            }),
-            _ => None,
-        };
+        for logical_row in start_line..end_line {
+            let line = &self.textarea.lines()[logical_row];
+            let trimmed_line = line.trim();
 
-        for (row, line) in LinesWithEndings::from(&text).enumerate() {
+            let mut is_vid_header = false;
+            if trimmed_line.starts_with("```vid") {
+                is_vid_header = true;
+            }
+
+            let line_with_nl = format!("{}\n", line);
             let ranges = highlighter
-                .highlight_line(line, &self.syntax_set)
+                .highlight_line(&line_with_nl, &self.syntax_set)
                 .map_err(|e| EditorError::SyntaxHighlighting(e.to_string()))?;
-            let mut spans: Vec<Span> = Vec::new();
-            let mut col = 0;
 
-            for (style, text) in ranges {
+            let mut new_spans = Vec::new();
+            let mut col_tracker = 0;
+
+            for (style, text_segment) in ranges {
+                let text = text_segment.trim_end_matches('\n');
+                if text.is_empty() {
+                    continue;
+                }
+
                 let color = Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b);
                 let text_len = text.chars().count();
                 let mut span_style = Style::default().fg(color);
 
-                if let Some(((start_row, start_col), (end_row, end_col))) = selection_range {
-                    if (row > start_row || (row == start_row && col >= start_col))
-                        && (row < end_row || (row == end_row && col < end_col))
+                if let Some(((start_r, start_c), (end_r, end_c))) = selection_range {
+                    if (logical_row > start_r || (logical_row == start_r && col_tracker >= start_c))
+                        && (logical_row < end_r || (logical_row == end_r && col_tracker < end_c))
                     {
                         span_style = span_style.bg(Color::LightBlue);
                     }
                 }
 
-                spans.push(Span::styled(text.to_string(), span_style));
-                col += text_len;
-            }
-            highlighted_lines.push(Line::from(spans));
-        }
-
-        // Calculate scroll offsets
-        let area_height = area.height.saturating_sub(2) as usize;
-        let area_width = area.width.saturating_sub(2) as usize;
-        let visible_lines = area_height.min(highlighted_lines.len());
-
-        if cursor_row < self.scroll_offset {
-            self.scroll_offset = cursor_row;
-        } else if cursor_row >= self.scroll_offset + visible_lines {
-            self.scroll_offset = cursor_row - (visible_lines - 1);
-        }
-        self.scroll_offset = self
-            .scroll_offset
-            .min(highlighted_lines.len().saturating_sub(visible_lines));
-
-        if cursor_col < self.horizontal_scroll_offset {
-            self.horizontal_scroll_offset = cursor_col;
-        } else if cursor_col >= self.horizontal_scroll_offset + area_width {
-            self.horizontal_scroll_offset = cursor_col - (area_width - 1);
-        }
-
-        let start_line = self.scroll_offset;
-        let end_line = (self.scroll_offset + visible_lines).min(highlighted_lines.len());
-        let mut visible_text = Vec::new();
-        for line in highlighted_lines[start_line..end_line].iter() {
-            let mut new_spans = Vec::new();
-            let mut col = 0;
-            for span in &line.spans {
-                let text = span.content.as_ref();
-                let span_len = text.chars().count();
-                let span_start = col;
-                let span_end = col + span_len;
-
-                if span_end > self.horizontal_scroll_offset {
-                    let start_char = if span_start < self.horizontal_scroll_offset {
-                        self.horizontal_scroll_offset - span_start
-                    } else {
-                        0
-                    };
-                    let text_chars: Vec<char> = text.chars().collect();
-                    let sliced_text = text_chars[start_char..].iter().collect::<String>();
-                    if !sliced_text.is_empty() {
-                        new_spans.push(Span::styled(sliced_text, span.style));
+                if !self.read_mode {
+                    let span_end = col_tracker + text_len;
+                    if span_end > self.horizontal_scroll_offset {
+                        let start_char = if col_tracker < self.horizontal_scroll_offset {
+                            self.horizontal_scroll_offset - col_tracker
+                        } else {
+                            0
+                        };
+                        let text_chars: Vec<char> = text.chars().collect();
+                        let sliced_text: String = text_chars.into_iter().skip(start_char).collect();
+                        if !sliced_text.is_empty() {
+                            new_spans.push(Span::styled(sliced_text, span_style));
+                        }
                     }
+                } else {
+                    new_spans.push(Span::styled(text.to_string(), span_style));
                 }
-                col += span_len;
+
+                col_tracker += text_len;
             }
+
+            if is_vid_header {
+                new_spans = Self::build_vid_virtual_text(
+                    self.textarea.lines(),
+                    logical_row,
+                    &self.yt_videos,
+                    self.horizontal_scroll_offset,
+                    self.read_mode,
+                );
+            }
+
             visible_text.push(Line::from(new_spans));
         }
 
         if !self.image_full_screen {
-            let block = self.textarea.block().cloned().unwrap_or_default();
+            let mut paragraph = Paragraph::new(visible_text).style(self.textarea.style());
+            if self.read_mode {
+                paragraph = paragraph.wrap(ratatui::widgets::Wrap { trim: false });
+            }
 
-            let paragraph = Paragraph::new(visible_text)
-                .block(block)
-                .style(self.textarea.style());
+            f.render_widget(paragraph, inner_area);
 
-            f.render_widget(paragraph, area);
-
-            if cursor_row >= self.scroll_offset && cursor_row < self.scroll_offset + visible_lines {
+            let (cursor_row, cursor_col) = self.textarea.cursor();
+            if !self.read_mode
+                && cursor_row >= self.scroll_offset
+                && cursor_row < self.scroll_offset + visible_lines_count
+            {
                 let screen_row = (cursor_row - self.scroll_offset) as u16;
                 let screen_col = (cursor_col.saturating_sub(self.horizontal_scroll_offset)) as u16;
-                let max_width = area_width as u16;
-                let cursor_x = screen_col.min(max_width);
+                let cursor_x = screen_col.min(inner_area.width.saturating_sub(1));
 
                 let cursor_area = Rect {
-                    x: area.x + 1 + cursor_x,
-                    y: area.y + 1 + screen_row,
+                    x: inner_area.x + cursor_x,
+                    y: inner_area.y + screen_row,
                     width: 1,
                     height: 1,
                 };
@@ -3032,14 +3209,63 @@ impl App {
                     .get(cursor_row)
                     .cloned()
                     .unwrap_or_default();
-
                 let ch: char = line.chars().nth(cursor_col).unwrap_or(' ');
                 let cursor_style = Style::default().bg(Color::White).fg(Color::Black);
                 let cursor_span = Span::styled(ch.to_string(), cursor_style);
 
-                f.render_widget(Paragraph::new(cursor_span), cursor_area); // <-- Fixed
+                f.render_widget(Paragraph::new(cursor_span), cursor_area);
             }
         }
+
+        Ok(())
+    }
+
+    fn build_vid_virtual_text<'a>(
+        lines: &[String],
+        logical_row: usize,
+        yt_videos: &HashMap<String, String>,
+        horizontal_scroll_offset: usize,
+        read_mode: bool,
+    ) -> Vec<Span<'a>> {
+        let mut title = "Title Not Found";
+
+        // Peek at the next line to find the URL
+        if let Some(next_line) = lines.get(logical_row + 1) {
+            let url = next_line.trim();
+            if !url.is_empty() {
+                for (db_url, db_title) in yt_videos {
+                    if url.contains(db_url) || db_url.contains(url) {
+                        title = db_title.as_str();
+                        break;
+                    }
+                }
+            }
+        }
+
+        let combined_text = format!("```vid  ➔ {}", title);
+        let mut final_text = combined_text.clone();
+
+        // Apply horizontal scrolling if not in read mode
+        if !read_mode && horizontal_scroll_offset > 0 {
+            let text_chars: Vec<char> = combined_text.chars().collect();
+            final_text = text_chars
+                .into_iter()
+                .skip(horizontal_scroll_offset)
+                .collect();
+        }
+
+        vec![Span::styled(
+            final_text,
+            Style::default()
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
+        )]
+    }
+
+    // --- 6. Render Image Overlay ---
+    fn render_image_overlay(&mut self, f: &mut Frame, area: Rect, inner_area: Rect) {
+        let area_height = inner_area.height as usize;
+        let visible_lines_count = area_height.min(self.textarea.lines().len());
 
         if let (Some(picker), Some(dyn_img), Some(image_row)) = (
             self.image_picker.as_mut(),
@@ -3047,38 +3273,33 @@ impl App {
             self.current_image_line,
         ) {
             let (image_area, title_str) = if self.image_full_screen {
-                (area, "Image (Full Screen)") // Use the whole editor area
+                (area, "Image (Full Screen)")
             } else {
-                // Ensure popup stays within text_area bounds
-                let popup_width = (area.width as f32 * 0.4).max(30.0).min(area.width as f32) as u16;
-
-                let popup_height =
-                    (area.height as f32 * 0.6).max(10.0).min(area.height as f32) as u16;
-
-                let max_y = area.y + area.height.saturating_sub(popup_height);
-
-                let max_x = area.x + area.width.saturating_sub(popup_width);
+                let popup_width = (inner_area.width as f32 * 0.4)
+                    .max(30.0)
+                    .min(inner_area.width as f32) as u16;
+                let popup_height = (inner_area.height as f32 * 0.6)
+                    .max(10.0)
+                    .min(inner_area.height as f32) as u16;
+                let max_y = inner_area.y + inner_area.height.saturating_sub(popup_height);
+                let max_x = inner_area.x + inner_area.width.saturating_sub(popup_width);
 
                 let mut popup_y;
-
-                if image_row < self.scroll_offset || image_row >= self.scroll_offset + visible_lines
+                if self.read_mode
+                    || image_row < self.scroll_offset
+                    || image_row >= self.scroll_offset + visible_lines_count
                 {
-                    popup_y = area.y + 1; // Top of text_area
+                    popup_y = inner_area.y;
                 } else {
                     let screen_row = (image_row - self.scroll_offset) as u16;
-
-                    popup_y = area.y + 1 + screen_row;
+                    popup_y = inner_area.y + screen_row;
                 }
-
                 popup_y = popup_y.min(max_y);
 
                 let popup_area = Rect {
-                    x: max_x, // Right-aligned
-
+                    x: max_x,
                     y: popup_y,
-
                     width: popup_width,
-
                     height: popup_height,
                 };
 
@@ -3087,24 +3308,18 @@ impl App {
 
             if self.image_protocol.is_none() || self.last_image_area != Some(image_area) {
                 self.image_protocol = Some(picker.new_resize_protocol(dyn_img.clone()));
-
                 self.last_image_area = Some(image_area);
             }
 
             if let Some(image_protocol) = self.image_protocol.as_mut() {
-                let block = Block::default().borders(Borders::ALL).title(title_str);
+                let img_block = Block::default().borders(Borders::ALL).title(title_str);
                 let image_widget = ratatui_image::StatefulImage::default()
                     .resize(Resize::Scale(Some(FilterType::Triangle)));
-                if self.image_full_screen {
-                    // Clear text underneath
 
-                    f.render_widget(ratatui::widgets::Clear, image_area);
-                }
-
-                f.render_widget(block, image_area);
+                f.render_widget(ratatui::widgets::Clear, image_area);
+                f.render_widget(img_block, image_area);
 
                 let margin = Margin::new(1, 1);
-
                 f.render_stateful_widget(image_widget, image_area.inner(margin), image_protocol);
 
                 if let Some(Err(e)) = image_protocol.last_encoding_result() {
@@ -3112,8 +3327,10 @@ impl App {
                 }
             }
         }
+    }
 
-        // Render completion popup if active
+    // --- 7. Render Completion Popup ---
+    fn render_completion_popup(&mut self, f: &mut Frame, inner_area: Rect) {
         if self.completion_state.active && !self.completion_state.suggestions.is_empty() {
             let items: Vec<ListItem> = self
                 .completion_state
@@ -3134,19 +3351,22 @@ impl App {
                         .style(Style::default().fg(Color::White).bg(Color::Black)),
                 )
                 .highlight_style(Style::default().bg(Color::White).fg(Color::Black));
-            let popup_width = 40;
-            let popup_height = (self.completion_state.suggestions.len().min(5) + 2) as u16;
+
+            let popup_width = 40.min(inner_area.width);
+            let popup_height = ((self.completion_state.suggestions.len().min(5) + 2) as u16)
+                .min(inner_area.height);
             let popup_area = Rect {
-                x: area.x + area.width.saturating_sub(popup_width),
-                y: area.y + 1,
+                x: inner_area.x + inner_area.width.saturating_sub(popup_width),
+                y: inner_area.y,
                 width: popup_width,
                 height: popup_height,
             };
+
+            f.render_widget(ratatui::widgets::Clear, popup_area);
             f.render_stateful_widget(list, popup_area, &mut self.completion_state.list_state);
         }
-
-        Ok(())
     }
+
     fn process_template_command(&mut self, template_path_str: &str) -> Result<(), EditorError> {
         // 1. Define the template path. This should be a configurable path.
         let template_path = Path::new(&self.base_dir).join(template_path_str);
@@ -3317,5 +3537,168 @@ impl App {
         self.current_image_index = 0;
         self.last_image_area = None;
         self.image_full_screen = false;
+    }
+
+    fn search_custom_sql(&mut self) -> Result<(), EditorError> {
+        let query = &self.search_state.query;
+
+        if !query.trim().to_lowercase().starts_with("select") {
+            self.status = "Only SELECT queries are allowed.".to_string();
+            self.search_state.results = Vec::new();
+            return Ok(());
+        }
+
+        let mut stmt = match self.db.prepare(query) {
+            Ok(s) => s,
+            Err(e) => {
+                self.status = format!("SQL Prepare Error: {}", e);
+                self.search_state.results = Vec::new();
+                return Ok(());
+            }
+        };
+
+        let mut results = Vec::new();
+
+        let rows = stmt.query_map([], |row| {
+            // Column 0: Display Text (Required)
+            let display_text: String = row.get(0)?;
+
+            // Column 1: File ID (Optional and needs careful handling)
+            // We attempt to get the i64 value directly.
+            // If it returns a Rusqlite error (like TypeMismatch or Null),
+            // we map it to None, assuming the column exists but is empty or wrong type.
+            // We use an explicit lifetime on the row reference: `row.get::<_, T>(idx)`
+
+            let file_id: Option<i64> = match row.get(1) {
+                Ok(val) => Some(val),
+                // Catching all errors here is safe because if the row exists, any error
+                // on the optional column just means we can't open a file for this result.
+                // Specifically, rusqlite often returns `InvalidColumnIndex` if the column
+                // isn't present in the query result set, or a conversion error if it's NULL/wrong type.
+                Err(_) => None,
+            };
+
+            Ok((display_text, file_id))
+        });
+
+        match rows {
+            Ok(mapped_rows) => {
+                results = mapped_rows
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| EditorError::Database(e))?;
+                self.status = format!(
+                    "Custom SQL query executed. {} results found.",
+                    results.len()
+                );
+            }
+            Err(e) => {
+                self.status = format!("SQL Query Execution Error: {}", e);
+            }
+        }
+
+        self.search_state.results = results;
+
+        Ok(())
+    }
+
+    fn playaudio(&mut self, index: usize, music_path: &str) -> Result<(), EditorError> {
+        // --- 1. Extract the Wikilink (Filename) ---
+        let (current_row, current_col) = self.textarea.cursor();
+        let line = self.textarea.lines()[current_row].clone();
+
+        let filename = if index < self.backlinks.len() {
+            self.backlinks[index].0.clone()
+        } else {
+            self.extract_wikilink(&line, current_col).ok_or_else(|| {
+                EditorError::InvalidBacklink("No valid wikilink found at cursor".to_string())
+            })?
+        };
+
+        // --- 2. Clean Autocompletions (Your existing logic) ---
+        if line.contains("[[") && !line.contains("]]") {
+            let mut new_lines = self.textarea.lines().to_vec();
+            new_lines[current_row] = line[..line.rfind("[[").unwrap_or(line.len())].to_string();
+            self.textarea = tui_textarea::TextArea::new(new_lines);
+            // set_textarea_delafult_style!(self.textarea);
+            self.textarea
+                .move_cursor(tui_textarea::CursorMove::Jump(current_row as u16, 0));
+        }
+
+        // --- 3. Construct and Verify Path ---
+        // We join the constant MUSIC_DIR with the filename from the wikilink.
+        let mut file_path = Path::new(music_path).join(&filename);
+
+        if !file_path.exists() && !file_path.with_extension("mp3").exists() {
+            // We'll look for either the exact filename or filename.mp3
+            let target_name = filename.clone();
+            let target_mp3 = format!("{}.mp3", filename);
+
+            let found_path = WalkDir::new(music_path)
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .find(|entry| {
+                    let name = entry.file_name().to_string_lossy();
+                    name == target_name || name == target_mp3
+                });
+
+            if let Some(entry) = found_path {
+                file_path = entry.path().to_path_buf();
+            } else {
+                return Err(EditorError::InvalidBacklink(format!(
+                    "File '{}' not found in {}",
+                    filename, music_path
+                )));
+            }
+        } else if !file_path.exists() {
+            // This handles the case where it WAS found in the root, but needed the .mp3 extension
+            file_path = file_path.with_extension("mp3");
+        }
+
+        // --- 4. Stop Previous Audio & Start New ---
+        self.stop_audio();
+
+        let child_result = Command::new("vlc")
+            .arg("-I")
+            .arg("dummy")
+            .arg("--play-and-exit")
+            .arg(&file_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+
+        match child_result {
+            Ok(child) => {
+                self.audio_child = Some(child);
+                self.status = format!("Playing: {}", filename);
+            }
+            Err(e) => {
+                return Err(EditorError::InvalidBacklink(format!(
+                    "Failed to start VLC: {}",
+                    e
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn stop_audio(&mut self) {
+        // .take() moves the value out of the Option, leaving None behind.
+        if let Some(mut child) = self.audio_child.take() {
+            // Attempt to kill the process
+            if let Err(e) = child.kill() {
+                eprintln!("Failed to kill audio process: {}", e);
+            }
+            // Wait on the child to prevent "zombie" processes
+            let _ = child.wait();
+        }
+        self.status = String::from("Audio stopped");
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        self.stop_audio();
     }
 }

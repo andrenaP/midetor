@@ -1,6 +1,6 @@
 [package]
 name = "midetor"
-version = "1.0.22"
+version = "1.0.25"
 edition = "2024"
 license-file="LICENSE"
 keywords = ["editor", "markdown"]
@@ -22,6 +22,8 @@ clap = { version = "4.5", features = ["derive"] }
 ratatui-image = "8.0.2"
 image = {version= "0.25.8", features = ["avif","avif-native"]} # Compatible with ratatui-image 8.0.2
 regex = "1.10"
+walkdir = "2.5"
+serde_json = "1.0.149"
 
 
 [profile.release]

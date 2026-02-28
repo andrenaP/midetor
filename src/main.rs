@@ -20,7 +20,7 @@ use error::EditorError;
 fn main() -> Result<(), EditorError> {
     // Define CLI using clap
     let matches = Command::new("midetor")
-        .version("1.0.22")
+        .version("1.0.26")
         .about("A terminal-based vim like Markdown editor with Obsidian-like features")
         .arg(
             Arg::new("file_path")
@@ -34,10 +34,21 @@ fn main() -> Result<(), EditorError> {
                 .index(2)
                 .required(false),
         )
+        .arg(
+            Arg::new("music_folder")
+                .help("Music folder")
+                .index(3)
+                .required(false),
+        )
         .get_matches();
 
     // Extract file_path
     let file_path = matches.get_one::<String>("file_path").unwrap();
+    let music_path = matches
+        .get_one::<String>("music_folder")
+        .map(|s| s.to_string())
+        .or_else(|| env::var("musik_folder").ok()) //I know that is is not right but I did it like so years ago
+        .unwrap_or_else(|| env::current_dir().unwrap().to_string_lossy().to_string());
 
     // Determine base_dir: use provided, then OBSIDIAN_VAULT_MAIN_PATH, then current directory
     let base_dir = matches
@@ -54,76 +65,32 @@ fn main() -> Result<(), EditorError> {
         )));
     }
 
+    // Ensure the target file actually exists on the disk
+    let full_file_path = Path::new(&base_dir).join(file_path);
+    if !full_file_path.exists() {
+        std::fs::write(&full_file_path, "")?;
+    }
+
     // Check for and initialize markdown_data.db if it doesn't exist
     let db_path = Path::new(&base_dir).join("markdown_data.db");
     if !db_path.exists() {
-        // Create the database and initialize schema
-        let db = rusqlite::Connection::open(&db_path)?;
-        db.execute(
-            "CREATE TABLE IF NOT EXISTS folders (
-                    id INTEGER PRIMARY KEY,
-                    path TEXT UNIQUE
-                )",
-            [],
-        )?;
-
-        // Files table
-        db.execute(
-                "CREATE TABLE IF NOT EXISTS files (
-                    id INTEGER PRIMARY KEY,
-                    path TEXT UNIQUE,
-                    file_name TEXT,
-                    folder_id INTEGER,
-                    metadata TEXT DEFAULT '{}',
-                    FOREIGN KEY(folder_id) REFERENCES folders(id) ON DELETE CASCADE  -- Optional: cascades if deleting folders
-                )",
-                [],
-            )?;
-
-        // Tags table
-        db.execute(
-            "CREATE TABLE IF NOT EXISTS tags (
-                    id INTEGER PRIMARY KEY,
-                    tag TEXT UNIQUE
-                )",
-            [],
-        )?;
-
-        // File_tags table (cascade on file_id, but not on tag_id)
-        db.execute(
-                "CREATE TABLE IF NOT EXISTS file_tags (
-                    file_id INTEGER,
-                    tag_id INTEGER,
-                    FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE,  -- Auto-delete tags for this file
-                    FOREIGN KEY(tag_id) REFERENCES tags(id),                      -- No cascade: keep tags
-                    UNIQUE(file_id, tag_id)
-                )",
-                [],
-            )?;
-
-        // Backlinks table (cascade on both file_id and backlink_id for bidirectional cleanup)
-        db.execute(
-                "CREATE TABLE IF NOT EXISTS backlinks (
-                    id INTEGER PRIMARY KEY,
-                    backlink TEXT,
-                    backlink_id INTEGER,
-                    file_id INTEGER,
-                    FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE,             -- Auto-delete if target file deleted
-                    FOREIGN KEY(backlink_id) REFERENCES files(id) ON DELETE CASCADE,         -- Auto-delete if source file deleted
-                    UNIQUE(backlink_id, file_id, backlink)
-                )",
-                [],
-            )?;
-        // Ensure markdown-scanner is run to populate the database
-        let output = ProcessCommand::new("markdown-scanner")
+        ProcessCommand::new("markdown-scanner")
             .arg(file_path)
             .arg(&base_dir)
             .output()?;
-        if !output.status.success() {
-            let error_msg = String::from_utf8_lossy(&output.stderr).into_owned();
-            return Err(EditorError::Scanner(error_msg));
-        }
     }
+
+    // 2. Force the scanner to run for this specific file on startup.
+    // This ensures it is always in the database before App::new runs.
+    // let output = ProcessCommand::new("markdown-scanner")
+    //     .arg(&full_file_path)
+    //     .arg(&base_dir)
+    //     .output()?;
+
+    // if !output.status.success() {
+    //     let error_msg = String::from_utf8_lossy(&output.stderr).into_owned();
+    //     return Err(EditorError::Scanner(error_msg));
+    // }
 
     // Ensure terminal cleanup on exit
     struct TerminalGuard;
@@ -142,7 +109,7 @@ fn main() -> Result<(), EditorError> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(file_path, &base_dir)?;
+    let mut app = App::new(file_path, &base_dir, &music_path)?;
 
     while !app.should_quit {
         app.render(&mut terminal)?;
@@ -202,6 +169,6 @@ fn main() -> Result<(), EditorError> {
             _ => {}
         }
     }
-
+    drop(app);
     Ok(())
 }
