@@ -1,2 +1,4 @@
 target
 markdown_data.db
+release
+.rustc_info.json

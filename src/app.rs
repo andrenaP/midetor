@@ -3188,32 +3188,69 @@ impl App {
             f.render_widget(paragraph, inner_area);
 
             let (cursor_row, cursor_col) = self.textarea.cursor();
-            if !self.read_mode
-                && cursor_row >= self.scroll_offset
-                && cursor_row < self.scroll_offset + visible_lines_count
-            {
-                let screen_row = (cursor_row - self.scroll_offset) as u16;
-                let screen_col = (cursor_col.saturating_sub(self.horizontal_scroll_offset)) as u16;
-                let cursor_x = screen_col.min(inner_area.width.saturating_sub(1));
+            if !self.read_mode {
+                if cursor_row >= self.scroll_offset
+                    && cursor_row < self.scroll_offset + visible_lines_count
+                {
+                    let screen_row = (cursor_row - self.scroll_offset) as u16;
+                    let screen_col =
+                        (cursor_col.saturating_sub(self.horizontal_scroll_offset)) as u16;
+                    let cursor_x = screen_col.min(inner_area.width.saturating_sub(1));
 
-                let cursor_area = Rect {
-                    x: inner_area.x + cursor_x,
-                    y: inner_area.y + screen_row,
-                    width: 1,
-                    height: 1,
-                };
+                    let cursor_area = Rect {
+                        x: inner_area.x + cursor_x,
+                        y: inner_area.y + screen_row,
+                        width: 1,
+                        height: 1,
+                    };
 
-                let line = self
-                    .textarea
-                    .lines()
-                    .get(cursor_row)
-                    .cloned()
-                    .unwrap_or_default();
-                let ch: char = line.chars().nth(cursor_col).unwrap_or(' ');
-                let cursor_style = Style::default().bg(Color::White).fg(Color::Black);
-                let cursor_span = Span::styled(ch.to_string(), cursor_style);
+                    let line = self
+                        .textarea
+                        .lines()
+                        .get(cursor_row)
+                        .cloned()
+                        .unwrap_or_default();
+                    let ch: char = line.chars().nth(cursor_col).unwrap_or(' ');
+                    let cursor_style = Style::default().bg(Color::White).fg(Color::Black);
+                    let cursor_span = Span::styled(ch.to_string(), cursor_style);
 
-                f.render_widget(Paragraph::new(cursor_span), cursor_area);
+                    f.render_widget(Paragraph::new(cursor_span), cursor_area);
+                }
+            } else if self.read_mode && cursor_row >= self.scroll_offset {
+                let mut visual_y = 0;
+                let area_w = inner_area.width.max(1) as usize;
+
+                for r in self.scroll_offset..=cursor_row {
+                    let line = self.textarea.lines().get(r).cloned().unwrap_or_default();
+
+                    if r == cursor_row {
+                        let wrap_offset_y = cursor_col / area_w;
+                        let wrap_offset_x = cursor_col % area_w;
+                        let target_y = visual_y + wrap_offset_y as u16;
+
+                        if target_y < inner_area.height {
+                            let cursor_area = Rect {
+                                x: inner_area.x + wrap_offset_x as u16,
+                                y: inner_area.y + target_y,
+                                width: 1,
+                                height: 1,
+                            };
+
+                            let ch: char = line.chars().nth(cursor_col).unwrap_or(' ');
+                            let cursor_span = Span::styled(
+                                ch.to_string(),
+                                Style::default().bg(Color::White).fg(Color::Black),
+                            );
+                            f.render_widget(Paragraph::new(cursor_span), cursor_area);
+                        }
+                        break;
+                    } else {
+                        // Calculate how many vertical lines the previous text took up
+                        let chars_count = line.chars().count();
+                        let lines_taken = (chars_count / area_w) as u16 + 1;
+                        visual_y += lines_taken;
+                    }
+                }
             }
         }
 
