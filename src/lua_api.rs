@@ -3,6 +3,15 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+// 1. The Snapshot State
+#[derive(Clone, Default)]
+pub struct EditorContext {
+    pub lines: Vec<String>,
+    pub cursor_row: usize,
+    pub cursor_col: usize,
+    pub current_file: String,
+}
+
 #[derive(Clone, Debug)]
 pub enum EditorCommand {
     // Basic Movement
@@ -45,11 +54,17 @@ pub enum EditorCommand {
     Cancel,
 
     ChangeStatus(String),
+
+    // --- NEW TEXT MANIPULATION COMMANDS ---
+    InsertText(String),
+    SetLines(Vec<String>),
+    SetCursor(usize, usize),
 }
 
 pub struct LuaEditorAPI {
     pub command_queue: Rc<RefCell<Vec<EditorCommand>>>,
     pub normal_keymaps: Rc<RefCell<HashMap<String, mlua::RegistryKey>>>,
+    pub context: Rc<RefCell<EditorContext>>, // <-- NEW: The shared snapshot
 }
 
 impl UserData for LuaEditorAPI {
@@ -241,6 +256,61 @@ impl UserData for LuaEditorAPI {
             this.command_queue
                 .borrow_mut()
                 .push(EditorCommand::ChangeStatus(msg));
+            Ok(())
+        });
+
+        // ==========================================
+        // READ METHODS (Lua -> Rust State)
+        // ==========================================
+
+        methods.add_method("get_cursor", |_, this, ()| {
+            let ctx = this.context.borrow();
+            Ok((ctx.cursor_row, ctx.cursor_col)) // Returns a tuple to Lua
+        });
+
+        methods.add_method("get_current_line", |_, this, ()| {
+            let ctx = this.context.borrow();
+            if let Some(line) = ctx.lines.get(ctx.cursor_row) {
+                Ok(line.clone())
+            } else {
+                Ok(String::new())
+            }
+        });
+
+        methods.add_method("get_all_lines", |_, this, ()| {
+            let ctx = this.context.borrow();
+            Ok(ctx.lines.clone()) // Automatically converts to a Lua Table of strings!
+        });
+
+        methods.add_method("get_current_file", |_, this, ()| {
+            let ctx = this.context.borrow();
+            Ok(ctx.current_file.clone())
+        });
+
+        // ==========================================
+        // WRITE METHODS (Lua -> Command Queue)
+        // ==========================================
+
+        methods.add_method("insert_text", |_, this, text: String| {
+            this.command_queue
+                .borrow_mut()
+                .push(EditorCommand::InsertText(text));
+            Ok(())
+        });
+
+        // Replaces the entire buffer (like vim.api.nvim_buf_set_lines)
+        methods.add_method("set_lines", |_, this, new_lines: Vec<String>| {
+            this.command_queue
+                .borrow_mut()
+                .push(EditorCommand::SetLines(new_lines));
+            Ok(())
+        });
+
+        // Jump to a specific row and col
+        methods.add_method("set_cursor", |_, this, (row, col): (usize, usize)| {
+            this.command_queue
+                .borrow_mut()
+                .push(EditorCommand::SetCursor(row, col));
             Ok(())
         });
     }

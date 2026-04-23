@@ -123,3 +123,67 @@ editor:map("n", "<Esc>", function()
     editor:cancel()
     editor:set_status("Normal Mode")
 end)
+
+
+function run_bash_script_and_save()
+    -- editor:save()
+    _G.Obsidian_valt_main_path = os.getenv("Obsidian_valt_main_path")
+    local current_file_path = editor:get_current_file()
+    local script_path = 'markdown-scanner "' ..
+        current_file_path .. '" "' .. _G.Obsidian_valt_main_path .. '" --json-only '
+
+    local handle = io.popen(script_path)
+    local result = handle:read("*a")
+    handle:close()
+
+    editor:echo(result .. " THIS IS RUST BABY")
+end
+
+editor:map("n", "<C-y>", function() run_bash_script_and_save() end)
+
+
+editor:map("n", "o", function()
+    editor:move("end")        -- Jump to the end of the current line
+    editor:insert_text("\n")  -- Insert a newline character
+    editor:set_mode("insert") -- Switch to insert mode
+end)
+-- Implement 'O' (Insert line above) entirely in Lua
+editor:map("n", "O", function()
+    local row, col = editor:get_cursor()
+    local lines = editor:get_all_lines()
+
+    -- Insert at the current line (pushes current line down)
+    table.insert(lines, row + 1, "")
+
+    editor:set_lines(lines)
+    editor:set_cursor(row, 0) -- Cursor stays on the same Rust row index
+    editor:set_mode("insert")
+end)
+
+
+
+local function move_line_up()
+    local row, col = editor:get_cursor()
+    if row > 0 then
+        local lines = editor:get_all_lines()
+        lines[row + 1], lines[row] = lines[row], lines[row + 1] -- Lua shortcut for swapping!
+        editor:set_lines(lines)
+        editor:set_cursor(row - 1, col)
+    end
+end
+
+local function move_line_down()
+    local row, col = editor:get_cursor()
+    local lines = editor:get_all_lines()
+    if row < #lines - 1 then
+        lines[row + 1], lines[row + 2] = lines[row + 2], lines[row + 1]
+        editor:set_lines(lines)
+        editor:set_cursor(row + 1, col)
+    end
+end
+
+editor:map("n", "<A-Up>", move_line_up)
+editor:map("n", "<A-k>", move_line_up)
+
+editor:map("n", "<A-Down>", move_line_down)
+editor:map("n", "<A-j>", move_line_down)

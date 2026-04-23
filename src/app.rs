@@ -32,7 +32,7 @@ use walkdir::WalkDir;
 
 use unicode_width::UnicodeWidthChar;
 
-use crate::lua_api::{EditorCommand, LuaEditorAPI};
+use crate::lua_api::{EditorCommand, EditorContext, LuaEditorAPI};
 use mlua::Lua;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -194,6 +194,7 @@ pub struct App {
     lua: Lua,
     command_queue: Rc<RefCell<Vec<EditorCommand>>>,
     normal_keymaps: Rc<RefCell<HashMap<String, mlua::RegistryKey>>>,
+    shared_context: Rc<RefCell<EditorContext>>,
 }
 
 pub struct CompletionState {
@@ -248,10 +249,12 @@ impl App {
         let lua = Lua::new();
         let command_queue = Rc::new(RefCell::new(Vec::new()));
         let normal_keymaps = Rc::new(RefCell::new(HashMap::new()));
+        let shared_context = Rc::new(RefCell::new(EditorContext::default()));
 
         let api = LuaEditorAPI {
             command_queue: Rc::clone(&command_queue),
             normal_keymaps: Rc::clone(&normal_keymaps),
+            context: Rc::clone(&shared_context),
         };
 
         // 2. Expose the API to Lua under the global variable `editor`
@@ -336,6 +339,7 @@ impl App {
             lua,
             command_queue,
             normal_keymaps,
+            shared_context,
         };
         app.open_file(file_path.to_string(), file_id)?;
 
@@ -1771,22 +1775,26 @@ impl App {
                 };
 
                 if has_exact {
-                    // 1. Create a variable to catch errors before we borrow `self.lua`
+                    // --- 1. SYNC STATE TO LUA BEFORE EXECUTION ---
+                    {
+                        let mut ctx = self.shared_context.borrow_mut();
+                        ctx.lines = self.textarea.lines().to_vec();
+                        ctx.cursor_row = self.textarea.cursor().0;
+                        ctx.cursor_col = self.textarea.cursor().1;
+                        ctx.current_file = self.file_path.clone();
+                    }
+                    // 2. Execute the Lua function
                     let mut lua_error = None;
-
-                    // 2. Open an inner scope to strictly contain the immutable borrows
                     {
                         let maps = self.normal_keymaps.borrow();
                         let reg_key = maps.get(&sequence).unwrap();
                         let func: mlua::Function = self.lua.registry_value(reg_key).unwrap();
 
                         if let Err(e) = func.call::<_, ()>(()) {
-                            // Save the error string, don't mutate `self.status` yet!
                             lua_error = Some(e.to_string());
                         }
-                    } // <-- `func` and `maps` are DROPPED right here! `self` is free!
+                    }
 
-                    // 3. Now it is perfectly safe to mutate `self`
                     if let Some(err) = lua_error {
                         self.status = format!("Lua execution error: {}", err);
                     }
@@ -3886,7 +3894,27 @@ impl App {
                         self.status = "Normal".to_string();
                     }
                 }
+                // ... inside execute_lua_commands ...
+                EditorCommand::InsertText(text) => {
+                    self.textarea.insert_str(&text);
+                }
+                EditorCommand::SetCursor(row, col) => {
+                    self.textarea
+                        .move_cursor(tui_textarea::CursorMove::Jump(row as u16, col as u16));
+                }
+                EditorCommand::SetLines(new_lines) => {
+                    // Replace the entire buffer
+                    let mut new_textarea = tui_textarea::TextArea::new(new_lines);
 
+                    // Re-apply your default styling macro so it doesn't break visuals
+                    set_textarea_delafult_style!(new_textarea);
+
+                    // Keep the cursor roughly where it was, or reset to 0,0
+                    let (r, c) = self.textarea.cursor();
+                    new_textarea.move_cursor(tui_textarea::CursorMove::Jump(r as u16, c as u16));
+
+                    self.textarea = new_textarea;
+                }
                 _ => {} // Optional: A catch-all for any future commands you add to the enum
                         // but haven't implemented here yet.
                         // _ => {}
