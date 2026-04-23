@@ -13,6 +13,7 @@ use std::process::Command as ProcessCommand;
 
 mod app;
 mod error;
+pub mod lua_api;
 
 use app::App;
 use error::EditorError;
