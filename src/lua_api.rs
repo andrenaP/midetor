@@ -10,6 +10,7 @@ pub struct EditorContext {
     pub cursor_row: usize,
     pub cursor_col: usize,
     pub current_file: String,
+    pub visual_anchor: Option<(usize, usize)>,
 }
 
 #[derive(Clone, Debug)]
@@ -59,11 +60,13 @@ pub enum EditorCommand {
     InsertText(String),
     SetLines(Vec<String>),
     SetCursor(usize, usize),
+    SetSelection(Option<(usize, usize)>),
 }
 
 pub struct LuaEditorAPI {
     pub command_queue: Rc<RefCell<Vec<EditorCommand>>>,
     pub normal_keymaps: Rc<RefCell<HashMap<String, mlua::RegistryKey>>>,
+    pub visual_keymaps: Rc<RefCell<HashMap<String, mlua::RegistryKey>>>,
     pub context: Rc<RefCell<EditorContext>>, // <-- NEW: The shared snapshot
 }
 
@@ -311,6 +314,37 @@ impl UserData for LuaEditorAPI {
             this.command_queue
                 .borrow_mut()
                 .push(EditorCommand::SetCursor(row, col));
+            Ok(())
+        });
+        // Replaces the old "map" method to support "v" mappings
+        methods.add_method(
+            "map",
+            |lua, this, (mode, seq, func): (String, String, mlua::Function)| {
+                let key = lua.create_registry_value(func)?;
+                if mode == "n" {
+                    this.normal_keymaps.borrow_mut().insert(seq, key);
+                } else if mode == "v" {
+                    this.visual_keymaps.borrow_mut().insert(seq, key);
+                }
+                Ok(())
+            },
+        );
+
+        // Gets the anchor coordinates
+        methods.add_method("get_visual_anchor", |_, this, ()| {
+            let ctx = this.context.borrow();
+            if let Some(anchor) = ctx.visual_anchor {
+                Ok((anchor.0, anchor.1))
+            } else {
+                Ok((ctx.cursor_row, ctx.cursor_col)) // Fallback if no anchor
+            }
+        });
+
+        // Sets the anchor coordinates
+        methods.add_method("set_selection", |_, this, (row, col): (usize, usize)| {
+            this.command_queue
+                .borrow_mut()
+                .push(EditorCommand::SetSelection(Some((row, col))));
             Ok(())
         });
     }

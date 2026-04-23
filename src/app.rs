@@ -194,6 +194,7 @@ pub struct App {
     lua: Lua,
     command_queue: Rc<RefCell<Vec<EditorCommand>>>,
     normal_keymaps: Rc<RefCell<HashMap<String, mlua::RegistryKey>>>,
+    visual_keymaps: Rc<RefCell<HashMap<String, mlua::RegistryKey>>>,
     shared_context: Rc<RefCell<EditorContext>>,
 }
 
@@ -249,11 +250,13 @@ impl App {
         let lua = Lua::new();
         let command_queue = Rc::new(RefCell::new(Vec::new()));
         let normal_keymaps = Rc::new(RefCell::new(HashMap::new()));
+        let visual_keymaps = Rc::new(RefCell::new(HashMap::new()));
         let shared_context = Rc::new(RefCell::new(EditorContext::default()));
 
         let api = LuaEditorAPI {
             command_queue: Rc::clone(&command_queue),
             normal_keymaps: Rc::clone(&normal_keymaps),
+            visual_keymaps: Rc::clone(&visual_keymaps),
             context: Rc::clone(&shared_context),
         };
 
@@ -339,6 +342,7 @@ impl App {
             lua,
             command_queue,
             normal_keymaps,
+            visual_keymaps,
             shared_context,
         };
         app.open_file(file_path.to_string(), file_id)?;
@@ -2052,7 +2056,56 @@ impl App {
                 _ => {}
             },
             Mode::Visual | Mode::VisualBlock => {
-                let mut input = Input::from(event);
+                let key_str = Self::event_to_string(event);
+                self.key_sequence.push_str(&key_str);
+                let sequence = self.key_sequence.clone();
+
+                let (has_exact, has_partial) = {
+                    let maps = self.visual_keymaps.borrow(); // NOTE: visual_keymaps here!
+                    let exact = maps.contains_key(&sequence);
+                    let partial = maps
+                        .keys()
+                        .any(|k| k.starts_with(&sequence) && k != &sequence);
+                    (exact, partial)
+                };
+
+                if has_exact {
+                    // Sync State
+                    {
+                        let mut ctx = self.shared_context.borrow_mut();
+                        ctx.lines = self.textarea.lines().to_vec();
+                        ctx.cursor_row = self.textarea.cursor().0;
+                        ctx.cursor_col = self.textarea.cursor().1;
+                        ctx.current_file = self.file_path.clone();
+                        ctx.visual_anchor = self.visual_anchor; // Sync the anchor
+                    }
+
+                    let mut lua_error = None;
+                    {
+                        let maps = self.visual_keymaps.borrow();
+                        let reg_key = maps.get(&sequence).unwrap();
+                        let func: mlua::Function = self.lua.registry_value(reg_key).unwrap();
+                        if let Err(e) = func.call::<_, ()>(()) {
+                            lua_error = Some(e.to_string());
+                        }
+                    }
+
+                    if let Some(err) = lua_error {
+                        self.status = format!("Lua error: {}", err);
+                    }
+                    self.key_sequence.clear();
+                    self.execute_lua_commands()?;
+
+                    return Ok(()); // Stop here, Lua handled it!
+                } else if has_partial {
+                    self.status = format!("Waiting: {}", sequence);
+                    return Ok(()); // Stop here, waiting for next key
+                } else {
+                    self.key_sequence.clear();
+                }
+
+                // --- EXISTING HARDCODED RUST LOGIC CONTINUES BELOW ---
+                let mut input = tui_textarea::Input::from(event);
                 match input.key {
                     Key::Esc => {
                         self.textarea.cancel_selection();
@@ -3914,6 +3967,10 @@ impl App {
                     new_textarea.move_cursor(tui_textarea::CursorMove::Jump(r as u16, c as u16));
 
                     self.textarea = new_textarea;
+                }
+
+                EditorCommand::SetSelection(anchor) => {
+                    self.visual_anchor = anchor;
                 }
                 _ => {} // Optional: A catch-all for any future commands you add to the enum
                         // but haven't implemented here yet.
