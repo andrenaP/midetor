@@ -30,6 +30,8 @@ use std::process::Child;
 use std::process::Stdio;
 use walkdir::WalkDir;
 
+use unicode_width::UnicodeWidthChar;
+
 macro_rules! set_textarea_delafult_style {
     ($textarea:expr) => {
         $textarea.set_block(
@@ -182,6 +184,8 @@ pub struct App {
     audio_child: Option<Child>,
     read_mode: bool,
     yt_videos: HashMap<String, String>,
+    editor_width: u16,
+    visual_scroll_y: u16,
 }
 
 pub struct CompletionState {
@@ -292,6 +296,8 @@ impl App {
             audio_child: None,
             read_mode: false,
             yt_videos: HashMap::new(),
+            editor_width: 0,
+            visual_scroll_y: 0,
         };
         app.open_file(file_path.to_string(), file_id)?;
 
@@ -1933,11 +1939,18 @@ impl App {
                         self.textarea.move_cursor(CursorMove::Forward);
                     }
                     (ratatui::crossterm::event::KeyCode::Up, _) => {
-                        self.textarea.move_cursor(CursorMove::Up);
-                        // self.scroll_offset = self.scroll_offset.saturating_sub(1);
+                        if self.read_mode {
+                            self.visual_move_up();
+                        } else {
+                            self.textarea.move_cursor(CursorMove::Up);
+                        } // self.scroll_offset = self.scroll_offset.saturating_sub(1);
                     }
                     (ratatui::crossterm::event::KeyCode::Down, _) => {
-                        self.textarea.move_cursor(CursorMove::Down);
+                        if self.read_mode {
+                            self.visual_move_down();
+                        } else {
+                            self.textarea.move_cursor(CursorMove::Down);
+                        }
                     }
                     (
                         ratatui::crossterm::event::KeyCode::Left,
@@ -2998,6 +3011,7 @@ impl App {
         // 2. Draw outer borders and get the safe inner drawing area
         let inner_area = self.render_borders(f, area);
 
+        self.editor_width = inner_area.width;
         // 3. Update scroll positions based on the cursor and inner area
         self.update_scrolling(inner_area);
 
@@ -3050,41 +3064,46 @@ impl App {
     // --- 3. Adjust Scrolling ---
     fn update_scrolling(&mut self, inner_area: Rect) {
         let area_height = inner_area.height as usize;
-        let area_width = inner_area.width as usize;
+        let area_w = inner_area.width.max(1) as usize;
         let total_lines = self.textarea.lines().len();
-        let visible_lines_count = area_height.min(total_lines);
         let cursor_row = self.textarea.cursor().0;
         let cursor_col = self.textarea.cursor().1;
 
-        let logical_scroll_margin = if self.read_mode {
-            3.min(visible_lines_count)
-        } else {
-            visible_lines_count
-        };
+        if self.read_mode {
+            let mut absolute_cursor_y = 0;
+            for r in 0..=cursor_row {
+                let line = self.textarea.lines().get(r).cloned().unwrap_or_default();
 
-        if cursor_row < self.scroll_offset {
-            self.scroll_offset = cursor_row;
-        } else if cursor_row >= self.scroll_offset + logical_scroll_margin {
-            self.scroll_offset = cursor_row.saturating_sub(logical_scroll_margin.saturating_sub(1));
-        }
+                if r == cursor_row {
+                    let (y, _) = Self::calculate_cursor_position(&line, cursor_col, area_w);
+                    absolute_cursor_y += y;
+                } else {
+                    absolute_cursor_y += Self::calculate_visual_lines(&line, area_w);
+                }
+            }
 
-        let max_scroll = if self.read_mode {
-            total_lines.saturating_sub(1)
-        } else {
-            total_lines.saturating_sub(visible_lines_count)
-        };
-
-        self.scroll_offset = self.scroll_offset.min(max_scroll);
-
-        if !self.read_mode {
-            if cursor_col < self.horizontal_scroll_offset {
-                self.horizontal_scroll_offset = cursor_col;
-            } else if cursor_col >= self.horizontal_scroll_offset + area_width {
-                self.horizontal_scroll_offset =
-                    cursor_col.saturating_sub(area_width.saturating_sub(1));
+            if absolute_cursor_y < self.visual_scroll_y as usize {
+                self.visual_scroll_y = absolute_cursor_y as u16;
+            } else if absolute_cursor_y >= (self.visual_scroll_y as usize + area_height) {
+                self.visual_scroll_y = (absolute_cursor_y - area_height + 1) as u16;
             }
         } else {
-            self.horizontal_scroll_offset = 0;
+            let visible_lines_count = area_height.min(total_lines);
+            if cursor_row < self.scroll_offset {
+                self.scroll_offset = cursor_row;
+            } else if cursor_row >= self.scroll_offset + visible_lines_count {
+                self.scroll_offset =
+                    cursor_row.saturating_sub(visible_lines_count.saturating_sub(1));
+            }
+
+            let max_scroll = total_lines.saturating_sub(visible_lines_count);
+            self.scroll_offset = self.scroll_offset.min(max_scroll);
+
+            if cursor_col < self.horizontal_scroll_offset {
+                self.horizontal_scroll_offset = cursor_col;
+            } else if cursor_col >= self.horizontal_scroll_offset + area_w {
+                self.horizontal_scroll_offset = cursor_col.saturating_sub(area_w.saturating_sub(1));
+            }
         }
     }
 
@@ -3095,11 +3114,36 @@ impl App {
         inner_area: Rect,
     ) -> Result<(), EditorError> {
         let area_height = inner_area.height as usize;
+        let area_width = inner_area.width.max(1) as usize;
         let total_lines = self.textarea.lines().len();
-        let visible_lines_count = area_height.min(total_lines);
 
-        let start_line = self.scroll_offset;
-        let end_line = (self.scroll_offset + visible_lines_count).min(total_lines);
+        // Calculate the exact starting chunk based on visual scroll
+        let mut start_logical_row = self.scroll_offset;
+        let mut scroll_remainder = 0;
+
+        if self.read_mode {
+            let mut visual_y = 0;
+            for (r, line) in self.textarea.lines().iter().enumerate() {
+                let lines_for_this_row = Self::calculate_visual_lines(line, area_width);
+
+                if visual_y + lines_for_this_row > self.visual_scroll_y as usize {
+                    start_logical_row = r;
+                    scroll_remainder = self.visual_scroll_y as usize - visual_y;
+                    break;
+                }
+                visual_y += lines_for_this_row;
+            }
+        }
+
+        // Give Read Mode a generous buffer of lines so it doesn't cut off at the bottom of the screen
+        let visible_lines_count = if self.read_mode {
+            area_height
+        } else {
+            area_height.min(total_lines)
+        };
+        let end_line =
+            (start_logical_row + visible_lines_count + (if self.read_mode { 15 } else { 0 }))
+                .min(total_lines);
 
         let syntax = self
             .syntax_set
@@ -3110,7 +3154,7 @@ impl App {
         let mut visible_text = Vec::new();
         let selection_range = self.textarea.selection_range();
 
-        for logical_row in start_line..end_line {
+        for logical_row in start_logical_row..end_line {
             let line = &self.textarea.lines()[logical_row];
             let trimmed_line = line.trim();
 
@@ -3181,13 +3225,18 @@ impl App {
 
         if !self.image_full_screen {
             let mut paragraph = Paragraph::new(visible_text).style(self.textarea.style());
+
             if self.read_mode {
-                paragraph = paragraph.wrap(ratatui::widgets::Wrap { trim: false });
+                // Apply Ratatui's native intra-line scrolling
+                paragraph = paragraph
+                    .wrap(ratatui::widgets::Wrap { trim: false })
+                    .scroll((scroll_remainder as u16, 0));
             }
 
             f.render_widget(paragraph, inner_area);
 
             let (cursor_row, cursor_col) = self.textarea.cursor();
+
             if !self.read_mode {
                 if cursor_row >= self.scroll_offset
                     && cursor_row < self.scroll_offset + visible_lines_count
@@ -3216,40 +3265,51 @@ impl App {
 
                     f.render_widget(Paragraph::new(cursor_span), cursor_area);
                 }
-            } else if self.read_mode && cursor_row >= self.scroll_offset {
-                let mut visual_y = 0;
-                let area_w = inner_area.width.max(1) as usize;
+            } else {
+                // --- WRAPPED MODE ABSOLUTE CURSOR ---
+                let mut absolute_cursor_y = 0;
+                let mut cursor_screen_x = 0;
 
-                for r in self.scroll_offset..=cursor_row {
+                for r in 0..=cursor_row {
                     let line = self.textarea.lines().get(r).cloned().unwrap_or_default();
-
                     if r == cursor_row {
-                        let wrap_offset_y = cursor_col / area_w;
-                        let wrap_offset_x = cursor_col % area_w;
-                        let target_y = visual_y + wrap_offset_y as u16;
-
-                        if target_y < inner_area.height {
-                            let cursor_area = Rect {
-                                x: inner_area.x + wrap_offset_x as u16,
-                                y: inner_area.y + target_y,
-                                width: 1,
-                                height: 1,
-                            };
-
-                            let ch: char = line.chars().nth(cursor_col).unwrap_or(' ');
-                            let cursor_span = Span::styled(
-                                ch.to_string(),
-                                Style::default().bg(Color::White).fg(Color::Black),
-                            );
-                            f.render_widget(Paragraph::new(cursor_span), cursor_area);
-                        }
-                        break;
+                        // THIS FUNCTION CALCULATES THE TRUE WORD-WRAPPED X and Y
+                        let (y, x) = Self::calculate_cursor_position(&line, cursor_col, area_width);
+                        absolute_cursor_y += y;
+                        cursor_screen_x = x;
                     } else {
-                        // Calculate how many vertical lines the previous text took up
-                        let chars_count = line.chars().count();
-                        let lines_taken = (chars_count / area_w) as u16 + 1;
-                        visual_y += lines_taken;
+                        absolute_cursor_y += Self::calculate_visual_lines(&line, area_width);
                     }
+                }
+
+                // If the cursor is currently inside the visual viewport, draw it
+                if absolute_cursor_y >= self.visual_scroll_y as usize
+                    && absolute_cursor_y < (self.visual_scroll_y as usize + area_height)
+                {
+                    let screen_y = (absolute_cursor_y - self.visual_scroll_y as usize) as u16;
+
+                    // FIXED: Use the simulated X position, NOT the modulo math!
+                    let screen_x = cursor_screen_x as u16;
+
+                    let cursor_area = Rect {
+                        x: inner_area.x + screen_x,
+                        y: inner_area.y + screen_y,
+                        width: 1,
+                        height: 1,
+                    };
+
+                    let line = self
+                        .textarea
+                        .lines()
+                        .get(cursor_row)
+                        .cloned()
+                        .unwrap_or_default();
+                    let ch: char = line.chars().nth(cursor_col).unwrap_or(' ');
+                    let cursor_span = Span::styled(
+                        ch.to_string(),
+                        Style::default().bg(Color::White).fg(Color::Black),
+                    );
+                    f.render_widget(Paragraph::new(cursor_span), cursor_area);
                 }
             }
         }
@@ -3731,6 +3791,156 @@ impl App {
             let _ = child.wait();
         }
         self.status = String::from("Audio stopped");
+    }
+
+    fn visual_move_down(&mut self) {
+        let (row, col) = self.textarea.cursor();
+        let width = self.editor_width.max(1) as usize;
+        let line = self.textarea.lines().get(row).cloned().unwrap_or_default();
+        let char_count = line.chars().count();
+
+        // If dropping down keeps us on the same logical line (just a wrapped chunk)
+        if col + width <= char_count {
+            self.textarea.move_cursor(tui_textarea::CursorMove::Jump(
+                row as u16,
+                (col + width) as u16,
+            ));
+        } else {
+            // We are on the last visual chunk of this line, jump to the next logical line
+            let next_row = row + 1;
+            if next_row < self.textarea.lines().len() {
+                let visual_x = col % width; // Try to maintain the same horizontal X position
+                let next_line_chars = self.textarea.lines()[next_row].chars().count();
+                let target_col = visual_x.min(next_line_chars); // Don't overshoot the next line
+                self.textarea.move_cursor(tui_textarea::CursorMove::Jump(
+                    next_row as u16,
+                    target_col as u16,
+                ));
+            }
+        }
+    }
+
+    fn visual_move_up(&mut self) {
+        let (row, col) = self.textarea.cursor();
+        let width = self.editor_width.max(1) as usize;
+
+        // If moving up keeps us on the same logical line
+        if col >= width {
+            self.textarea.move_cursor(tui_textarea::CursorMove::Jump(
+                row as u16,
+                (col - width) as u16,
+            ));
+        } else if row > 0 {
+            // We are on the top chunk, jump to the previous logical line
+            let prev_row = row - 1;
+            let prev_line = self
+                .textarea
+                .lines()
+                .get(prev_row)
+                .cloned()
+                .unwrap_or_default();
+            let prev_char_count = prev_line.chars().count();
+
+            let visual_x = col % width;
+            // Calculate the start of the last visual chunk on the previous line
+            let last_chunk_start = (prev_char_count / width) * width;
+            let target_col = (last_chunk_start + visual_x).min(prev_char_count);
+
+            self.textarea.move_cursor(tui_textarea::CursorMove::Jump(
+                prev_row as u16,
+                target_col as u16,
+            ));
+        }
+    }
+
+    /// Simulates Ratatui's word wrapping to find exact cursor coordinates
+    /// Simulates Ratatui's word wrapping to find exact cursor coordinates
+    /// Simulates Ratatui's word wrapping to find exact cursor coordinates
+    /// Simulates Ratatui's word wrapping to find exact cursor coordinates
+    fn calculate_cursor_position(line: &str, cursor_col: usize, width: usize) -> (usize, usize) {
+        if width == 0 {
+            return (0, 0);
+        }
+        let chars: Vec<char> = line.chars().collect();
+
+        let mut visual_y = 0;
+        let mut current_x = 0;
+        let mut i = 0;
+        // Tracks if we have placed actual characters (not just spaces) on the current line
+        let mut line_has_text = false;
+
+        while i < chars.len() {
+            let is_whitespace = chars[i].is_whitespace();
+            let mut chunk_width = 0;
+            let mut chunk_char_count = 0;
+            let mut j = i;
+
+            // Group by whitespace vs non-whitespace to mirror Ratatui's chunking
+            while j < chars.len() && chars[j].is_whitespace() == is_whitespace {
+                chunk_width += chars[j].width().unwrap_or(0); // Handles emojis/hidden chars
+                chunk_char_count += 1;
+                j += 1;
+            }
+
+            if !is_whitespace {
+                // --- WORD CHUNK ---
+                // Only wrap if the word exceeds the remaining width AND there is already
+                // text on this line. We DO NOT wrap if the line is just leading spaces!
+                if current_x + chunk_width > width && line_has_text {
+                    visual_y += 1;
+                    current_x = 0;
+                    line_has_text = false;
+                }
+
+                line_has_text = true;
+
+                for _ in 0..chunk_char_count {
+                    if i == cursor_col {
+                        return (visual_y, current_x);
+                    }
+                    let char_w = chars[i].width().unwrap_or(0);
+
+                    // Hard-break mid-word if it exceeds the boundary
+                    if current_x + char_w > width && current_x > 0 {
+                        visual_y += 1;
+                        current_x = 0;
+                        line_has_text = true; // We are still placing the word
+                    }
+                    current_x += char_w;
+                    i += 1;
+                }
+            } else {
+                // --- WHITESPACE CHUNK ---
+                for _ in 0..chunk_char_count {
+                    if i == cursor_col {
+                        return (visual_y, current_x);
+                    }
+                    let char_w = chars[i].width().unwrap_or(0);
+
+                    if current_x + char_w > width {
+                        // Space hits the boundary and is "eaten".
+                        if current_x > 0 {
+                            visual_y += 1;
+                            current_x = 0;
+                            line_has_text = false; // New line resets the text flag
+                        }
+                    } else {
+                        current_x += char_w;
+                    }
+                    i += 1;
+                }
+            }
+        }
+
+        // Return the exact position. (We intentionally do NOT auto-wrap here at the
+        // end of the string to ensure height calculations stay perfectly accurate).
+        (visual_y, current_x)
+    }
+
+    /// Calculates total visual lines a logical line will take up
+    fn calculate_visual_lines(line: &str, width: usize) -> usize {
+        let (y, _) = Self::calculate_cursor_position(line, usize::MAX, width);
+        y + 1
     }
 }
 

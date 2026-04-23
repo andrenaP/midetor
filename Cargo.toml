@@ -1,6 +1,6 @@
 [package]
 name = "midetor"
-version = "1.0.25"
+version = "1.0.26"
 edition = "2024"
 license-file="LICENSE"
 keywords = ["editor", "markdown"]
@@ -24,6 +24,7 @@ image = {version= "0.25.8", features = ["avif","avif-native"]} # Compatible with
 regex = "1.10"
 walkdir = "2.5"
 serde_json = "1.0.149"
+unicode-width = "0.1"
 
 
 [profile.release]
