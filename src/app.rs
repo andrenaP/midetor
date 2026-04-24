@@ -1,5 +1,5 @@
 use crate::error::EditorError;
-use chrono::{Duration, Local};
+use chrono::Local;
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -97,6 +97,7 @@ pub enum SearchType {
     Tags,
     Files,
     CustomSql,
+    CustomLua { provider: String, on_select: String },
 }
 
 #[derive(PartialEq, Clone, Debug)]
@@ -196,6 +197,7 @@ pub struct App {
     normal_keymaps: Rc<RefCell<HashMap<String, mlua::RegistryKey>>>,
     visual_keymaps: Rc<RefCell<HashMap<String, mlua::RegistryKey>>>,
     shared_context: Rc<RefCell<EditorContext>>,
+    virtual_texts: HashMap<usize, Vec<(usize, String, String)>>,
 }
 
 pub struct CompletionState {
@@ -344,6 +346,7 @@ impl App {
             normal_keymaps,
             visual_keymaps,
             shared_context,
+            virtual_texts: HashMap::new(),
         };
         app.open_file(file_path.to_string(), file_id)?;
 
@@ -726,15 +729,21 @@ impl App {
                 mapped_rows.collect::<Result<Vec<_>, _>>()?
             }
             CompletionType::Variable => {
-                let possible = vec![
-                    "date".to_string(),
-                    "time".to_string(),
-                    "file-name".to_string(),
-                ];
-                possible
-                    .into_iter()
-                    .filter(|s| s.starts_with(&query))
-                    .collect::<Vec<String>>()
+                // Try to call a global Lua function named 'on_autocomplete'
+                let globals = self.lua.globals();
+                if let Ok(func) = globals.get::<_, mlua::Function>("on_autocomplete") {
+                    // Pass the trigger type and current query to Lua
+                    match func.call::<_, Vec<String>>(("@", query.clone())) {
+                        Ok(suggestions) => suggestions,
+                        Err(e) => {
+                            self.status = format!("Lua Autocomplete Error: {}", e);
+                            Vec::new()
+                        }
+                    }
+                } else {
+                    // Fallback if the Lua function isn't defined
+                    Vec::new()
+                }
             }
             CompletionType::None => Vec::new(),
         };
@@ -790,16 +799,24 @@ impl App {
                         let insert_text = match self.completion_state.completion_type {
                             CompletionType::File => format!("[[{}]]", suggestion),
                             CompletionType::Tag => format!("#{}", suggestion),
-                            CompletionType::Variable => match suggestion.as_str() {
-                                "date" => chrono::Local::now().format("%Y-%m-%d").to_string(),
-                                "time" => chrono::Local::now().format("%H:%M:%S").to_string(),
-                                "file-name" => Path::new(&self.file_path)
-                                    .file_name()
-                                    .and_then(|s| s.to_str())
-                                    .unwrap_or_default()
-                                    .to_string(),
-                                _ => suggestion,
-                            },
+                            // Replace the old CompletionType::Variable logic in select_completion with this:
+                            CompletionType::Variable => {
+                                let globals = self.lua.globals();
+                                if let Ok(func) =
+                                    globals.get::<_, mlua::Function>("expand_autocomplete")
+                                {
+                                    // Pass the trigger ("@") and the selected suggestion name
+                                    match func.call::<_, String>(("@", suggestion.clone())) {
+                                        Ok(expanded_text) => expanded_text,
+                                        Err(e) => {
+                                            self.status = format!("Lua Snippet Error: {}", e);
+                                            suggestion // Fallback to literal name if Lua fails
+                                        }
+                                    }
+                                } else {
+                                    suggestion // Fallback if Lua function doesn't exist
+                                }
+                            }
                             _ => suggestion,
                         };
 
@@ -908,12 +925,25 @@ impl App {
     }
 
     fn update_search_results(&mut self) -> Result<(), EditorError> {
-        match self.search_state.search_type {
+        match &self.search_state.search_type {
             SearchType::Backlinks => self.search_backlinks()?,
             SearchType::Tags => self.search_tags()?,
             SearchType::Files => self.search_files()?,
             // --- New Call ---
             SearchType::CustomSql => self.search_custom_sql()?,
+            SearchType::CustomLua { provider, .. } => {
+                let globals = self.lua.globals();
+                if let Ok(func) = globals.get::<_, mlua::Function>(provider.as_str()) {
+                    match func.call::<_, Vec<String>>(self.search_state.query.clone()) {
+                        Ok(results) => {
+                            // We map them to (String, None) since Lua handles the execution
+                            self.search_state.results =
+                                results.into_iter().map(|s| (s, None)).collect();
+                        }
+                        Err(e) => self.status = format!("Lua Search Error: {}", e),
+                    }
+                }
+            }
             SearchType::None => {}
         }
         if !self.search_state.results.is_empty() {
@@ -1047,9 +1077,9 @@ impl App {
     }
     fn select_search_result(&mut self) -> Result<(), EditorError> {
         if let Some(selected) = self.search_state.list_state.selected() {
-            if let Some((_display_text, file_id)) = self.search_state.results.get(selected).cloned()
+            if let Some((display_text, file_id)) = self.search_state.results.get(selected).cloned()
             {
-                match self.search_state.search_type {
+                match &self.search_state.search_type {
                     SearchType::Backlinks | SearchType::Files | SearchType::CustomSql => {
                         if let Some(file_id) = file_id {
                             // Retrieve full path from database
@@ -1073,11 +1103,19 @@ impl App {
                         }
                     }
                     SearchType::Tags => {
-                        self.load_tag_files(&_display_text)?;
+                        self.load_tag_files(&display_text)?;
                         if !self.tag_files.is_empty() {
                             self.mode = Mode::TagFiles;
                         } else {
                             self.cancel_search();
+                        }
+                    }
+                    SearchType::CustomLua { on_select, .. } => {
+                        let globals = self.lua.globals();
+                        if let Ok(func) = globals.get::<_, mlua::Function>(on_select.as_str()) {
+                            if let Err(e) = func.call::<_, ()>(display_text.clone()) {
+                                self.status = format!("Lua Select Error: {}", e);
+                            }
                         }
                     }
                     SearchType::None => {}
@@ -1921,6 +1959,13 @@ impl App {
                         self.textarea.clear_mask_char();
                         self.open_wikilink_file("index.md".to_string())?; //TODO open something else in the future
                         self.status = format!("Deleted file: {}", delete_path);
+                    } else if self.command.starts_with("lua ") {
+                        let code = self.command.trim_start_matches("lua ").to_string();
+                        // Execute the code directly
+                        match self.lua.load(&code).exec() {
+                            Ok(_) => self.status = "Lua executed".to_string(),
+                            Err(e) => self.status = format!("Lua err: {}", e),
+                        }
                     } else {
                         self.status = format!("Unknown command: {}", self.command);
                     }
@@ -2000,6 +2045,7 @@ impl App {
                     } else if !self.search_state.results.is_empty() {
                         // 2. Second Enter: Select the file from the displayed list
                         self.select_search_result()?;
+                        self.execute_lua_commands()?;
                     }
                 }
                 ratatui::crossterm::event::KeyCode::Up => {
@@ -2653,7 +2699,8 @@ impl App {
                     // The actual query input is handled below in chunks[2]
                 } else {
                     // Render search results for all modes (Backlinks, Tags, Files, and results of CustomSql)
-                    let title = match self.search_state.search_type {
+                    let title = match &self.search_state.search_type {
+                        // Add & here as well just to be safe
                         SearchType::Backlinks => format!("Backlinks: {}", self.search_state.query),
                         SearchType::Tags => format!("Tags: {}", self.search_state.query),
                         SearchType::Files => format!("Files: {}", self.search_state.query),
@@ -2661,6 +2708,9 @@ impl App {
                             "Custom SQL Results (Press Enter to Open): {}",
                             self.search_state.query
                         ),
+                        SearchType::CustomLua { .. } => {
+                            format!("Lua Search: {}", self.search_state.query)
+                        } // <--- ADD THIS LINE
                         SearchType::None => "Search".to_string(),
                     };
 
@@ -2866,13 +2916,15 @@ impl App {
         if self.read_mode {
             let mut absolute_cursor_y = 0;
             for r in 0..=cursor_row {
-                let line = self.textarea.lines().get(r).cloned().unwrap_or_default();
+                // Fetch the expanded line string and the newly mapped cursor index
+                let (expanded_line, mapped_col) = self.get_expanded_line_info(r, cursor_col);
 
                 if r == cursor_row {
-                    let (y, _) = Self::calculate_cursor_position(&line, cursor_col, area_w);
+                    let (y, _) =
+                        Self::calculate_cursor_position(&expanded_line, mapped_col, area_w);
                     absolute_cursor_y += y;
                 } else {
-                    absolute_cursor_y += Self::calculate_visual_lines(&line, area_w);
+                    absolute_cursor_y += Self::calculate_visual_lines(&expanded_line, area_w);
                 }
             }
 
@@ -2917,8 +2969,9 @@ impl App {
 
         if self.read_mode {
             let mut visual_y = 0;
-            for (r, line) in self.textarea.lines().iter().enumerate() {
-                let lines_for_this_row = Self::calculate_visual_lines(line, area_width);
+            for r in 0..total_lines {
+                let (expanded_line, _) = self.get_expanded_line_info(r, 0);
+                let lines_for_this_row = Self::calculate_visual_lines(&expanded_line, area_width);
 
                 if visual_y + lines_for_this_row > self.visual_scroll_y as usize {
                     start_logical_row = r;
@@ -2965,6 +3018,15 @@ impl App {
             let mut new_spans = Vec::new();
             let mut col_tracker = 0;
 
+            // --- Fetch and sort virtual text for this specific line ---
+            let mut line_v_texts = self
+                .virtual_texts
+                .get(&logical_row)
+                .cloned()
+                .unwrap_or_default();
+            line_v_texts.sort_by_key(|v| v.0); // Sort by column index
+            let mut v_idx = 0;
+
             for (style, text_segment) in ranges {
                 let text = text_segment.trim_end_matches('\n');
                 if text.is_empty() {
@@ -2972,36 +3034,94 @@ impl App {
                 }
 
                 let color = Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b);
-                let text_len = text.chars().count();
-                let mut span_style = Style::default().fg(color);
+                let span_style = Style::default().fg(color);
 
-                if let Some(((start_r, start_c), (end_r, end_c))) = selection_range {
-                    if (logical_row > start_r || (logical_row == start_r && col_tracker >= start_c))
-                        && (logical_row < end_r || (logical_row == end_r && col_tracker < end_c))
-                    {
-                        span_style = span_style.bg(Color::LightBlue);
-                    }
-                }
+                // Slice token dynamically to insert virtual text inside
+                let text_chars: Vec<char> = text.chars().collect();
+                let mut char_idx = 0;
 
-                if !self.read_mode {
-                    let span_end = col_tracker + text_len;
-                    if span_end > self.horizontal_scroll_offset {
-                        let start_char = if col_tracker < self.horizontal_scroll_offset {
-                            self.horizontal_scroll_offset - col_tracker
-                        } else {
-                            0
+                while char_idx < text_chars.len() {
+                    // 1. Inject virtual text at exactly this column position
+                    while v_idx < line_v_texts.len() && line_v_texts[v_idx].0 == col_tracker {
+                        let (_, ref v_text, ref v_color) = line_v_texts[v_idx];
+                        let parsed_color = match v_color.to_lowercase().as_str() {
+                            "red" => Color::Red,
+                            "green" => Color::Green,
+                            "blue" => Color::LightBlue,
+                            "yellow" => Color::Yellow,
+                            "gray" => Color::DarkGray,
+                            _ => Color::Gray,
                         };
-                        let text_chars: Vec<char> = text.chars().collect();
-                        let sliced_text: String = text_chars.into_iter().skip(start_char).collect();
-                        if !sliced_text.is_empty() {
-                            new_spans.push(Span::styled(sliced_text, span_style));
+                        let v_style = Style::default()
+                            .fg(parsed_color)
+                            .add_modifier(Modifier::ITALIC);
+                        new_spans.push(Span::styled(v_text.clone(), v_style));
+                        v_idx += 1;
+                    }
+
+                    // 2. Find boundary to the next virtual text (or end of segment)
+                    let mut next_boundary = text_chars.len();
+                    if v_idx < line_v_texts.len() && line_v_texts[v_idx].0 > col_tracker {
+                        let dist = line_v_texts[v_idx].0 - col_tracker;
+                        if char_idx + dist < next_boundary {
+                            next_boundary = char_idx + dist;
                         }
                     }
-                } else {
-                    new_spans.push(Span::styled(text.to_string(), span_style));
-                }
 
-                col_tracker += text_len;
+                    let sub_text: String = text_chars[char_idx..next_boundary].iter().collect();
+                    let sub_len = sub_text.chars().count();
+
+                    let mut current_span_style = span_style;
+                    if let Some(((start_r, start_c), (end_r, end_c))) = selection_range {
+                        if (logical_row > start_r
+                            || (logical_row == start_r && col_tracker >= start_c))
+                            && (logical_row < end_r
+                                || (logical_row == end_r && col_tracker < end_c))
+                        {
+                            current_span_style = current_span_style.bg(Color::LightBlue);
+                        }
+                    }
+
+                    if !self.read_mode {
+                        let span_end = col_tracker + sub_len;
+                        if span_end > self.horizontal_scroll_offset {
+                            let start_char = if col_tracker < self.horizontal_scroll_offset {
+                                self.horizontal_scroll_offset - col_tracker
+                            } else {
+                                0
+                            };
+                            let sliced_text: String = sub_text.chars().skip(start_char).collect();
+                            if !sliced_text.is_empty() {
+                                new_spans.push(Span::styled(sliced_text, current_span_style));
+                            }
+                        }
+                    } else {
+                        new_spans.push(Span::styled(sub_text, current_span_style));
+                    }
+
+                    char_idx = next_boundary;
+                    col_tracker += sub_len;
+                }
+            }
+
+            // --- Catch any trailing End-Of-Line (EOL) virtual text ---
+            while v_idx < line_v_texts.len() {
+                let (_, ref v_text, ref v_color) = line_v_texts[v_idx];
+                let parsed_color = match v_color.to_lowercase().as_str() {
+                    "red" => Color::Red,
+                    "green" => Color::Green,
+                    "blue" => Color::LightBlue,
+                    "yellow" => Color::Yellow,
+                    "gray" => Color::DarkGray,
+                    _ => Color::Gray,
+                };
+                new_spans.push(Span::styled(
+                    format!(" {}", v_text),
+                    Style::default()
+                        .fg(parsed_color)
+                        .add_modifier(Modifier::ITALIC),
+                ));
+                v_idx += 1;
             }
 
             if is_vid_header {
@@ -3065,14 +3185,16 @@ impl App {
                 let mut cursor_screen_x = 0;
 
                 for r in 0..=cursor_row {
-                    let line = self.textarea.lines().get(r).cloned().unwrap_or_default();
+                    let (expanded_line, mapped_col) = self.get_expanded_line_info(r, cursor_col);
                     if r == cursor_row {
                         // THIS FUNCTION CALCULATES THE TRUE WORD-WRAPPED X and Y
-                        let (y, x) = Self::calculate_cursor_position(&line, cursor_col, area_width);
+                        let (y, x) =
+                            Self::calculate_cursor_position(&expanded_line, mapped_col, area_width);
                         absolute_cursor_y += y;
                         cursor_screen_x = x;
                     } else {
-                        absolute_cursor_y += Self::calculate_visual_lines(&line, area_width);
+                        absolute_cursor_y +=
+                            Self::calculate_visual_lines(&expanded_line, area_width);
                     }
                 }
 
@@ -3082,7 +3204,7 @@ impl App {
                 {
                     let screen_y = (absolute_cursor_y - self.visual_scroll_y as usize) as u16;
 
-                    // FIXED: Use the simulated X position, NOT the modulo math!
+                    // FIXED: Use the simulated X position
                     let screen_x = cursor_screen_x as u16;
 
                     let cursor_area = Rect {
@@ -3912,7 +4034,11 @@ impl App {
                     self.navigate_forward()?;
                 }
                 EditorCommand::ChangeStatus(msg) => {
-                    self.status = msg;
+                    if msg == "clearing_image_flag" {
+                        self.clear_image_state();
+                    } else {
+                        self.status = msg;
+                    }
                 }
                 EditorCommand::Cancel => {
                     // Ensure we get out of the info view
@@ -3972,6 +4098,45 @@ impl App {
                 EditorCommand::SetSelection(anchor) => {
                     self.visual_anchor = anchor;
                 }
+                EditorCommand::SetVirtualText(row, col, text, color) => {
+                    self.virtual_texts
+                        .entry(row)
+                        .or_default()
+                        .push((col, text, color));
+                }
+                EditorCommand::StartCustomSearch(provider, on_select) => {
+                    self.search_state.active = true;
+                    self.search_state.search_type = SearchType::CustomLua {
+                        provider,
+                        on_select,
+                    };
+                    self.search_state.query = String::new();
+                    self.search_state.results = Vec::new();
+                    self.search_state.list_state = ListState::default();
+                    self.mode = Mode::Search;
+                    self.view = View::Editor;
+                    self.status = "Custom Lua Search".to_string();
+                    self.key_sequence.clear();
+                    self.update_search_results()?;
+                }
+                EditorCommand::ShowImage(path, row) => {
+                    match self.resolve_image_path(&path) {
+                        Ok(full_path) => match image::ImageReader::open(&full_path) {
+                            Ok(reader) => match reader.decode() {
+                                Ok(dyn_img) => {
+                                    self.current_image = Some(dyn_img);
+                                    self.current_image_line = Some(row);
+                                    self.image_protocol = None; // Force protocol to regenerate
+                                    self.last_image_area = None;
+                                    self.status = format!("Lua rendered image: {}", path);
+                                }
+                                Err(e) => self.status = format!("Lua img decode err: {}", e),
+                            },
+                            Err(e) => self.status = format!("Lua img open err: {}", e),
+                        },
+                        Err(e) => self.status = format!("Lua img resolve err: {}", e),
+                    }
+                }
                 _ => {} // Optional: A catch-all for any future commands you add to the enum
                         // but haven't implemented here yet.
                         // _ => {}
@@ -4022,6 +4187,67 @@ impl App {
         } else {
             s
         }
+    }
+
+    fn get_expanded_line_info(&self, row: usize, original_col: usize) -> (String, usize) {
+        let line = self.textarea.lines().get(row).cloned().unwrap_or_default();
+        let trimmed_line = line.trim();
+
+        // 1. Check for vid blocks (completely replaces the text)
+        if trimmed_line.starts_with("```vid") {
+            let spans = Self::build_vid_virtual_text(
+                self.textarea.lines(),
+                row,
+                &self.yt_videos,
+                0,
+                true, // Always true for measurement to avoid offset stripping
+            );
+            let expanded_text = spans
+                .into_iter()
+                .map(|s| s.content.to_string())
+                .collect::<String>();
+            // Cap cursor to the end of the expanded text
+            let mapped_col = original_col.min(expanded_text.chars().count());
+            return (expanded_text, mapped_col);
+        }
+
+        // 2. Check for standard inline virtual text
+        let mut line_v_texts = self.virtual_texts.get(&row).cloned().unwrap_or_default();
+        if !line_v_texts.is_empty() {
+            line_v_texts.sort_by_key(|v| v.0);
+            let mut expanded = String::new();
+            let mut mapped_col = original_col;
+            let mut v_idx = 0;
+            let chars: Vec<char> = line.chars().collect();
+            let mut col_tracker = 0;
+
+            while col_tracker < chars.len() {
+                while v_idx < line_v_texts.len() && line_v_texts[v_idx].0 <= col_tracker {
+                    let v_text = &line_v_texts[v_idx].1;
+                    expanded.push_str(v_text);
+                    // Crucial fix: Only shift cursor if virtual text strictly BEFORE it (<).
+                    // If placed ON the cursor, we want cursor visually sitting BEFORE the overlay text.
+                    if line_v_texts[v_idx].0 < original_col {
+                        mapped_col += v_text.chars().count();
+                    }
+                    v_idx += 1;
+                }
+                expanded.push(chars[col_tracker]);
+                col_tracker += 1;
+            }
+            while v_idx < line_v_texts.len() {
+                let v_text = format!(" {}", line_v_texts[v_idx].1);
+                expanded.push_str(&v_text);
+                if line_v_texts[v_idx].0 < original_col {
+                    mapped_col += v_text.chars().count();
+                }
+                v_idx += 1;
+            }
+            return (expanded, mapped_col);
+        }
+
+        // 3. Normal text line
+        (line, original_col)
     }
 }
 

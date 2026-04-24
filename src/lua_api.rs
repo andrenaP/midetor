@@ -61,6 +61,9 @@ pub enum EditorCommand {
     SetLines(Vec<String>),
     SetCursor(usize, usize),
     SetSelection(Option<(usize, usize)>),
+    SetVirtualText(usize, usize, String, String),
+    ShowImage(String, usize),
+    StartCustomSearch(String, String),
 }
 
 pub struct LuaEditorAPI {
@@ -345,6 +348,46 @@ impl UserData for LuaEditorAPI {
             this.command_queue
                 .borrow_mut()
                 .push(EditorCommand::SetSelection(Some((row, col))));
+            Ok(())
+        });
+        methods.add_method(
+            "set_virtual_text",
+            |_, this, (row, col, text, color): (usize, usize, String, String)| {
+                this.command_queue
+                    .borrow_mut()
+                    .push(EditorCommand::SetVirtualText(row, col, text, color));
+                Ok(())
+            },
+        );
+        methods.add_method("start_custom_search", |_, this, callback_name: String| {
+            this.command_queue
+                .borrow_mut()
+                .push(EditorCommand::StartSearch(format!("lua:{}", callback_name)));
+            Ok(())
+        });
+
+        methods.add_method(
+            "start_custom_search",
+            |_, this, (provider, on_select): (String, String)| {
+                this.command_queue
+                    .borrow_mut()
+                    .push(EditorCommand::StartCustomSearch(provider, on_select));
+                Ok(())
+            },
+        );
+        methods.add_method("show_image", |_, this, (path, row): (String, usize)| {
+            this.command_queue
+                .borrow_mut()
+                .push(EditorCommand::ShowImage(path, row));
+            Ok(())
+        });
+
+        methods.add_method("clear_image", |_, this, ()| {
+            this.command_queue
+                .borrow_mut()
+                .push(EditorCommand::ChangeStatus(
+                    "clearing_image_flag".to_string(),
+                ));
             Ok(())
         });
     }

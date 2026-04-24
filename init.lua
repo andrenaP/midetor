@@ -125,7 +125,7 @@ editor:map("n", "<Esc>", function()
 end)
 
 
-function run_bash_script_and_save()
+function explore()
     -- editor:save()
     _G.Obsidian_valt_main_path = os.getenv("Obsidian_valt_main_path")
     local current_file_path = editor:get_current_file()
@@ -139,7 +139,7 @@ function run_bash_script_and_save()
     editor:echo(result .. " THIS IS RUST BABY")
 end
 
-editor:map("n", "<C-y>", function() run_bash_script_and_save() end)
+editor:map("n", "<C-y>", function() explore() end)
 
 
 editor:map("n", "o", function()
@@ -161,39 +161,201 @@ editor:map("n", "O", function()
 end)
 
 
+-- ==========================================
+-- 1. NORMAL MODE: Single Line Movement
+-- ==========================================
+local function move_line_up()
+    local row, col = editor:get_cursor()
+    if row > 0 then
+        local lines = editor:get_all_lines()
+        -- Swap current line (row + 1) with line above (row)
+        lines[row + 1], lines[row] = lines[row], lines[row + 1]
+        editor:set_lines(lines)
+        editor:set_cursor(row - 1, col)
+    end
+end
 
+local function move_line_down()
+    local row, col = editor:get_cursor()
+    local lines = editor:get_all_lines()
+    if row < #lines - 1 then
+        -- Swap current line (row + 1) with line below (row + 2)
+        lines[row + 1], lines[row + 2] = lines[row + 2], lines[row + 1]
+        editor:set_lines(lines)
+        editor:set_cursor(row + 1, col)
+    end
+end
+
+-- Map to "n" (Normal mode)
+editor:map("n", "<A-Up>", move_line_up)
+editor:map("n", "<A-k>", move_line_up)
+editor:map("n", "<A-Down>", move_line_down)
+editor:map("n", "<A-j>", move_line_down)
+
+
+-- ==========================================
+-- 2. VISUAL MODE: Multi-Line Block Movement
+-- ==========================================
 local function move_visual_block(direction)
     local c_row, c_col = editor:get_cursor()
     local a_row, a_col = editor:get_visual_anchor()
 
-    -- Figure out which row is the top of the block and which is the bottom
     local start_row = math.min(c_row, a_row)
     local end_row = math.max(c_row, a_row)
     local lines = editor:get_all_lines()
 
     if direction == "up" and start_row > 0 then
-        -- Remove the line directly above the block, and insert it below the block
         local line_above = table.remove(lines, start_row)
         table.insert(lines, end_row + 1, line_above)
 
         editor:set_lines(lines)
-        -- Maintain the visual selection
         editor:set_selection(a_row - 1, a_col)
         editor:set_cursor(c_row - 1, c_col)
     elseif direction == "down" and end_row < #lines - 1 then
-        -- Remove the line directly below the block, and insert it above the block
-        local line_below = table.remove(lines, end_row + 2) -- +2 because Lua is 1-indexed
+        local line_below = table.remove(lines, end_row + 2)
         table.insert(lines, start_row + 1, line_below)
 
         editor:set_lines(lines)
-        -- Maintain the visual selection
         editor:set_selection(a_row + 1, a_col)
         editor:set_cursor(c_row + 1, c_col)
     end
 end
 
--- Notice the 'v' mode string here!
+-- Map to "v" (Visual mode)
 editor:map("v", "<A-Up>", function() move_visual_block("up") end)
 editor:map("v", "<A-k>", function() move_visual_block("up") end)
 editor:map("v", "<A-Down>", function() move_visual_block("down") end)
 editor:map("v", "<A-j>", function() move_visual_block("down") end)
+
+
+
+
+
+
+-- 1. Define your custom snippets dictionary
+-- Values can be static strings or functions that generate dynamic text
+local snippets = {
+    ["date"] = function() return os.date("%Y-%m-%d") end,
+    ["time"] = function() return os.date("%H:%M:%S") end,
+
+    -- Using the editor API to get context!
+    ["file-name"] = function()
+        local full_path = editor:get_current_file()
+        -- Extract just the filename from the path
+        return full_path:match("^.+/(.+)$") or full_path
+    end,
+
+    -- A simple static string snippet
+    ["shrug"] = "¯\\_('-')_/¯",
+
+    -- A multi-line custom snippet
+    ["rust-main"] = function()
+        return "fn main() {\n    println!(\"Hello World\");\n}"
+    end,
+
+    -- Using system environment variables
+    ["greeting"] = function()
+        return "Hello, " .. (os.getenv("USER") or "User") .. "!"
+    end
+}
+
+-- 2. Provide the list of available snippets to the UI
+function on_autocomplete(trigger, query)
+    local results = {}
+    if trigger == "@" then
+        for key, _ in pairs(snippets) do
+            -- Only show snippets that match what the user typed so far
+            if string.sub(key, 1, string.len(query)) == query then
+                table.insert(results, key)
+            end
+        end
+    end
+    return results
+end
+
+-- 3. Provide the actual text to insert when a user selects a snippet
+function expand_autocomplete(trigger, suggestion)
+    if trigger == "@" then
+        local action = snippets[suggestion]
+
+        -- If it's a function, execute it to get the string
+        if type(action) == "function" then
+            return action()
+            -- If it's just a string, return it directly
+        elseif type(action) == "string" then
+            return action
+        end
+    end
+
+    return suggestion -- Fallback just in case
+end
+
+-- ==========================================
+-- FEATURE TESTS & EXAMPLES (Future Reference)
+-- ==========================================
+
+-- ------------------------------------------
+-- 1. VIRTUAL TEXT
+-- ------------------------------------------
+-- When you press '\vt' in normal mode, it will inject a red warning
+-- note at column 40 of the line your cursor is currently on.
+editor:map("n", "\\vt", function()
+    local row, col = editor:get_cursor()
+    -- Args: row, col, text, color (red, green, blue, yellow, gray)
+    editor:set_virtual_text(row, col, " <-- CHECK THIS", "red")
+    editor:set_status("Injected virtual text at row " .. tostring(row))
+end)
+
+-- lua  editor:set_virtual_text(editor:get_cursor().row, 40, ""virtualtext", "red")
+-- ------------------------------------------
+-- 2. CUSTOM SEARCH UI
+-- ------------------------------------------
+-- Step A: Define the Data Provider (must be global so Rust can find it)
+-- It takes the current string the user has typed and returns a table of matches.
+_G.fruit_search_provider = function(query)
+    local database = { "apple", "banana", "cherry", "date", "elderberry", "fig", "grape" }
+    local results = {}
+
+    for _, item in ipairs(database) do
+        -- Simple substring match
+        if query == "" or string.find(item, query) then
+            table.insert(results, item)
+        end
+    end
+    return results
+end
+
+-- Step B: Define the Selection Action (must be global)
+-- This runs when the user presses Enter on an item in the search list.
+_G.fruit_search_action = function(selected_item)
+    -- For example, let's insert it into the file
+    editor:insert_text("I love eating " .. selected_item .. "s!")
+    editor:set_status("Inserted fruit: " .. selected_item)
+end
+
+-- Step C: Map a key to trigger the custom search pipeline
+-- Press '\sf' to test it.
+editor:map("n", "\\ip", function()
+    -- Args: provider_function_name, action_function_name
+    editor:start_custom_search("fruit_search_provider", "fruit_search_action")
+end)
+
+
+-- ------------------------------------------
+-- 3. MANUAL IMAGE RENDERING
+-- ------------------------------------------
+-- This lets you force an image to render on the screen at a specific row,
+-- even if there is no [[image.png]] markdown link there.
+-- (Note: Ensure you actually have a file named "test.png" or similar in your vault)
+
+-- Image mappings (start with \i)
+editor:map("n", "\\if", function() editor:toggle_image_fullscreen() end) -- Image Fullscreen
+editor:map("n", "\\is", function()                                       -- Image Show (Manual)
+    local row, col = editor:get_cursor()
+    local test_image = "photo_1_2026-04-21_14-08-11.jpg"
+    editor:show_image(test_image, row)
+end)
+editor:map("n", "\\ic", function() -- Image Clear
+    editor:clear_image()
+    editor:set_status("Cleared image")
+end)
