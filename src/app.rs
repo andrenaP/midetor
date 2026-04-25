@@ -3699,7 +3699,7 @@ impl App {
         self.status = String::from("Audio stopped");
     }
 
-    fn visual_move_down(&mut self) {
+    fn _visual_move_down(&mut self) {
         let (row, col) = self.textarea.cursor();
         let width = self.editor_width.max(1) as usize;
         let line = self.textarea.lines().get(row).cloned().unwrap_or_default();
@@ -3726,7 +3726,7 @@ impl App {
         }
     }
 
-    fn visual_move_up(&mut self) {
+    fn _visual_move_up(&mut self) {
         let (row, col) = self.textarea.cursor();
         let width = self.editor_width.max(1) as usize;
 
@@ -3876,10 +3876,6 @@ impl App {
                         _ => self.status = format!("Unknown search type: {}", search_type),
                     }
                 }
-                EditorCommand::MoveToTop => {
-                    self.textarea.move_cursor(tui_textarea::CursorMove::Top);
-                    self.status = "Moved to top".to_string();
-                }
                 // --- NEW EXECUTIONS ---
                 EditorCommand::YankLine => {
                     let row = self.textarea.cursor().0;
@@ -3932,13 +3928,6 @@ impl App {
                 EditorCommand::ProcessTemplate(template) => {
                     self.process_template_command(&template)?;
                 }
-                EditorCommand::StartSearch(search_type) => match search_type.as_str() {
-                    "files" => self.start_search(SearchType::Files)?,
-                    "tags" => self.start_search(SearchType::Tags)?,
-                    "backlinks" => self.start_search(SearchType::Backlinks)?,
-                    "sql" => self.start_search(SearchType::CustomSql)?,
-                    _ => self.status = format!("Unknown search type: {}", search_type),
-                },
                 EditorCommand::MoveUp => self.textarea.move_cursor(tui_textarea::CursorMove::Up),
                 EditorCommand::MoveDown => {
                     self.textarea.move_cursor(tui_textarea::CursorMove::Down)
@@ -3959,13 +3948,6 @@ impl App {
                     self.textarea.move_cursor(tui_textarea::CursorMove::Head)
                 }
                 EditorCommand::MoveEnd => self.textarea.move_cursor(tui_textarea::CursorMove::End),
-                EditorCommand::MoveToTop => {
-                    self.textarea.move_cursor(tui_textarea::CursorMove::Top)
-                }
-                EditorCommand::MoveToBottom => {
-                    self.textarea.move_cursor(tui_textarea::CursorMove::Bottom)
-                }
-
                 EditorCommand::Undo => {
                     if self.textarea.undo() {
                         self.status = "Undone".to_string();
@@ -4013,7 +3995,6 @@ impl App {
                     }
                     _ => self.status = format!("Unknown mode: {}", mode_str),
                 },
-                // ... in execute_lua_commands match block ...
                 EditorCommand::NavigateBack => {
                     self.navigate_back()?;
                 }
@@ -4060,7 +4041,6 @@ impl App {
                         self.status = "Normal".to_string();
                     }
                 }
-                // ... inside execute_lua_commands ...
                 EditorCommand::InsertText(text) => {
                     self.textarea.insert_str(&text);
                 }
@@ -4124,9 +4104,7 @@ impl App {
                         Err(e) => self.status = format!("Lua img resolve err: {}", e),
                     }
                 }
-                _ => {} // Optional: A catch-all for any future commands you add to the enum
-                        // but haven't implemented here yet.
-                        // _ => {}
+                _ => {}
             }
         }
         Ok(())

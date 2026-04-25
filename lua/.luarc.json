@@ -1,0 +1,10 @@
+{
+  "workspace": {
+    "checkThirdParty": false,
+    "library": ["."]
+  },
+  "diagnostics": {
+    "globals": ["editor", "_G"],
+    "disable": ["need-check-nil"]
+  }
+}

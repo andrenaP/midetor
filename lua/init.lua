@@ -28,17 +28,20 @@ editor:map("n", "\\ig", function() editor:process_template("Templates/img-galler
 -- %Y-%m-%d formats to 2026-04-23
 editor:map("n", "\\oot", function()
     local today = os.date("Every day info/%Y-%m-%d.md")
+    ---@cast today string
     editor:open_file(today)
 end)
 
 editor:map("n", "\\ooy", function()
     -- 86400 seconds = 1 day
     local yesterday = os.date("Every day info/%Y-%m-%d.md", os.time() - 86400)
+    ---@cast yesterday string
     editor:open_file(yesterday)
 end)
 
 editor:map("n", "\\ooT", function()
     local tomorrow = os.date("Every day info/%Y-%m-%d.md", os.time() + 86400)
+    ---@cast tomorrow string
     editor:open_file(tomorrow)
 end)
 
@@ -126,17 +129,17 @@ end)
 
 
 function explore()
-    -- editor:save()
-    _G.Obsidian_valt_main_path = os.getenv("Obsidian_valt_main_path")
-    local current_file_path = editor:get_current_file()
-    local script_path = 'markdown-scanner "' ..
-        current_file_path .. '" "' .. _G.Obsidian_valt_main_path .. '" --json-only '
+    local path = os.getenv("Obsidian_valt_main_path")
+    if not path then return editor:echo("Error: Env var not set") end
 
-    local handle = io.popen(script_path)
+    local current_file_path = editor:get_current_file()
+    local script_path = string.format('markdown-scanner "%s" "%s" --json-only', current_file_path, path)
+
+    local handle = assert(io.popen(script_path))
     local result = handle:read("*a")
     handle:close()
 
-    editor:echo(result .. " THIS IS RUST BABY")
+    editor:echo(result .. " THIS IS RUST")
 end
 
 editor:map("n", "<C-y>", function() explore() end)
@@ -359,11 +362,6 @@ editor:map("n", "\\ic", function() -- Image Clear
     editor:clear_image()
     editor:set_status("Cleared image")
 end)
-
-
-
-
-
 
 -- ==========================================
 -- DYNAMIC TEMPLATE PICKER
