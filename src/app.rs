@@ -165,9 +165,8 @@ pub struct App {
     syntax_set: SyntaxSet,
     theme: Theme, // Use Box to ensure 'static lifetime
     scroll_offset: usize,
-    horizontal_scroll_offset: usize, // New: Horizontal scroll
-    // File tree fields
-    file_tree: Vec<TreeNode>,
+    horizontal_scroll_offset: usize, // Horizontal scroll
+    file_tree: Vec<TreeNode>,        // File tree fields
     visible_items: Vec<TreeItem>,
     tree_state: ListState,
     sort_by: SortBy,
@@ -240,13 +239,6 @@ impl App {
                 format!("Failed to initialize image picker: {}", e),
             ))
         })?;
-
-        // Optionally load an initial image (e.g., if file_path is an image or referenced in Markdown)
-        // let (image_protocol, current_image) = (None, None);
-        //
-        //
-        //
-        //
 
         // 1. Initialize Lua and shared state
         let lua = Lua::new();
@@ -799,7 +791,6 @@ impl App {
                         let insert_text = match self.completion_state.completion_type {
                             CompletionType::File => format!("[[{}]]", suggestion),
                             CompletionType::Tag => format!("#{}", suggestion),
-                            // Replace the old CompletionType::Variable logic in select_completion with this:
                             CompletionType::Variable => {
                                 let globals = self.lua.globals();
                                 if let Ok(func) =
@@ -1817,7 +1808,7 @@ impl App {
                 };
 
                 if has_exact {
-                    // --- 1. SYNC STATE TO LUA BEFORE EXECUTION ---
+                    // 1. SYNC STATE TO LUA BEFORE EXECUTION
                     {
                         let mut ctx = self.shared_context.borrow_mut();
                         ctx.lines = self.textarea.lines().to_vec();
@@ -2700,7 +2691,6 @@ impl App {
                 } else {
                     // Render search results for all modes (Backlinks, Tags, Files, and results of CustomSql)
                     let title = match &self.search_state.search_type {
-                        // Add & here as well just to be safe
                         SearchType::Backlinks => format!("Backlinks: {}", self.search_state.query),
                         SearchType::Tags => format!("Tags: {}", self.search_state.query),
                         SearchType::Files => format!("Files: {}", self.search_state.query),
@@ -2710,7 +2700,7 @@ impl App {
                         ),
                         SearchType::CustomLua { .. } => {
                             format!("Lua Search: {}", self.search_state.query)
-                        } // <--- ADD THIS LINE
+                        }
                         SearchType::None => "Search".to_string(),
                     };
 
@@ -3769,9 +3759,6 @@ impl App {
         }
     }
 
-    /// Simulates Ratatui's word wrapping to find exact cursor coordinates
-    /// Simulates Ratatui's word wrapping to find exact cursor coordinates
-    /// Simulates Ratatui's word wrapping to find exact cursor coordinates
     /// Simulates Ratatui's word wrapping to find exact cursor coordinates
     fn calculate_cursor_position(line: &str, cursor_col: usize, width: usize) -> (usize, usize) {
         if width == 0 {

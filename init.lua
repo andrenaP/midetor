@@ -246,17 +246,17 @@ local snippets = {
     end,
 
     -- A simple static string snippet
-    ["shrug"] = "¯\\_('-')_/¯",
+    -- ["shrug"] = "¯\\_('-')_/¯",
 
     -- A multi-line custom snippet
-    ["rust-main"] = function()
-        return "fn main() {\n    println!(\"Hello World\");\n}"
-    end,
+    -- ["rust-main"] = function()
+    --     return "fn main() {\n    println!(\"Hello World\");\n}"
+    -- end,
 
     -- Using system environment variables
-    ["greeting"] = function()
-        return "Hello, " .. (os.getenv("USER") or "User") .. "!"
-    end
+    -- ["greeting"] = function()
+    --     return "Hello, " .. (os.getenv("USER") or "User") .. "!"
+    -- end
 }
 
 -- 2. Provide the list of available snippets to the UI
@@ -302,7 +302,7 @@ end
 editor:map("n", "\\vt", function()
     local row, col = editor:get_cursor()
     -- Args: row, col, text, color (red, green, blue, yellow, gray)
-    editor:set_virtual_text(row, col, " <-- CHECK THIS", "red")
+    editor:set_virtual_text(row, 40, " <-- CHECK THIS", "red")
     editor:set_status("Injected virtual text at row " .. tostring(row))
 end)
 
@@ -352,10 +352,67 @@ end)
 editor:map("n", "\\if", function() editor:toggle_image_fullscreen() end) -- Image Fullscreen
 editor:map("n", "\\is", function()                                       -- Image Show (Manual)
     local row, col = editor:get_cursor()
-    local test_image = "photo_1_2026-04-21_14-08-11.jpg"
+    local test_image = "test.jpg"
     editor:show_image(test_image, row)
 end)
 editor:map("n", "\\ic", function() -- Image Clear
     editor:clear_image()
     editor:set_status("Cleared image")
 end)
+
+
+
+
+
+
+-- ==========================================
+-- DYNAMIC TEMPLATE PICKER
+-- ==========================================
+
+-- Step 1: Define the Data Provider
+-- Reads the Templates directory and filters based on user input
+_G.template_search_provider = function(query)
+    local results = {}
+
+    -- Use 'ls -1' for Unix/Linux/macOS or 'dir /b' for Windows.
+    -- Assuming a Unix-like environment here based on your Rust scanner setup:
+    local handle = io.popen('ls -1 "Templates/" 2>/dev/null')
+
+    if handle then
+        for file in handle:lines() do
+            -- Only include Markdown files
+            if file:match("%.md$") then
+                -- Case-insensitive search match
+                if query == "" or string.find(string.lower(file), string.lower(query), 1, true) then
+                    table.insert(results, file)
+                end
+            end
+        end
+        handle:close()
+    else
+        -- Fallback if the command fails
+        table.insert(results, "Yaml-Template.md")
+        table.insert(results, "meeting.md")
+        table.insert(results, "img-gallery.md")
+    end
+
+    return results
+end
+
+-- Step 2: Define the Selection Action
+-- Triggers when you press Enter on a template in the search UI
+_G.template_search_action = function(selected_item)
+    if selected_item and selected_item ~= "" then
+        editor:process_template("Templates/" .. selected_item)
+        editor:set_status("Applied template: " .. selected_item)
+    end
+end
+
+-- Step 3: Map the custom search to \nt
+editor:map("n", "\\nt", function()
+    editor:start_custom_search("template_search_provider", "template_search_action")
+end)
+
+-- (Optional) Keep your other specific template maps if you still want fast-tracks
+editor:map("n", "\\nm", function() editor:process_template("Templates/meeting.md") end)
+editor:map("n", "\\ig", function() editor:process_template("Templates/img-gallery.md") end)
