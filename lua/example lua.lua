@@ -86,7 +86,6 @@ editor:map("n", "p", function() editor:paste() end)
 -- Editor control
 editor:map("n", "<C-s>", function() editor:save() end)
 editor:map("n", "<C-q>", function() editor:quit() end)
-editor:map("n", "<Esc>", function() editor:echo("Normal Mode") end)
 
 
 -- Add these to your init.lua file:
@@ -99,11 +98,6 @@ editor:map("n", "<Down>", function() editor:move("down") end)
 
 -- Handle Enter (Links/Audio) and Escape (Fullscreen closing)
 editor:map("n", "<Enter>", function() editor:follow_link() end)
-editor:map("n", "<Esc>", function()
-    editor:cancel()
-    editor:echo("Normal Mode")
-end)
-
 
 -- History Navigation (Ctrl+o, Ctrl+i)
 editor:map("n", "<C-o>", function() editor:navigate_back() end)
@@ -121,7 +115,7 @@ editor:map("n", "<C-End>", function() editor:move("bottom") end)
 editor:map("n", "<C-Up>", function() editor:move("up") end)
 editor:map("n", "<C-Down>", function() editor:move("down") end)
 
--- Fixed Escape Mapping!
+-- Escape Mapping
 editor:map("n", "<Esc>", function()
     editor:cancel()
     editor:set_status("Normal Mode")

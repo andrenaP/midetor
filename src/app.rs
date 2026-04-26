@@ -218,7 +218,8 @@ pub struct SearchState {
 
 impl App {
     pub fn new(file_path: &str, base_dir: &str, music_path: &str) -> Result<Self, EditorError> {
-        let db = Connection::open("markdown_data.db")?;
+        let db_path = Path::new(base_dir).join("markdown_data.db");
+        let db = Connection::open(db_path)?;
         db.execute("PRAGMA foreign_keys = ON;", [])?;
 
         let content = fs::read_to_string(file_path).unwrap_or_default();
@@ -260,9 +261,37 @@ impl App {
             .expect("Failed to set Lua globals");
 
         // 3. Load the user's config file
-        if let Ok(config) = std::fs::read_to_string("init.lua") {
+        let config_dir = std::env::var("XDG_CONFIG_HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| String::from("~"));
+                std::path::PathBuf::from(home).join(".config")
+            })
+            .join("midetor");
+
+        let global_config = config_dir.join("init.lua");
+        let local_config = std::path::Path::new("init.lua");
+
+        let config_content = if global_config.exists() {
+            std::fs::read_to_string(&global_config).ok()
+        } else if local_config.exists() {
+            std::fs::read_to_string(local_config).ok()
+        } else {
+            // Embeds default_init.lua directly into the binary at compile time
+            let template = include_str!("../lua/default_init.lua");
+
+            if let Err(e) = std::fs::create_dir_all(&config_dir) {
+                eprintln!("Failed to create config directory: {}", e);
+            } else if let Err(e) = std::fs::write(&global_config, template) {
+                eprintln!("Failed to write default init.lua: {}", e);
+            }
+
+            Some(template.to_string())
+        };
+
+        if let Some(config) = config_content {
             if let Err(e) = lua.load(&config).exec() {
-                eprintln!("Lua Error: {}", e);
+                eprintln!("Lua Error in config: {}", e);
             }
         }
 
