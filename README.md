@@ -6,8 +6,6 @@
 
 Powered by Ratatui and Crossterm, `midetor` now features **embedded Lua scripting**, allowing you to completely customize keybindings, write custom search providers, and build your own autocomplete snippets. 
 
-> **⚠️ Make sure to put init.lua in current working directory. Editor will not function without it. You can find my `init.lua` in `/lua` folder**.
-
 ## Trying it out
 Go to [this repo](https://github.com/andrenaP/midetor-docker-tesiting) and run it inside `Docker`. You can pass `-v` to volume your folder if you want.
 
@@ -79,7 +77,7 @@ midetor <file_path> [base_dir] [music_folder]
 
 ## Configuration & Lua Scripting
 
-`midetor` reads an `init.lua` file from your current working directory on startup. This is where you configure all keybindings, custom macros, search logic, and snippet expansions.
+`midetor` reads an `init.lua` file from your current working directory on startup or from `~/,config/midetor/`. This is where you configure all keybindings, custom macros, search logic, and snippet expansions.
 
 The editor exposes a global `editor` object to Lua.
 
@@ -186,8 +184,8 @@ The `markdown-scanner` tool runs automatically in the background to keep this da
 
 ## Environment Variables
 
-- `Obsidian_valt_main_path`: Default base directory for the vault.
-- `musik_folder`: Default directory for audio/music playback.
+- `OBSIDIAN_VAULT_PATH`: Default base directory for the vault.
+- `MUSIC_FOLDER`: Default directory for audio/music playback.
 
 ## License
 

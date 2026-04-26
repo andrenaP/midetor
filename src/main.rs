@@ -31,7 +31,7 @@ fn main() -> Result<(), EditorError> {
         )
         .arg(
             Arg::new("base_dir")
-                .help("Base directory of the Obsidian vault (defaults to Obsidian_valt_main_path or current directory)")
+                .help("Base directory of the Obsidian vault (defaults to OBSIDIAN_VAULT_PATH or current directory)")
                 .index(2)
                 .required(false),
         )
