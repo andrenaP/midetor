@@ -1,5 +1,5 @@
 use crate::error::EditorError;
-use chrono::{Duration, Local};
+use chrono::Local;
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -29,6 +29,13 @@ use std::collections::HashMap;
 use std::process::Child;
 use std::process::Stdio;
 use walkdir::WalkDir;
+
+use unicode_width::UnicodeWidthChar;
+
+use crate::lua_api::{EditorCommand, EditorContext, LuaEditorAPI};
+use mlua::Lua;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 macro_rules! set_textarea_delafult_style {
     ($textarea:expr) => {
@@ -90,6 +97,7 @@ pub enum SearchType {
     Tags,
     Files,
     CustomSql,
+    CustomLua { provider: String, on_select: String },
 }
 
 #[derive(PartialEq, Clone, Debug)]
@@ -157,9 +165,8 @@ pub struct App {
     syntax_set: SyntaxSet,
     theme: Theme, // Use Box to ensure 'static lifetime
     scroll_offset: usize,
-    horizontal_scroll_offset: usize, // New: Horizontal scroll
-    // File tree fields
-    file_tree: Vec<TreeNode>,
+    horizontal_scroll_offset: usize, // Horizontal scroll
+    file_tree: Vec<TreeNode>,        // File tree fields
     visible_items: Vec<TreeItem>,
     tree_state: ListState,
     sort_by: SortBy,
@@ -182,6 +189,14 @@ pub struct App {
     audio_child: Option<Child>,
     read_mode: bool,
     yt_videos: HashMap<String, String>,
+    editor_width: u16,
+    visual_scroll_y: u16,
+    lua: Lua,
+    command_queue: Rc<RefCell<Vec<EditorCommand>>>,
+    normal_keymaps: Rc<RefCell<HashMap<String, mlua::RegistryKey>>>,
+    visual_keymaps: Rc<RefCell<HashMap<String, mlua::RegistryKey>>>,
+    shared_context: Rc<RefCell<EditorContext>>,
+    virtual_texts: HashMap<usize, Vec<(usize, String, String)>>,
 }
 
 pub struct CompletionState {
@@ -203,7 +218,8 @@ pub struct SearchState {
 
 impl App {
     pub fn new(file_path: &str, base_dir: &str, music_path: &str) -> Result<Self, EditorError> {
-        let db = Connection::open("markdown_data.db")?;
+        let db_path = Path::new(base_dir).join("markdown_data.db");
+        let db = Connection::open(db_path)?;
         db.execute("PRAGMA foreign_keys = ON;", [])?;
 
         let content = fs::read_to_string(file_path).unwrap_or_default();
@@ -225,8 +241,60 @@ impl App {
             ))
         })?;
 
-        // Optionally load an initial image (e.g., if file_path is an image or referenced in Markdown)
-        // let (image_protocol, current_image) = (None, None);
+        // 1. Initialize Lua and shared state
+        let lua = Lua::new();
+        let command_queue = Rc::new(RefCell::new(Vec::new()));
+        let normal_keymaps = Rc::new(RefCell::new(HashMap::new()));
+        let visual_keymaps = Rc::new(RefCell::new(HashMap::new()));
+        let shared_context = Rc::new(RefCell::new(EditorContext::default()));
+
+        let api = LuaEditorAPI {
+            command_queue: Rc::clone(&command_queue),
+            normal_keymaps: Rc::clone(&normal_keymaps),
+            visual_keymaps: Rc::clone(&visual_keymaps),
+            context: Rc::clone(&shared_context),
+        };
+
+        // 2. Expose the API to Lua under the global variable `editor`
+        lua.globals()
+            .set("editor", api)
+            .expect("Failed to set Lua globals");
+
+        // 3. Load the user's config file
+        let config_dir = std::env::var("XDG_CONFIG_HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| String::from("~"));
+                std::path::PathBuf::from(home).join(".config")
+            })
+            .join("midetor");
+
+        let global_config = config_dir.join("init.lua");
+        let local_config = std::path::Path::new("init.lua");
+
+        let config_content = if global_config.exists() {
+            std::fs::read_to_string(&global_config).ok()
+        } else if local_config.exists() {
+            std::fs::read_to_string(local_config).ok()
+        } else {
+            // Embeds default_init.lua directly into the binary at compile time
+            let template = include_str!("../lua/default_init.lua");
+
+            if let Err(e) = std::fs::create_dir_all(&config_dir) {
+                eprintln!("Failed to create config directory: {}", e);
+            } else if let Err(e) = std::fs::write(&global_config, template) {
+                eprintln!("Failed to write default init.lua: {}", e);
+            }
+
+            Some(template.to_string())
+        };
+
+        if let Some(config) = config_content {
+            if let Err(e) = lua.load(&config).exec() {
+                eprintln!("Lua Error in config: {}", e);
+            }
+        }
+
         let mut app = App {
             db,
             file_path: file_path.to_string(),
@@ -292,6 +360,14 @@ impl App {
             audio_child: None,
             read_mode: false,
             yt_videos: HashMap::new(),
+            editor_width: 0,
+            visual_scroll_y: 0,
+            lua,
+            command_queue,
+            normal_keymaps,
+            visual_keymaps,
+            shared_context,
+            virtual_texts: HashMap::new(),
         };
         app.open_file(file_path.to_string(), file_id)?;
 
@@ -674,15 +750,21 @@ impl App {
                 mapped_rows.collect::<Result<Vec<_>, _>>()?
             }
             CompletionType::Variable => {
-                let possible = vec![
-                    "date".to_string(),
-                    "time".to_string(),
-                    "file-name".to_string(),
-                ];
-                possible
-                    .into_iter()
-                    .filter(|s| s.starts_with(&query))
-                    .collect::<Vec<String>>()
+                // Try to call a global Lua function named 'on_autocomplete'
+                let globals = self.lua.globals();
+                if let Ok(func) = globals.get::<_, mlua::Function>("on_autocomplete") {
+                    // Pass the trigger type and current query to Lua
+                    match func.call::<_, Vec<String>>(("@", query.clone())) {
+                        Ok(suggestions) => suggestions,
+                        Err(e) => {
+                            self.status = format!("Lua Autocomplete Error: {}", e);
+                            Vec::new()
+                        }
+                    }
+                } else {
+                    // Fallback if the Lua function isn't defined
+                    Vec::new()
+                }
             }
             CompletionType::None => Vec::new(),
         };
@@ -738,16 +820,23 @@ impl App {
                         let insert_text = match self.completion_state.completion_type {
                             CompletionType::File => format!("[[{}]]", suggestion),
                             CompletionType::Tag => format!("#{}", suggestion),
-                            CompletionType::Variable => match suggestion.as_str() {
-                                "date" => chrono::Local::now().format("%Y-%m-%d").to_string(),
-                                "time" => chrono::Local::now().format("%H:%M:%S").to_string(),
-                                "file-name" => Path::new(&self.file_path)
-                                    .file_name()
-                                    .and_then(|s| s.to_str())
-                                    .unwrap_or_default()
-                                    .to_string(),
-                                _ => suggestion,
-                            },
+                            CompletionType::Variable => {
+                                let globals = self.lua.globals();
+                                if let Ok(func) =
+                                    globals.get::<_, mlua::Function>("expand_autocomplete")
+                                {
+                                    // Pass the trigger ("@") and the selected suggestion name
+                                    match func.call::<_, String>(("@", suggestion.clone())) {
+                                        Ok(expanded_text) => expanded_text,
+                                        Err(e) => {
+                                            self.status = format!("Lua Snippet Error: {}", e);
+                                            suggestion // Fallback to literal name if Lua fails
+                                        }
+                                    }
+                                } else {
+                                    suggestion // Fallback if Lua function doesn't exist
+                                }
+                            }
                             _ => suggestion,
                         };
 
@@ -856,12 +945,25 @@ impl App {
     }
 
     fn update_search_results(&mut self) -> Result<(), EditorError> {
-        match self.search_state.search_type {
+        match &self.search_state.search_type {
             SearchType::Backlinks => self.search_backlinks()?,
             SearchType::Tags => self.search_tags()?,
             SearchType::Files => self.search_files()?,
             // --- New Call ---
             SearchType::CustomSql => self.search_custom_sql()?,
+            SearchType::CustomLua { provider, .. } => {
+                let globals = self.lua.globals();
+                if let Ok(func) = globals.get::<_, mlua::Function>(provider.as_str()) {
+                    match func.call::<_, Vec<String>>(self.search_state.query.clone()) {
+                        Ok(results) => {
+                            // We map them to (String, None) since Lua handles the execution
+                            self.search_state.results =
+                                results.into_iter().map(|s| (s, None)).collect();
+                        }
+                        Err(e) => self.status = format!("Lua Search Error: {}", e),
+                    }
+                }
+            }
             SearchType::None => {}
         }
         if !self.search_state.results.is_empty() {
@@ -995,9 +1097,9 @@ impl App {
     }
     fn select_search_result(&mut self) -> Result<(), EditorError> {
         if let Some(selected) = self.search_state.list_state.selected() {
-            if let Some((_display_text, file_id)) = self.search_state.results.get(selected).cloned()
+            if let Some((display_text, file_id)) = self.search_state.results.get(selected).cloned()
             {
-                match self.search_state.search_type {
+                match &self.search_state.search_type {
                     SearchType::Backlinks | SearchType::Files | SearchType::CustomSql => {
                         if let Some(file_id) = file_id {
                             // Retrieve full path from database
@@ -1021,11 +1123,19 @@ impl App {
                         }
                     }
                     SearchType::Tags => {
-                        self.load_tag_files(&_display_text)?;
+                        self.load_tag_files(&display_text)?;
                         if !self.tag_files.is_empty() {
                             self.mode = Mode::TagFiles;
                         } else {
                             self.cancel_search();
+                        }
+                    }
+                    SearchType::CustomLua { on_select, .. } => {
+                        let globals = self.lua.globals();
+                        if let Ok(func) = globals.get::<_, mlua::Function>(on_select.as_str()) {
+                            if let Err(e) = func.call::<_, ()>(display_text.clone()) {
+                                self.status = format!("Lua Select Error: {}", e);
+                            }
                         }
                     }
                     SearchType::None => {}
@@ -1708,351 +1818,57 @@ impl App {
     ) -> Result<(), EditorError> {
         match self.mode {
             Mode::Normal => {
-                // Handle key sequence first if it has started
-                if !self.key_sequence.is_empty() {
-                    if let ratatui::crossterm::event::KeyCode::Char(c) = event.code {
-                        self.key_sequence.push(c);
-                        let sequence = self.key_sequence.clone(); // Clone to avoid borrow issues
-                        match sequence.as_str() {
-                            "gg" => {
-                                self.textarea.move_cursor(CursorMove::Top);
-                                self.key_sequence.clear();
-                                self.status = "Moved to top".to_string();
-                            }
-                            "yy" => {
-                                let row = self.textarea.cursor().0;
-                                self.yanked = vec![self.textarea.lines()[row].clone()];
-                                self.key_sequence.clear();
-                                self.status = "Yanked line (not undoable)".to_string();
-                            }
-                            "dd" => {
-                                self.textarea.move_cursor(CursorMove::Head);
-                                self.textarea.delete_line_by_end();
-                                self.key_sequence.clear();
-                                self.status = "Deleted line".to_string();
-                            }
-                            "\\ob" => {
-                                self.start_search(SearchType::Backlinks)?;
-                                self.key_sequence.clear();
-                                self.status = "Started backlinks search".to_string();
-                            }
-                            "\\ot" => {
-                                self.start_search(SearchType::Tags)?;
-                                self.key_sequence.clear();
-                                self.status = "Started tags search".to_string();
-                            }
-                            "\\f" => {
-                                self.start_search(SearchType::Files)?;
-                                self.key_sequence.clear();
-                                self.status = "Started files search".to_string();
-                            }
-                            "\\oot" => {
-                                let today = Local::now()
-                                    .format("Every day info/%Y-%m-%d.md")
-                                    .to_string();
-                                self.open_wikilink_file(today)?;
-                                self.key_sequence.clear();
-                                self.status = "Opened today's file".to_string();
-                            }
-                            "\\ooy" => {
-                                let yesterday = (Local::now() - Duration::days(1))
-                                    .format("Every day info/%Y-%m-%d.md")
-                                    .to_string();
-                                self.open_wikilink_file(yesterday)?;
-                                self.key_sequence.clear();
-                                self.status = "Opened yesterday's file".to_string();
-                            }
-                            "\\ooT" => {
-                                let tomorrow = (Local::now() + Duration::days(1))
-                                    .format("Every day info/%Y-%m-%d.md")
-                                    .to_string();
-                                self.open_wikilink_file(tomorrow)?;
-                                self.key_sequence.clear();
-                                self.status = "Opened tomorrow's file".to_string();
-                            }
-                            "\\t" => {
-                                if self.file_tree.is_empty() {
-                                    self.file_tree = self.build_root();
-                                }
-                                self.update_visible();
-                                if !self.visible_items.is_empty() {
-                                    self.tree_state.select(Some(0));
-                                }
-                                self.mode = Mode::FileTree;
-                                self.key_sequence.clear();
-                                self.status = "Entered File Tree mode".to_string();
-                            }
-                            "\\nt" => {
-                                self.process_template_command("Templates/Yaml-Template.md")?;
-                            }
-                            "\\nm" => {
-                                self.process_template_command("Templates/meeting.md")?;
-                            }
-                            "\\os" => {
-                                self.start_search(SearchType::CustomSql)?;
-                                self.key_sequence.clear();
-                                // self.search_state
-                                //     .query
-                                //     .push_str("Select id from files where id=3;");
-                                self.status = "Started custom SQL search".to_string();
-                            }
+                // 1. Convert the raw key event to a string (e.g., "j", "<C-s>", "<Esc>")
+                let key_str = Self::event_to_string(event);
 
-                            "\\if" => {
-                                if self.current_image.is_some() {
-                                    self.image_full_screen = !self.image_full_screen;
-                                    self.status = if self.image_full_screen {
-                                        "Image full screen".to_string()
-                                    } else {
-                                        "Image popup".to_string()
-                                    };
-                                    self.last_image_area = None; // Force protocol regen
-                                } else {
-                                    self.status = "No image to toggle full screen".to_string();
-                                }
-                                self.key_sequence.clear();
-                            }
-                            "\\s" => {
-                                self.stop_audio();
-                            }
-                            "\\w" => {
-                                self.read_mode = !self.read_mode;
-                                self.key_sequence.clear();
-                                self.status = if self.read_mode {
-                                    "Read Mode (Wrapping ON)".to_string()
-                                } else {
-                                    "Edit Mode (Wrapping OFF)".to_string()
-                                };
-                            }
+                // 2. Add it to our running sequence
+                self.key_sequence.push_str(&key_str);
+                let sequence = self.key_sequence.clone();
 
-                            s if !("\\ob".starts_with(s)
-                                || "\\ot".starts_with(s)
-                                || "\\f".starts_with(s)
-                                || "\\oot".starts_with(s)
-                                || "\\ooy".starts_with(s)
-                                || "\\ooT".starts_with(s)
-                                || "\\t".starts_with(s)
-                                || "\\nt".starts_with(s)
-                                || "\\if".starts_with(s)
-                                || "\\os".starts_with(s)
-                                || "\\nm".starts_with(s)
-                                || "\\s".starts_with(s)
-                                || "\\w".starts_with(s)) =>
-                            {
-                                self.key_sequence.clear();
-                                self.status = format!("Invalid sequence 1: {}", s);
-                            }
-                            _ => {}
-                        }
-                        return Ok(());
-                    }
-                }
+                // 3. Check Lua keymaps
+                let (has_exact, has_partial) = {
+                    let maps = self.normal_keymaps.borrow();
+                    let exact = maps.contains_key(&sequence);
+                    // Check if any mapped key starts with what we typed (e.g. typed "g", map has "gg")
+                    let partial = maps
+                        .keys()
+                        .any(|k| k.starts_with(&sequence) && k != &sequence);
+                    (exact, partial)
+                };
 
-                // Handle single-key commands and other key events
-                match (event.code, event.modifiers) {
-                    (
-                        ratatui::crossterm::event::KeyCode::Char('o'),
-                        ratatui::crossterm::event::KeyModifiers::CONTROL,
-                    ) => {
-                        self.navigate_back()?;
-                    }
-                    (
-                        ratatui::crossterm::event::KeyCode::Char('i'),
-                        ratatui::crossterm::event::KeyModifiers::CONTROL,
-                    ) => {
-                        self.navigate_forward()?;
-                    }
-                    (
-                        ratatui::crossterm::event::KeyCode::Char('r'),
-                        ratatui::crossterm::event::KeyModifiers::CONTROL,
-                    ) => {
-                        if self.textarea.redo() {
-                            self.status = "Redone".to_string();
-                        } else {
-                            self.status = "Nothing to redo".to_string();
-                        }
-                    }
-                    (ratatui::crossterm::event::KeyCode::Char('u'), _) => {
-                        if self.textarea.undo() {
-                            self.status = "Undone".to_string();
-                        } else {
-                            self.status = "Nothing to undo".to_string();
-                        }
-                    }
-                    (ratatui::crossterm::event::KeyCode::Char('i'), _) => {
-                        self.mode = Mode::Insert;
-                        self.status = "Insert".to_string();
-                    }
-                    (ratatui::crossterm::event::KeyCode::Char('a'), _) => {
-                        self.textarea.move_cursor(CursorMove::Forward);
-                        self.mode = Mode::Insert;
-                        self.status = "Insert".to_string();
-                    }
-                    (ratatui::crossterm::event::KeyCode::Char('o'), _) => {
-                        self.textarea.move_cursor(CursorMove::End);
-                        self.textarea.insert_newline();
-                        self.mode = Mode::Insert;
-                        self.status = "Insert".to_string();
-                    }
-                    (
-                        ratatui::crossterm::event::KeyCode::Char('v'),
-                        ratatui::crossterm::event::KeyModifiers::CONTROL,
-                    ) => {
-                        self.visual_anchor = Some(self.textarea.cursor());
-                        self.mode = Mode::VisualBlock;
-                        self.status = "Visual Block".to_string();
-                    }
-                    (ratatui::crossterm::event::KeyCode::Char('v'), _) => {
-                        self.visual_anchor = Some(self.textarea.cursor());
-                        self.mode = Mode::Visual;
-                        self.status = "Visual".to_string();
-                    }
-                    (ratatui::crossterm::event::KeyCode::Char('x'), _) => {
-                        self.textarea.delete_next_char();
-                    }
-                    (ratatui::crossterm::event::KeyCode::Char('p'), _) => {
-                        self.textarea.move_cursor(CursorMove::End);
-                        self.textarea.insert_char('\n');
-                        self.textarea.insert_str(&self.yanked.join("\n"));
-                    }
-                    (ratatui::crossterm::event::KeyCode::Char(':'), _) => {
-                        self.prev_mode = Some(Mode::Normal);
-                        self.mode = Mode::Command;
-                        self.command.clear();
-                        self.status = "Command".to_string();
-                    }
-                    (ratatui::crossterm::event::KeyCode::Char('j'), _) => {
-                        self.textarea.move_cursor(CursorMove::Down);
-                    }
-                    (ratatui::crossterm::event::KeyCode::Char('k'), _) => {
-                        self.textarea.move_cursor(CursorMove::Up);
-                    }
-                    (ratatui::crossterm::event::KeyCode::Char('h'), _) => {
-                        self.textarea.move_cursor(CursorMove::Back);
-                    }
-                    (ratatui::crossterm::event::KeyCode::Char('l'), _) => {
-                        self.textarea.move_cursor(CursorMove::Forward);
-                    }
-                    (ratatui::crossterm::event::KeyCode::Up, _) => {
-                        self.textarea.move_cursor(CursorMove::Up);
-                        // self.scroll_offset = self.scroll_offset.saturating_sub(1);
-                    }
-                    (ratatui::crossterm::event::KeyCode::Down, _) => {
-                        self.textarea.move_cursor(CursorMove::Down);
-                    }
-                    (
-                        ratatui::crossterm::event::KeyCode::Left,
-                        ratatui::crossterm::event::KeyModifiers::CONTROL,
-                    ) => {
-                        self.textarea.move_cursor(CursorMove::WordBack);
-                    }
-                    (
-                        ratatui::crossterm::event::KeyCode::Right,
-                        ratatui::crossterm::event::KeyModifiers::CONTROL,
-                    ) => {
-                        self.textarea.move_cursor(CursorMove::WordForward);
-                    }
-                    (ratatui::crossterm::event::KeyCode::Left, _) => {
-                        self.textarea.move_cursor(CursorMove::Back);
-                    }
-                    (ratatui::crossterm::event::KeyCode::Right, _) => {
-                        self.textarea.move_cursor(CursorMove::Forward);
-                    }
-                    (
-                        ratatui::crossterm::event::KeyCode::Home,
-                        ratatui::crossterm::event::KeyModifiers::CONTROL,
-                    ) => {
-                        self.textarea.move_cursor(CursorMove::Top);
-                    }
-                    (ratatui::crossterm::event::KeyCode::Home, _) => {
-                        self.textarea.move_cursor(CursorMove::Head);
-                    }
-                    (
-                        ratatui::crossterm::event::KeyCode::End,
-                        ratatui::crossterm::event::KeyModifiers::CONTROL,
-                    ) => {
-                        self.textarea.move_cursor(CursorMove::Bottom);
-                    }
-                    (ratatui::crossterm::event::KeyCode::End, _) => {
-                        self.textarea.move_cursor(CursorMove::End);
-                    }
-                    (ratatui::crossterm::event::KeyCode::Char('G'), _)
-                        if self.key_sequence.is_empty() =>
+                if has_exact {
+                    // 1. SYNC STATE TO LUA BEFORE EXECUTION
                     {
-                        self.textarea.move_cursor(CursorMove::Bottom);
+                        let mut ctx = self.shared_context.borrow_mut();
+                        ctx.lines = self.textarea.lines().to_vec();
+                        ctx.cursor_row = self.textarea.cursor().0;
+                        ctx.cursor_col = self.textarea.cursor().1;
+                        ctx.current_file = self.file_path.clone();
                     }
-                    (
-                        ratatui::crossterm::event::KeyCode::Char('q'),
-                        ratatui::crossterm::event::KeyModifiers::CONTROL,
-                    ) => {
-                        self.should_quit = true;
-                    }
-                    (
-                        ratatui::crossterm::event::KeyCode::Char('s'),
-                        ratatui::crossterm::event::KeyModifiers::CONTROL,
-                    ) => {
-                        self.save_file()?;
-                        let mode = self.prev_mode.unwrap_or(Mode::Normal);
-                        self.mode = mode;
-                        self.command.clear();
-                        self.prev_mode = None;
-                        self.status = format!("Saved file: {}", gettitle!(&self.file_path));
-                    }
-                    (ratatui::crossterm::event::KeyCode::Char(c), _) => {
-                        //TODO IF I DELETE THAT THAN gg dd and yy in not working.
-                        self.key_sequence.push(c);
-                        let sequence = self.key_sequence.clone(); // Clone to avoid borrow issues
-                        match sequence.as_str() {
-                            _ => {}
-                        }
-                    }
-                    (ratatui::crossterm::event::KeyCode::Enter, _) => {
-                        if self.view == View::Editor {
-                            let (current_row, current_col) = self.textarea.cursor();
-                            let line = self.textarea.lines()[current_row].clone();
-                            if let Some(wikilinkline) = self.extract_wikilink(&line, current_col) {
-                                if wikilinkline.ends_with(".mp3") {
-                                    self.playaudio(usize::MAX, &self.music_path.clone())?;
-                                } else {
-                                    self.follow_backlink(usize::MAX)?;
-                                }
-                            } else if let Some(tag) = self.extract_tag(&line, current_col) {
-                                //First load
-                                self.load_tag_files(&tag)?;
-                                //Then open the mode
-                                self.mode = Mode::TagFiles;
-                            }
-                        } else {
-                            self.view = View::Editor;
-                            self.status = "Normal".to_string();
+                    // 2. Execute the Lua function
+                    let mut lua_error = None;
+                    {
+                        let maps = self.normal_keymaps.borrow();
+                        let reg_key = maps.get(&sequence).unwrap();
+                        let func: mlua::Function = self.lua.registry_value(reg_key).unwrap();
+
+                        if let Err(e) = func.call::<_, ()>(()) {
+                            lua_error = Some(e.to_string());
                         }
                     }
 
-                    (
-                        ratatui::crossterm::event::KeyCode::Esc,
-                        ratatui::crossterm::event::KeyModifiers::CONTROL,
-                    ) => {
-                        self.mode = Mode::Normal;
-                        self.status = "Normal".to_string();
+                    if let Some(err) = lua_error {
+                        self.status = format!("Lua execution error: {}", err);
                     }
 
-                    (ratatui::crossterm::event::KeyCode::Esc, _) => {
-                        if self.image_full_screen {
-                            self.image_full_screen = false;
-                            self.status = "Image popup".to_string();
-                            self.last_image_area = None; // Force protocol regen
-                        } else if !self.key_sequence.is_empty() {
-                            self.key_sequence.clear();
-                            self.status = "Sequence cancelled".to_string();
-                        }
-                    }
-                    _ => {
-                        // self.status = format!(
-                        //     "Unsupported key on line {}: {:?}",
-                        //     line!(), // This will be replaced with the actual line number
-                        //     event.code
-                        // );
-                        // This looks bad.
-                    }
+                    self.key_sequence.clear();
+                    self.execute_lua_commands()?;
+                } else if has_partial {
+                    // Valid start of a sequence, wait for the next keypress
+                    self.status = format!("Waiting: {}", sequence);
+                } else {
+                    // Invalid sequence or unmapped key, clear to start fresh next press
+                    self.key_sequence.clear();
                 }
             }
             Mode::Insert => {
@@ -2163,6 +1979,13 @@ impl App {
                         self.textarea.clear_mask_char();
                         self.open_wikilink_file("index.md".to_string())?; //TODO open something else in the future
                         self.status = format!("Deleted file: {}", delete_path);
+                    } else if self.command.starts_with("lua ") {
+                        let code = self.command.trim_start_matches("lua ").to_string();
+                        // Execute the code directly
+                        match self.lua.load(&code).exec() {
+                            Ok(_) => self.status = "Lua executed".to_string(),
+                            Err(e) => self.status = format!("Lua err: {}", e),
+                        }
                     } else {
                         self.status = format!("Unknown command: {}", self.command);
                     }
@@ -2242,6 +2065,7 @@ impl App {
                     } else if !self.search_state.results.is_empty() {
                         // 2. Second Enter: Select the file from the displayed list
                         self.select_search_result()?;
+                        self.execute_lua_commands()?;
                     }
                 }
                 ratatui::crossterm::event::KeyCode::Up => {
@@ -2298,7 +2122,56 @@ impl App {
                 _ => {}
             },
             Mode::Visual | Mode::VisualBlock => {
-                let mut input = Input::from(event);
+                let key_str = Self::event_to_string(event);
+                self.key_sequence.push_str(&key_str);
+                let sequence = self.key_sequence.clone();
+
+                let (has_exact, has_partial) = {
+                    let maps = self.visual_keymaps.borrow(); // NOTE: visual_keymaps here!
+                    let exact = maps.contains_key(&sequence);
+                    let partial = maps
+                        .keys()
+                        .any(|k| k.starts_with(&sequence) && k != &sequence);
+                    (exact, partial)
+                };
+
+                if has_exact {
+                    // Sync State
+                    {
+                        let mut ctx = self.shared_context.borrow_mut();
+                        ctx.lines = self.textarea.lines().to_vec();
+                        ctx.cursor_row = self.textarea.cursor().0;
+                        ctx.cursor_col = self.textarea.cursor().1;
+                        ctx.current_file = self.file_path.clone();
+                        ctx.visual_anchor = self.visual_anchor; // Sync the anchor
+                    }
+
+                    let mut lua_error = None;
+                    {
+                        let maps = self.visual_keymaps.borrow();
+                        let reg_key = maps.get(&sequence).unwrap();
+                        let func: mlua::Function = self.lua.registry_value(reg_key).unwrap();
+                        if let Err(e) = func.call::<_, ()>(()) {
+                            lua_error = Some(e.to_string());
+                        }
+                    }
+
+                    if let Some(err) = lua_error {
+                        self.status = format!("Lua error: {}", err);
+                    }
+                    self.key_sequence.clear();
+                    self.execute_lua_commands()?;
+
+                    return Ok(()); // Stop here, Lua handled it!
+                } else if has_partial {
+                    self.status = format!("Waiting: {}", sequence);
+                    return Ok(()); // Stop here, waiting for next key
+                } else {
+                    self.key_sequence.clear();
+                }
+
+                // --- EXISTING HARDCODED RUST LOGIC CONTINUES BELOW ---
+                let mut input = tui_textarea::Input::from(event);
                 match input.key {
                     Key::Esc => {
                         self.textarea.cancel_selection();
@@ -2846,7 +2719,7 @@ impl App {
                     // The actual query input is handled below in chunks[2]
                 } else {
                     // Render search results for all modes (Backlinks, Tags, Files, and results of CustomSql)
-                    let title = match self.search_state.search_type {
+                    let title = match &self.search_state.search_type {
                         SearchType::Backlinks => format!("Backlinks: {}", self.search_state.query),
                         SearchType::Tags => format!("Tags: {}", self.search_state.query),
                         SearchType::Files => format!("Files: {}", self.search_state.query),
@@ -2854,6 +2727,9 @@ impl App {
                             "Custom SQL Results (Press Enter to Open): {}",
                             self.search_state.query
                         ),
+                        SearchType::CustomLua { .. } => {
+                            format!("Lua Search: {}", self.search_state.query)
+                        }
                         SearchType::None => "Search".to_string(),
                     };
 
@@ -2998,6 +2874,7 @@ impl App {
         // 2. Draw outer borders and get the safe inner drawing area
         let inner_area = self.render_borders(f, area);
 
+        self.editor_width = inner_area.width;
         // 3. Update scroll positions based on the cursor and inner area
         self.update_scrolling(inner_area);
 
@@ -3050,41 +2927,48 @@ impl App {
     // --- 3. Adjust Scrolling ---
     fn update_scrolling(&mut self, inner_area: Rect) {
         let area_height = inner_area.height as usize;
-        let area_width = inner_area.width as usize;
+        let area_w = inner_area.width.max(1) as usize;
         let total_lines = self.textarea.lines().len();
-        let visible_lines_count = area_height.min(total_lines);
         let cursor_row = self.textarea.cursor().0;
         let cursor_col = self.textarea.cursor().1;
 
-        let logical_scroll_margin = if self.read_mode {
-            3.min(visible_lines_count)
-        } else {
-            visible_lines_count
-        };
+        if self.read_mode {
+            let mut absolute_cursor_y = 0;
+            for r in 0..=cursor_row {
+                // Fetch the expanded line string and the newly mapped cursor index
+                let (expanded_line, mapped_col) = self.get_expanded_line_info(r, cursor_col);
 
-        if cursor_row < self.scroll_offset {
-            self.scroll_offset = cursor_row;
-        } else if cursor_row >= self.scroll_offset + logical_scroll_margin {
-            self.scroll_offset = cursor_row.saturating_sub(logical_scroll_margin.saturating_sub(1));
-        }
+                if r == cursor_row {
+                    let (y, _) =
+                        Self::calculate_cursor_position(&expanded_line, mapped_col, area_w);
+                    absolute_cursor_y += y;
+                } else {
+                    absolute_cursor_y += Self::calculate_visual_lines(&expanded_line, area_w);
+                }
+            }
 
-        let max_scroll = if self.read_mode {
-            total_lines.saturating_sub(1)
-        } else {
-            total_lines.saturating_sub(visible_lines_count)
-        };
-
-        self.scroll_offset = self.scroll_offset.min(max_scroll);
-
-        if !self.read_mode {
-            if cursor_col < self.horizontal_scroll_offset {
-                self.horizontal_scroll_offset = cursor_col;
-            } else if cursor_col >= self.horizontal_scroll_offset + area_width {
-                self.horizontal_scroll_offset =
-                    cursor_col.saturating_sub(area_width.saturating_sub(1));
+            if absolute_cursor_y < self.visual_scroll_y as usize {
+                self.visual_scroll_y = absolute_cursor_y as u16;
+            } else if absolute_cursor_y >= (self.visual_scroll_y as usize + area_height) {
+                self.visual_scroll_y = (absolute_cursor_y - area_height + 1) as u16;
             }
         } else {
-            self.horizontal_scroll_offset = 0;
+            let visible_lines_count = area_height.min(total_lines);
+            if cursor_row < self.scroll_offset {
+                self.scroll_offset = cursor_row;
+            } else if cursor_row >= self.scroll_offset + visible_lines_count {
+                self.scroll_offset =
+                    cursor_row.saturating_sub(visible_lines_count.saturating_sub(1));
+            }
+
+            let max_scroll = total_lines.saturating_sub(visible_lines_count);
+            self.scroll_offset = self.scroll_offset.min(max_scroll);
+
+            if cursor_col < self.horizontal_scroll_offset {
+                self.horizontal_scroll_offset = cursor_col;
+            } else if cursor_col >= self.horizontal_scroll_offset + area_w {
+                self.horizontal_scroll_offset = cursor_col.saturating_sub(area_w.saturating_sub(1));
+            }
         }
     }
 
@@ -3095,11 +2979,37 @@ impl App {
         inner_area: Rect,
     ) -> Result<(), EditorError> {
         let area_height = inner_area.height as usize;
+        let area_width = inner_area.width.max(1) as usize;
         let total_lines = self.textarea.lines().len();
-        let visible_lines_count = area_height.min(total_lines);
 
-        let start_line = self.scroll_offset;
-        let end_line = (self.scroll_offset + visible_lines_count).min(total_lines);
+        // Calculate the exact starting chunk based on visual scroll
+        let mut start_logical_row = self.scroll_offset;
+        let mut scroll_remainder = 0;
+
+        if self.read_mode {
+            let mut visual_y = 0;
+            for r in 0..total_lines {
+                let (expanded_line, _) = self.get_expanded_line_info(r, 0);
+                let lines_for_this_row = Self::calculate_visual_lines(&expanded_line, area_width);
+
+                if visual_y + lines_for_this_row > self.visual_scroll_y as usize {
+                    start_logical_row = r;
+                    scroll_remainder = self.visual_scroll_y as usize - visual_y;
+                    break;
+                }
+                visual_y += lines_for_this_row;
+            }
+        }
+
+        // Give Read Mode a generous buffer of lines so it doesn't cut off at the bottom of the screen
+        let visible_lines_count = if self.read_mode {
+            area_height
+        } else {
+            area_height.min(total_lines)
+        };
+        let end_line =
+            (start_logical_row + visible_lines_count + (if self.read_mode { 15 } else { 0 }))
+                .min(total_lines);
 
         let syntax = self
             .syntax_set
@@ -3110,7 +3020,7 @@ impl App {
         let mut visible_text = Vec::new();
         let selection_range = self.textarea.selection_range();
 
-        for logical_row in start_line..end_line {
+        for logical_row in start_logical_row..end_line {
             let line = &self.textarea.lines()[logical_row];
             let trimmed_line = line.trim();
 
@@ -3127,6 +3037,15 @@ impl App {
             let mut new_spans = Vec::new();
             let mut col_tracker = 0;
 
+            // --- Fetch and sort virtual text for this specific line ---
+            let mut line_v_texts = self
+                .virtual_texts
+                .get(&logical_row)
+                .cloned()
+                .unwrap_or_default();
+            line_v_texts.sort_by_key(|v| v.0); // Sort by column index
+            let mut v_idx = 0;
+
             for (style, text_segment) in ranges {
                 let text = text_segment.trim_end_matches('\n');
                 if text.is_empty() {
@@ -3134,36 +3053,94 @@ impl App {
                 }
 
                 let color = Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b);
-                let text_len = text.chars().count();
-                let mut span_style = Style::default().fg(color);
+                let span_style = Style::default().fg(color);
 
-                if let Some(((start_r, start_c), (end_r, end_c))) = selection_range {
-                    if (logical_row > start_r || (logical_row == start_r && col_tracker >= start_c))
-                        && (logical_row < end_r || (logical_row == end_r && col_tracker < end_c))
-                    {
-                        span_style = span_style.bg(Color::LightBlue);
-                    }
-                }
+                // Slice token dynamically to insert virtual text inside
+                let text_chars: Vec<char> = text.chars().collect();
+                let mut char_idx = 0;
 
-                if !self.read_mode {
-                    let span_end = col_tracker + text_len;
-                    if span_end > self.horizontal_scroll_offset {
-                        let start_char = if col_tracker < self.horizontal_scroll_offset {
-                            self.horizontal_scroll_offset - col_tracker
-                        } else {
-                            0
+                while char_idx < text_chars.len() {
+                    // 1. Inject virtual text at exactly this column position
+                    while v_idx < line_v_texts.len() && line_v_texts[v_idx].0 == col_tracker {
+                        let (_, ref v_text, ref v_color) = line_v_texts[v_idx];
+                        let parsed_color = match v_color.to_lowercase().as_str() {
+                            "red" => Color::Red,
+                            "green" => Color::Green,
+                            "blue" => Color::LightBlue,
+                            "yellow" => Color::Yellow,
+                            "gray" => Color::DarkGray,
+                            _ => Color::Gray,
                         };
-                        let text_chars: Vec<char> = text.chars().collect();
-                        let sliced_text: String = text_chars.into_iter().skip(start_char).collect();
-                        if !sliced_text.is_empty() {
-                            new_spans.push(Span::styled(sliced_text, span_style));
+                        let v_style = Style::default()
+                            .fg(parsed_color)
+                            .add_modifier(Modifier::ITALIC);
+                        new_spans.push(Span::styled(v_text.clone(), v_style));
+                        v_idx += 1;
+                    }
+
+                    // 2. Find boundary to the next virtual text (or end of segment)
+                    let mut next_boundary = text_chars.len();
+                    if v_idx < line_v_texts.len() && line_v_texts[v_idx].0 > col_tracker {
+                        let dist = line_v_texts[v_idx].0 - col_tracker;
+                        if char_idx + dist < next_boundary {
+                            next_boundary = char_idx + dist;
                         }
                     }
-                } else {
-                    new_spans.push(Span::styled(text.to_string(), span_style));
-                }
 
-                col_tracker += text_len;
+                    let sub_text: String = text_chars[char_idx..next_boundary].iter().collect();
+                    let sub_len = sub_text.chars().count();
+
+                    let mut current_span_style = span_style;
+                    if let Some(((start_r, start_c), (end_r, end_c))) = selection_range {
+                        if (logical_row > start_r
+                            || (logical_row == start_r && col_tracker >= start_c))
+                            && (logical_row < end_r
+                                || (logical_row == end_r && col_tracker < end_c))
+                        {
+                            current_span_style = current_span_style.bg(Color::LightBlue);
+                        }
+                    }
+
+                    if !self.read_mode {
+                        let span_end = col_tracker + sub_len;
+                        if span_end > self.horizontal_scroll_offset {
+                            let start_char = if col_tracker < self.horizontal_scroll_offset {
+                                self.horizontal_scroll_offset - col_tracker
+                            } else {
+                                0
+                            };
+                            let sliced_text: String = sub_text.chars().skip(start_char).collect();
+                            if !sliced_text.is_empty() {
+                                new_spans.push(Span::styled(sliced_text, current_span_style));
+                            }
+                        }
+                    } else {
+                        new_spans.push(Span::styled(sub_text, current_span_style));
+                    }
+
+                    char_idx = next_boundary;
+                    col_tracker += sub_len;
+                }
+            }
+
+            // --- Catch any trailing End-Of-Line (EOL) virtual text ---
+            while v_idx < line_v_texts.len() {
+                let (_, ref v_text, ref v_color) = line_v_texts[v_idx];
+                let parsed_color = match v_color.to_lowercase().as_str() {
+                    "red" => Color::Red,
+                    "green" => Color::Green,
+                    "blue" => Color::LightBlue,
+                    "yellow" => Color::Yellow,
+                    "gray" => Color::DarkGray,
+                    _ => Color::Gray,
+                };
+                new_spans.push(Span::styled(
+                    format!(" {}", v_text),
+                    Style::default()
+                        .fg(parsed_color)
+                        .add_modifier(Modifier::ITALIC),
+                ));
+                v_idx += 1;
             }
 
             if is_vid_header {
@@ -3181,39 +3158,94 @@ impl App {
 
         if !self.image_full_screen {
             let mut paragraph = Paragraph::new(visible_text).style(self.textarea.style());
+
             if self.read_mode {
-                paragraph = paragraph.wrap(ratatui::widgets::Wrap { trim: false });
+                // Apply Ratatui's native intra-line scrolling
+                paragraph = paragraph
+                    .wrap(ratatui::widgets::Wrap { trim: false })
+                    .scroll((scroll_remainder as u16, 0));
             }
 
             f.render_widget(paragraph, inner_area);
 
             let (cursor_row, cursor_col) = self.textarea.cursor();
-            if !self.read_mode
-                && cursor_row >= self.scroll_offset
-                && cursor_row < self.scroll_offset + visible_lines_count
-            {
-                let screen_row = (cursor_row - self.scroll_offset) as u16;
-                let screen_col = (cursor_col.saturating_sub(self.horizontal_scroll_offset)) as u16;
-                let cursor_x = screen_col.min(inner_area.width.saturating_sub(1));
 
-                let cursor_area = Rect {
-                    x: inner_area.x + cursor_x,
-                    y: inner_area.y + screen_row,
-                    width: 1,
-                    height: 1,
-                };
+            if !self.read_mode {
+                if cursor_row >= self.scroll_offset
+                    && cursor_row < self.scroll_offset + visible_lines_count
+                {
+                    let screen_row = (cursor_row - self.scroll_offset) as u16;
+                    let screen_col =
+                        (cursor_col.saturating_sub(self.horizontal_scroll_offset)) as u16;
+                    let cursor_x = screen_col.min(inner_area.width.saturating_sub(1));
 
-                let line = self
-                    .textarea
-                    .lines()
-                    .get(cursor_row)
-                    .cloned()
-                    .unwrap_or_default();
-                let ch: char = line.chars().nth(cursor_col).unwrap_or(' ');
-                let cursor_style = Style::default().bg(Color::White).fg(Color::Black);
-                let cursor_span = Span::styled(ch.to_string(), cursor_style);
+                    let cursor_area = Rect {
+                        x: inner_area.x + cursor_x,
+                        y: inner_area.y + screen_row,
+                        width: 1,
+                        height: 1,
+                    };
 
-                f.render_widget(Paragraph::new(cursor_span), cursor_area);
+                    let line = self
+                        .textarea
+                        .lines()
+                        .get(cursor_row)
+                        .cloned()
+                        .unwrap_or_default();
+                    let ch: char = line.chars().nth(cursor_col).unwrap_or(' ');
+                    let cursor_style = Style::default().bg(Color::White).fg(Color::Black);
+                    let cursor_span = Span::styled(ch.to_string(), cursor_style);
+
+                    f.render_widget(Paragraph::new(cursor_span), cursor_area);
+                }
+            } else {
+                // --- WRAPPED MODE ABSOLUTE CURSOR ---
+                let mut absolute_cursor_y = 0;
+                let mut cursor_screen_x = 0;
+
+                for r in 0..=cursor_row {
+                    let (expanded_line, mapped_col) = self.get_expanded_line_info(r, cursor_col);
+                    if r == cursor_row {
+                        // THIS FUNCTION CALCULATES THE TRUE WORD-WRAPPED X and Y
+                        let (y, x) =
+                            Self::calculate_cursor_position(&expanded_line, mapped_col, area_width);
+                        absolute_cursor_y += y;
+                        cursor_screen_x = x;
+                    } else {
+                        absolute_cursor_y +=
+                            Self::calculate_visual_lines(&expanded_line, area_width);
+                    }
+                }
+
+                // If the cursor is currently inside the visual viewport, draw it
+                if absolute_cursor_y >= self.visual_scroll_y as usize
+                    && absolute_cursor_y < (self.visual_scroll_y as usize + area_height)
+                {
+                    let screen_y = (absolute_cursor_y - self.visual_scroll_y as usize) as u16;
+
+                    // FIXED: Use the simulated X position
+                    let screen_x = cursor_screen_x as u16;
+
+                    let cursor_area = Rect {
+                        x: inner_area.x + screen_x,
+                        y: inner_area.y + screen_y,
+                        width: 1,
+                        height: 1,
+                    };
+
+                    let line = self
+                        .textarea
+                        .lines()
+                        .get(cursor_row)
+                        .cloned()
+                        .unwrap_or_default();
+                    let ch: char = line.chars().nth(cursor_col).unwrap_or(' ');
+                    let cursor_span = Span::styled(
+                        ch.to_string(),
+                        Style::default().bg(Color::White).fg(Color::Black),
+                    );
+                    f.render_widget(Paragraph::new(cursor_span), cursor_area);
+                }
             }
         }
 
@@ -3694,6 +3726,522 @@ impl App {
             let _ = child.wait();
         }
         self.status = String::from("Audio stopped");
+    }
+
+    fn _visual_move_down(&mut self) {
+        let (row, col) = self.textarea.cursor();
+        let width = self.editor_width.max(1) as usize;
+        let line = self.textarea.lines().get(row).cloned().unwrap_or_default();
+        let char_count = line.chars().count();
+
+        // If dropping down keeps us on the same logical line (just a wrapped chunk)
+        if col + width <= char_count {
+            self.textarea.move_cursor(tui_textarea::CursorMove::Jump(
+                row as u16,
+                (col + width) as u16,
+            ));
+        } else {
+            // We are on the last visual chunk of this line, jump to the next logical line
+            let next_row = row + 1;
+            if next_row < self.textarea.lines().len() {
+                let visual_x = col % width; // Try to maintain the same horizontal X position
+                let next_line_chars = self.textarea.lines()[next_row].chars().count();
+                let target_col = visual_x.min(next_line_chars); // Don't overshoot the next line
+                self.textarea.move_cursor(tui_textarea::CursorMove::Jump(
+                    next_row as u16,
+                    target_col as u16,
+                ));
+            }
+        }
+    }
+
+    fn _visual_move_up(&mut self) {
+        let (row, col) = self.textarea.cursor();
+        let width = self.editor_width.max(1) as usize;
+
+        // If moving up keeps us on the same logical line
+        if col >= width {
+            self.textarea.move_cursor(tui_textarea::CursorMove::Jump(
+                row as u16,
+                (col - width) as u16,
+            ));
+        } else if row > 0 {
+            // We are on the top chunk, jump to the previous logical line
+            let prev_row = row - 1;
+            let prev_line = self
+                .textarea
+                .lines()
+                .get(prev_row)
+                .cloned()
+                .unwrap_or_default();
+            let prev_char_count = prev_line.chars().count();
+
+            let visual_x = col % width;
+            // Calculate the start of the last visual chunk on the previous line
+            let last_chunk_start = (prev_char_count / width) * width;
+            let target_col = (last_chunk_start + visual_x).min(prev_char_count);
+
+            self.textarea.move_cursor(tui_textarea::CursorMove::Jump(
+                prev_row as u16,
+                target_col as u16,
+            ));
+        }
+    }
+
+    /// Simulates Ratatui's word wrapping to find exact cursor coordinates
+    fn calculate_cursor_position(line: &str, cursor_col: usize, width: usize) -> (usize, usize) {
+        if width == 0 {
+            return (0, 0);
+        }
+        let chars: Vec<char> = line.chars().collect();
+
+        let mut visual_y = 0;
+        let mut current_x = 0;
+        let mut i = 0;
+        // Tracks if we have placed actual characters (not just spaces) on the current line
+        let mut line_has_text = false;
+
+        while i < chars.len() {
+            let is_whitespace = chars[i].is_whitespace();
+            let mut chunk_width = 0;
+            let mut chunk_char_count = 0;
+            let mut j = i;
+
+            // Group by whitespace vs non-whitespace to mirror Ratatui's chunking
+            while j < chars.len() && chars[j].is_whitespace() == is_whitespace {
+                chunk_width += chars[j].width().unwrap_or(0); // Handles emojis/hidden chars
+                chunk_char_count += 1;
+                j += 1;
+            }
+
+            if !is_whitespace {
+                // --- WORD CHUNK ---
+                // Only wrap if the word exceeds the remaining width AND there is already
+                // text on this line. We DO NOT wrap if the line is just leading spaces!
+                if current_x + chunk_width > width && line_has_text {
+                    visual_y += 1;
+                    current_x = 0;
+                    let _ = line_has_text;
+                }
+
+                line_has_text = true;
+
+                for _ in 0..chunk_char_count {
+                    if i == cursor_col {
+                        return (visual_y, current_x);
+                    }
+                    let char_w = chars[i].width().unwrap_or(0);
+
+                    // Hard-break mid-word if it exceeds the boundary
+                    if current_x + char_w > width && current_x > 0 {
+                        visual_y += 1;
+                        current_x = 0;
+                        line_has_text = true; // We are still placing the word
+                    }
+                    current_x += char_w;
+                    i += 1;
+                }
+            } else {
+                // --- WHITESPACE CHUNK ---
+                for _ in 0..chunk_char_count {
+                    if i == cursor_col {
+                        return (visual_y, current_x);
+                    }
+                    let char_w = chars[i].width().unwrap_or(0);
+
+                    if current_x + char_w > width {
+                        // Space hits the boundary and is "eaten".
+                        if current_x > 0 {
+                            visual_y += 1;
+                            current_x = 0;
+                            line_has_text = false; // New line resets the text flag
+                        }
+                    } else {
+                        current_x += char_w;
+                    }
+                    i += 1;
+                }
+            }
+        }
+
+        // Return the exact position. (We intentionally do NOT auto-wrap here at the
+        // end of the string to ensure height calculations stay perfectly accurate).
+        (visual_y, current_x)
+    }
+
+    /// Calculates total visual lines a logical line will take up
+    fn calculate_visual_lines(line: &str, width: usize) -> usize {
+        let (y, _) = Self::calculate_cursor_position(line, usize::MAX, width);
+        y + 1
+    }
+
+    fn execute_lua_commands(&mut self) -> Result<(), EditorError> {
+        // Extract commands so we don't hold the borrow
+        let commands: Vec<EditorCommand> = self.command_queue.borrow_mut().drain(..).collect();
+
+        for cmd in commands {
+            match cmd {
+                EditorCommand::MoveToTop => {
+                    self.textarea.move_cursor(tui_textarea::CursorMove::Top);
+                    self.status = "Moved to top (Lua)".to_string();
+                }
+                EditorCommand::MoveToBottom => {
+                    self.textarea.move_cursor(tui_textarea::CursorMove::Bottom);
+                    self.status = "Moved to bottom (Lua)".to_string();
+                }
+                EditorCommand::Echo(msg) => {
+                    self.echo(&msg)?;
+                }
+                EditorCommand::Quit => {
+                    self.should_quit = true;
+                }
+                EditorCommand::StartSearch(search_type) => {
+                    // Map the string from Lua to your Rust SearchType enum
+                    match search_type.as_str() {
+                        "files" => self.start_search(SearchType::Files)?,
+                        "tags" => self.start_search(SearchType::Tags)?,
+                        "backlinks" => self.start_search(SearchType::Backlinks)?,
+                        "sql" => self.start_search(SearchType::CustomSql)?,
+                        _ => self.status = format!("Unknown search type: {}", search_type),
+                    }
+                }
+                // --- NEW EXECUTIONS ---
+                EditorCommand::YankLine => {
+                    let row = self.textarea.cursor().0;
+                    self.yanked = vec![self.textarea.lines()[row].clone()];
+                    self.status = "Yanked line (not undoable)".to_string();
+                }
+                EditorCommand::DeleteLine => {
+                    self.textarea.move_cursor(tui_textarea::CursorMove::Head);
+                    self.textarea.delete_line_by_end();
+                    self.status = "Deleted line".to_string();
+                }
+                EditorCommand::EnterFileTree => {
+                    if self.file_tree.is_empty() {
+                        self.file_tree = self.build_root();
+                    }
+                    self.update_visible();
+                    if !self.visible_items.is_empty() {
+                        self.tree_state.select(Some(0));
+                    }
+                    self.mode = Mode::FileTree;
+                    self.status = "Entered File Tree mode".to_string();
+                }
+                EditorCommand::ToggleImageFullScreen => {
+                    if self.current_image.is_some() {
+                        self.image_full_screen = !self.image_full_screen;
+                        self.status = if self.image_full_screen {
+                            "Image full screen".to_string()
+                        } else {
+                            "Image popup".to_string()
+                        };
+                        self.last_image_area = None;
+                    } else {
+                        self.status = "No image to toggle full screen".to_string();
+                    }
+                }
+                EditorCommand::StopAudio => {
+                    self.stop_audio();
+                }
+                EditorCommand::ToggleReadMode => {
+                    self.read_mode = !self.read_mode;
+                    self.status = if self.read_mode {
+                        "Read Mode (Wrapping ON)".to_string()
+                    } else {
+                        "Edit Mode (Wrapping OFF)".to_string()
+                    };
+                }
+                EditorCommand::OpenWikilink(path) => {
+                    self.open_wikilink_file(path)?;
+                }
+                EditorCommand::ProcessTemplate(template) => {
+                    self.process_template_command(&template)?;
+                }
+                EditorCommand::MoveUp => self.textarea.move_cursor(tui_textarea::CursorMove::Up),
+                EditorCommand::MoveDown => {
+                    self.textarea.move_cursor(tui_textarea::CursorMove::Down)
+                }
+                EditorCommand::MoveLeft => {
+                    self.textarea.move_cursor(tui_textarea::CursorMove::Back)
+                }
+                EditorCommand::MoveRight => {
+                    self.textarea.move_cursor(tui_textarea::CursorMove::Forward)
+                }
+                EditorCommand::MoveWordForward => self
+                    .textarea
+                    .move_cursor(tui_textarea::CursorMove::WordForward),
+                EditorCommand::MoveWordBack => self
+                    .textarea
+                    .move_cursor(tui_textarea::CursorMove::WordBack),
+                EditorCommand::MoveHead => {
+                    self.textarea.move_cursor(tui_textarea::CursorMove::Head)
+                }
+                EditorCommand::MoveEnd => self.textarea.move_cursor(tui_textarea::CursorMove::End),
+                EditorCommand::Undo => {
+                    if self.textarea.undo() {
+                        self.status = "Undone".to_string();
+                    }
+                }
+                EditorCommand::Redo => {
+                    if self.textarea.redo() {
+                        self.status = "Redone".to_string();
+                    }
+                }
+                EditorCommand::Save => {
+                    self.save_file()?;
+                }
+                EditorCommand::Paste => {
+                    self.textarea.move_cursor(tui_textarea::CursorMove::End);
+                    self.textarea.insert_char('\n');
+                    self.textarea.insert_str(&self.yanked.join("\n"));
+                }
+                EditorCommand::InsertLineBelow => {
+                    self.textarea.move_cursor(tui_textarea::CursorMove::End);
+                    self.textarea.insert_newline();
+                    self.mode = Mode::Insert;
+                    self.status = "Insert".to_string();
+                }
+                EditorCommand::EnterMode(mode_str) => match mode_str.as_str() {
+                    "insert" => {
+                        self.mode = Mode::Insert;
+                        self.status = "Insert".to_string();
+                    }
+                    "visual" => {
+                        self.visual_anchor = Some(self.textarea.cursor());
+                        self.mode = Mode::Visual;
+                        self.status = "Visual".to_string();
+                    }
+                    "visual_block" => {
+                        self.visual_anchor = Some(self.textarea.cursor());
+                        self.mode = Mode::VisualBlock;
+                        self.status = "Visual Block".to_string();
+                    }
+                    "command" => {
+                        self.prev_mode = Some(Mode::Normal);
+                        self.mode = Mode::Command;
+                        self.command.clear();
+                        self.status = "Command".to_string();
+                    }
+                    _ => self.status = format!("Unknown mode: {}", mode_str),
+                },
+                EditorCommand::NavigateBack => {
+                    self.navigate_back()?;
+                }
+                EditorCommand::NavigateForward => {
+                    self.navigate_forward()?;
+                }
+                EditorCommand::ChangeStatus(msg) => {
+                    if msg == "clearing_image_flag" {
+                        self.clear_image_state();
+                    } else {
+                        self.status = msg;
+                    }
+                }
+                EditorCommand::Cancel => {
+                    // Ensure we get out of the info view
+                    self.view = View::Editor;
+
+                    if self.image_full_screen {
+                        self.image_full_screen = false;
+                        self.status = "Image popup".to_string();
+                        self.last_image_area = None; // Force protocol regen
+                    } else if !self.key_sequence.is_empty() {
+                        self.key_sequence.clear();
+                        self.status = "Sequence cancelled".to_string();
+                    }
+                }
+                EditorCommand::FollowLink => {
+                    if self.view == View::Editor {
+                        let (current_row, current_col) = self.textarea.cursor();
+                        let line = self.textarea.lines()[current_row].clone();
+
+                        if let Some(wikilinkline) = self.extract_wikilink(&line, current_col) {
+                            if wikilinkline.ends_with(".mp3") {
+                                self.playaudio(usize::MAX, &self.music_path.clone())?;
+                            } else {
+                                self.follow_backlink(usize::MAX)?;
+                            }
+                        } else if let Some(tag) = self.extract_tag(&line, current_col) {
+                            self.load_tag_files(&tag)?;
+                            self.mode = Mode::TagFiles;
+                        }
+                    } else {
+                        self.view = View::Editor;
+                        self.status = "Normal".to_string();
+                    }
+                }
+                EditorCommand::InsertText(text) => {
+                    self.textarea.insert_str(&text);
+                }
+                EditorCommand::SetCursor(row, col) => {
+                    self.textarea
+                        .move_cursor(tui_textarea::CursorMove::Jump(row as u16, col as u16));
+                }
+                EditorCommand::SetLines(new_lines) => {
+                    // Replace the entire buffer
+                    let mut new_textarea = tui_textarea::TextArea::new(new_lines);
+
+                    // Re-apply your default styling macro so it doesn't break visuals
+                    set_textarea_delafult_style!(new_textarea);
+
+                    // Keep the cursor roughly where it was, or reset to 0,0
+                    let (r, c) = self.textarea.cursor();
+                    new_textarea.move_cursor(tui_textarea::CursorMove::Jump(r as u16, c as u16));
+
+                    self.textarea = new_textarea;
+                }
+
+                EditorCommand::SetSelection(anchor) => {
+                    self.visual_anchor = anchor;
+                }
+                EditorCommand::SetVirtualText(row, col, text, color) => {
+                    self.virtual_texts
+                        .entry(row)
+                        .or_default()
+                        .push((col, text, color));
+                }
+                EditorCommand::StartCustomSearch(provider, on_select) => {
+                    self.search_state.active = true;
+                    self.search_state.search_type = SearchType::CustomLua {
+                        provider,
+                        on_select,
+                    };
+                    self.search_state.query = String::new();
+                    self.search_state.results = Vec::new();
+                    self.search_state.list_state = ListState::default();
+                    self.mode = Mode::Search;
+                    self.view = View::Editor;
+                    self.status = "Custom Lua Search".to_string();
+                    self.key_sequence.clear();
+                    self.update_search_results()?;
+                }
+                EditorCommand::ShowImage(path, row) => {
+                    match self.resolve_image_path(&path) {
+                        Ok(full_path) => match image::ImageReader::open(&full_path) {
+                            Ok(reader) => match reader.decode() {
+                                Ok(dyn_img) => {
+                                    self.current_image = Some(dyn_img);
+                                    self.current_image_line = Some(row);
+                                    self.image_protocol = None; // Force protocol to regenerate
+                                    self.last_image_area = None;
+                                    self.status = format!("Lua rendered image: {}", path);
+                                }
+                                Err(e) => self.status = format!("Lua img decode err: {}", e),
+                            },
+                            Err(e) => self.status = format!("Lua img open err: {}", e),
+                        },
+                        Err(e) => self.status = format!("Lua img resolve err: {}", e),
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+    fn event_to_string(event: ratatui::crossterm::event::KeyEvent) -> String {
+        use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+        let mut s = String::new();
+
+        let has_ctrl = event.modifiers.contains(KeyModifiers::CONTROL);
+        let has_alt = event.modifiers.contains(KeyModifiers::ALT);
+
+        if has_ctrl {
+            s.push_str("<C-");
+        } else if has_alt {
+            s.push_str("<A-");
+        }
+
+        match event.code {
+            KeyCode::Char(c) => {
+                if !has_ctrl && !has_alt {
+                    return c.to_string();
+                }
+                s.push(c);
+            }
+            // Fixed: No brackets here, they are added at the bottom!
+            KeyCode::Enter => s.push_str("Enter"),
+            KeyCode::Esc => s.push_str("Esc"),
+            KeyCode::Up => s.push_str("Up"),
+            KeyCode::Down => s.push_str("Down"),
+            KeyCode::Left => s.push_str("Left"),
+            KeyCode::Right => s.push_str("Right"),
+            KeyCode::Home => s.push_str("Home"),
+            KeyCode::End => s.push_str("End"),
+            _ => s.push_str("Unknown"),
+        }
+
+        if has_ctrl || has_alt {
+            s.push('>');
+            return s;
+        }
+
+        // Wrap standalone special keys in <>
+        if !matches!(event.code, KeyCode::Char(_)) {
+            format!("<{}>", s)
+        } else {
+            s
+        }
+    }
+
+    fn get_expanded_line_info(&self, row: usize, original_col: usize) -> (String, usize) {
+        let line = self.textarea.lines().get(row).cloned().unwrap_or_default();
+        let trimmed_line = line.trim();
+
+        // 1. Check for vid blocks (completely replaces the text)
+        if trimmed_line.starts_with("```vid") {
+            let spans = Self::build_vid_virtual_text(
+                self.textarea.lines(),
+                row,
+                &self.yt_videos,
+                0,
+                true, // Always true for measurement to avoid offset stripping
+            );
+            let expanded_text = spans
+                .into_iter()
+                .map(|s| s.content.to_string())
+                .collect::<String>();
+            // Cap cursor to the end of the expanded text
+            let mapped_col = original_col.min(expanded_text.chars().count());
+            return (expanded_text, mapped_col);
+        }
+
+        // 2. Check for standard inline virtual text
+        let mut line_v_texts = self.virtual_texts.get(&row).cloned().unwrap_or_default();
+        if !line_v_texts.is_empty() {
+            line_v_texts.sort_by_key(|v| v.0);
+            let mut expanded = String::new();
+            let mut mapped_col = original_col;
+            let mut v_idx = 0;
+            let chars: Vec<char> = line.chars().collect();
+            let mut col_tracker = 0;
+
+            while col_tracker < chars.len() {
+                while v_idx < line_v_texts.len() && line_v_texts[v_idx].0 <= col_tracker {
+                    let v_text = &line_v_texts[v_idx].1;
+                    expanded.push_str(v_text);
+                    // Crucial fix: Only shift cursor if virtual text strictly BEFORE it (<).
+                    // If placed ON the cursor, we want cursor visually sitting BEFORE the overlay text.
+                    if line_v_texts[v_idx].0 < original_col {
+                        mapped_col += v_text.chars().count();
+                    }
+                    v_idx += 1;
+                }
+                expanded.push(chars[col_tracker]);
+                col_tracker += 1;
+            }
+            while v_idx < line_v_texts.len() {
+                let v_text = format!(" {}", line_v_texts[v_idx].1);
+                expanded.push_str(&v_text);
+                if line_v_texts[v_idx].0 < original_col {
+                    mapped_col += v_text.chars().count();
+                }
+                v_idx += 1;
+            }
+            return (expanded, mapped_col);
+        }
+
+        // 3. Normal text line
+        (line, original_col)
     }
 }
 

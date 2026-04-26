@@ -13,6 +13,7 @@ use std::process::Command as ProcessCommand;
 
 mod app;
 mod error;
+pub mod lua_api;
 
 use app::App;
 use error::EditorError;
@@ -20,7 +21,7 @@ use error::EditorError;
 fn main() -> Result<(), EditorError> {
     // Define CLI using clap
     let matches = Command::new("midetor")
-        .version("1.0.26")
+        .version("1.1.0")
         .about("A terminal-based vim like Markdown editor with Obsidian-like features")
         .arg(
             Arg::new("file_path")
@@ -47,14 +48,15 @@ fn main() -> Result<(), EditorError> {
     let music_path = matches
         .get_one::<String>("music_folder")
         .map(|s| s.to_string())
-        .or_else(|| env::var("musik_folder").ok()) //I know that is is not right but I did it like so years ago
+        .or_else(|| env::var("MUSIC_FOLDER").ok()) // Standardized
+        .or_else(|| env::var("musik_folder").ok()) // Fallback
         .unwrap_or_else(|| env::current_dir().unwrap().to_string_lossy().to_string());
 
-    // Determine base_dir: use provided, then OBSIDIAN_VAULT_MAIN_PATH, then current directory
     let base_dir = matches
         .get_one::<String>("base_dir")
         .map(|s| s.to_string())
-        .or_else(|| env::var("Obsidian_valt_main_path").ok())
+        .or_else(|| env::var("OBSIDIAN_VAULT_PATH").ok()) // Standardized
+        .or_else(|| env::var("Obsidian_valt_main_path").ok()) // Fallback
         .unwrap_or_else(|| env::current_dir().unwrap().to_string_lossy().to_string());
 
     // Ensure base_dir exists
