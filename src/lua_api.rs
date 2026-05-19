@@ -1,4 +1,4 @@
-use mlua::{Function, UserData, UserDataMethods};
+use mlua::{UserData, UserDataMethods};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -13,7 +13,7 @@ pub struct EditorContext {
     pub visual_anchor: Option<(usize, usize)>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum EditorCommand {
     // Basic Movement
     MoveToTop,
@@ -64,12 +64,21 @@ pub enum EditorCommand {
     SetVirtualText(usize, usize, String, String),
     ShowImage(String, usize),
     StartCustomSearch(String, String),
+
+    OpenTableBrowser,
+    OpenCustomTable {
+        columns: Vec<String>,
+        query: String,
+        formatter_key: Option<Rc<mlua::RegistryKey>>, // We use registry keys to safely pass Lua functions
+    },
+    SortTable(usize),
 }
 
 pub struct LuaEditorAPI {
     pub command_queue: Rc<RefCell<Vec<EditorCommand>>>,
     pub normal_keymaps: Rc<RefCell<HashMap<String, mlua::RegistryKey>>>,
     pub visual_keymaps: Rc<RefCell<HashMap<String, mlua::RegistryKey>>>,
+    pub table_keymaps: Rc<RefCell<HashMap<String, mlua::RegistryKey>>>,
     pub context: Rc<RefCell<EditorContext>>, // <-- NEW: The shared snapshot
 }
 
@@ -168,16 +177,6 @@ impl UserData for LuaEditorAPI {
             this.command_queue.borrow_mut().push(EditorCommand::Quit);
             Ok(())
         });
-        methods.add_method(
-            "map",
-            |lua, this, (mode, seq, func): (String, String, Function)| {
-                if mode == "n" {
-                    let key = lua.create_registry_value(func)?;
-                    this.normal_keymaps.borrow_mut().insert(seq, key);
-                }
-                Ok(())
-            },
-        );
 
         methods.add_method("follow_link", |_, this, ()| {
             this.command_queue
@@ -319,15 +318,22 @@ impl UserData for LuaEditorAPI {
                 .push(EditorCommand::SetCursor(row, col));
             Ok(())
         });
-        // Replaces the old "map" method to support "v" mappings
+
         methods.add_method(
             "map",
             |lua, this, (mode, seq, func): (String, String, mlua::Function)| {
                 let key = lua.create_registry_value(func)?;
-                if mode == "n" {
-                    this.normal_keymaps.borrow_mut().insert(seq, key);
-                } else if mode == "v" {
-                    this.visual_keymaps.borrow_mut().insert(seq, key);
+                match mode.as_str() {
+                    "n" => {
+                        this.normal_keymaps.borrow_mut().insert(seq, key);
+                    }
+                    "v" => {
+                        this.visual_keymaps.borrow_mut().insert(seq, key);
+                    }
+                    "t" => {
+                        this.table_keymaps.borrow_mut().insert(seq, key);
+                    } // NEW
+                    _ => {}
                 }
                 Ok(())
             },
@@ -388,6 +394,41 @@ impl UserData for LuaEditorAPI {
                 .push(EditorCommand::ChangeStatus(
                     "clearing_image_flag".to_string(),
                 ));
+            Ok(())
+        });
+        methods.add_method("open_table_browser", |_, this, ()| {
+            this.command_queue
+                .borrow_mut()
+                .push(EditorCommand::OpenTableBrowser);
+            Ok(())
+        });
+        // Open Custom Table
+        methods.add_method("open_table", |lua, this, config: mlua::Table| {
+            let columns: Vec<String> = config.get("columns")?;
+            let query: String = config.get("query")?;
+            let formatter: Option<mlua::Function> = config.get("formatter").ok();
+
+            let formatter_key = if let Some(f) = formatter {
+                Some(Rc::new(lua.create_registry_value(f)?)) // <-- Wrap in Rc::new()
+            } else {
+                None
+            };
+
+            this.command_queue
+                .borrow_mut()
+                .push(EditorCommand::OpenCustomTable {
+                    columns,
+                    query,
+                    formatter_key,
+                });
+            Ok(())
+        });
+
+        // Trigger Sorting
+        methods.add_method("sort_table", |_, this, col: usize| {
+            this.command_queue
+                .borrow_mut()
+                .push(EditorCommand::SortTable(col));
             Ok(())
         });
     }

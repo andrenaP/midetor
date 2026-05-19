@@ -34,6 +34,7 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::lua_api::{EditorCommand, EditorContext, LuaEditorAPI};
 use mlua::Lua;
+use ratatui::widgets::{Cell, Row, Table};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -74,6 +75,41 @@ pub enum Mode {
     BlockInsert,
     FileTree,
     FileTreeVisual,
+    TableBrowser,
+    TableBrowserFilter,
+}
+
+// State for the Table Browser
+pub struct TableState {
+    pub list_state: ratatui::widgets::TableState,
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<String>>, // The queried data
+    pub filter_query: String,   // e.g., "+rust -dead book_title"
+    pub include_tags: Vec<(Option<String>, String)>,
+    pub exclude_tags: Vec<(Option<String>, String)>,
+    pub search_text: String,
+    pub sql_query: String,
+    pub formatter_key: Option<Rc<mlua::RegistryKey>>,
+    pub sort_col: usize,
+    pub sort_asc: bool,
+}
+
+impl Default for TableState {
+    fn default() -> Self {
+        Self {
+            list_state: ratatui::widgets::TableState::default(),
+            columns: Vec::new(),
+            rows: Vec::new(),
+            filter_query: String::new(),
+            include_tags: Vec::new(),
+            exclude_tags: Vec::new(),
+            search_text: String::new(),
+            sql_query: String::new(),
+            formatter_key: None,
+            sort_col: 0,
+            sort_asc: true,
+        }
+    }
 }
 
 #[derive(PartialEq)]
@@ -197,6 +233,8 @@ pub struct App {
     visual_keymaps: Rc<RefCell<HashMap<String, mlua::RegistryKey>>>,
     shared_context: Rc<RefCell<EditorContext>>,
     virtual_texts: HashMap<usize, Vec<(usize, String, String)>>,
+    table_state: TableState,
+    table_keymaps: Rc<RefCell<HashMap<String, mlua::RegistryKey>>>,
 }
 
 pub struct CompletionState {
@@ -246,12 +284,14 @@ impl App {
         let command_queue = Rc::new(RefCell::new(Vec::new()));
         let normal_keymaps = Rc::new(RefCell::new(HashMap::new()));
         let visual_keymaps = Rc::new(RefCell::new(HashMap::new()));
+        let table_keymaps = Rc::new(RefCell::new(HashMap::new()));
         let shared_context = Rc::new(RefCell::new(EditorContext::default()));
 
         let api = LuaEditorAPI {
             command_queue: Rc::clone(&command_queue),
             normal_keymaps: Rc::clone(&normal_keymaps),
             visual_keymaps: Rc::clone(&visual_keymaps),
+            table_keymaps: Rc::clone(&table_keymaps),
             context: Rc::clone(&shared_context),
         };
 
@@ -368,6 +408,8 @@ impl App {
             visual_keymaps,
             shared_context,
             virtual_texts: HashMap::new(),
+            table_state: TableState::default(),
+            table_keymaps,
         };
         app.open_file(file_path.to_string(), file_id)?;
 
@@ -392,6 +434,11 @@ impl App {
             Mode::BlockInsert => {
                 self.textarea.insert_str(&text);
                 self.status = "Pasted (simple) in BlockInsert".to_string();
+            }
+            Mode::TableBrowserFilter => {
+                self.table_state.filter_query.push_str(&text);
+                self.parse_table_filter();
+                self.update_table_data()?;
             }
             _ => {}
         }
@@ -1817,6 +1864,158 @@ impl App {
         event: ratatui::crossterm::event::KeyEvent,
     ) -> Result<(), EditorError> {
         match self.mode {
+            Mode::TableBrowser => {
+                // 1. Check Lua Keymaps FIRST
+                let key_str = Self::event_to_string(event);
+                self.key_sequence.push_str(&key_str);
+                let sequence = self.key_sequence.clone();
+
+                let (has_exact, has_partial) = {
+                    let maps = self.table_keymaps.borrow();
+                    let exact = maps.contains_key(&sequence);
+                    let partial = maps
+                        .keys()
+                        .any(|k| k.starts_with(&sequence) && k != &sequence);
+                    (exact, partial)
+                };
+
+                if has_exact {
+                    let mut lua_error = None;
+                    {
+                        let maps = self.table_keymaps.borrow();
+                        let reg_key = maps.get(&sequence).unwrap();
+                        let func: mlua::Function = self.lua.registry_value(reg_key).unwrap();
+                        if let Err(e) = func.call::<_, ()>(()) {
+                            lua_error = Some(e.to_string());
+                        }
+                    }
+                    if let Some(err) = lua_error {
+                        self.status = format!("Lua table bind error: {}", err);
+                    }
+                    self.key_sequence.clear();
+                    self.execute_lua_commands()?;
+
+                    // Exit early! We handled it via Lua.
+                    return Ok(());
+                } else if has_partial {
+                    self.status = format!("Waiting: {}", sequence);
+
+                    // Exit early! Waiting for the next key in the sequence.
+                    return Ok(());
+                } else {
+                    // Not a Lua map, clear the sequence so it doesn't build up junk
+                    self.key_sequence.clear();
+                }
+
+                // 2. FALLBACK to hardcoded navigation logic
+                match event.code {
+                    ratatui::crossterm::event::KeyCode::Esc => {
+                        let mode = self.prev_mode.unwrap_or(Mode::Normal);
+                        self.mode = mode;
+                        self.status = "Normal".to_string();
+                        self.prev_mode = None;
+                    }
+                    ratatui::crossterm::event::KeyCode::Up
+                    | ratatui::crossterm::event::KeyCode::Char('k') => {
+                        let i = match self.table_state.list_state.selected() {
+                            Some(i) => {
+                                if i == 0 {
+                                    0
+                                } else {
+                                    i - 1
+                                }
+                            }
+                            None => 0,
+                        };
+                        self.table_state.list_state.select(Some(i));
+                    }
+                    ratatui::crossterm::event::KeyCode::Down
+                    | ratatui::crossterm::event::KeyCode::Char('j') => {
+                        let i = match self.table_state.list_state.selected() {
+                            Some(i) => {
+                                if i >= self.table_state.rows.len().saturating_sub(1) {
+                                    self.table_state.rows.len().saturating_sub(1)
+                                } else {
+                                    i + 1
+                                }
+                            }
+                            None => 0,
+                        };
+                        self.table_state.list_state.select(Some(i));
+                    }
+                    ratatui::crossterm::event::KeyCode::Char('/')
+                    | ratatui::crossterm::event::KeyCode::Char('f') => {
+                        self.mode = Mode::TableBrowserFilter;
+                        self.status =
+                            "Typing filter... (Press Enter to apply, Esc to cancel)".to_string();
+                    }
+                    ratatui::crossterm::event::KeyCode::Enter => {
+                        if let Some(selected) = self.table_state.list_state.selected() {
+                            if let Some(row) = self.table_state.rows.get(selected) {
+                                let file_name = row[0].clone();
+                                self.open_wikilink_file(file_name)?;
+                                self.mode = Mode::Normal;
+                            }
+                        }
+                    }
+
+                    // Sort Left
+                    ratatui::crossterm::event::KeyCode::Char('<')
+                    | ratatui::crossterm::event::KeyCode::Char(',') => {
+                        if self.table_state.sort_col > 0 {
+                            self.table_state.sort_col -= 1;
+                            self.update_table_data()?;
+                        }
+                    }
+                    // Sort Right
+                    ratatui::crossterm::event::KeyCode::Char('>')
+                    | ratatui::crossterm::event::KeyCode::Char('.') => {
+                        if self.table_state.sort_col
+                            < self.table_state.columns.len().saturating_sub(1)
+                        {
+                            self.table_state.sort_col += 1;
+                            self.update_table_data()?;
+                        }
+                    }
+                    // Toggle Sort Ascending/Descending
+                    ratatui::crossterm::event::KeyCode::Char('s') => {
+                        self.table_state.sort_asc = !self.table_state.sort_asc;
+                        self.update_table_data()?;
+                    }
+                    _ => {}
+                }
+            }
+            Mode::TableBrowserFilter => match event.code {
+                ratatui::crossterm::event::KeyCode::Esc => {
+                    // Cancel typing, go back to table navigation
+                    self.mode = Mode::TableBrowser;
+                    self.status = "Database Browser Mode".to_string();
+                }
+                ratatui::crossterm::event::KeyCode::Enter => {
+                    // Apply filter and return to navigation mode
+                    self.parse_table_filter();
+                    self.update_table_data()?;
+                    self.mode = Mode::TableBrowser;
+                    self.status = "Filter applied".to_string();
+                }
+                ratatui::crossterm::event::KeyCode::Char(c) => {
+                    // Type characters into the filter
+                    self.table_state.filter_query.push(c);
+
+                    // Optional: Live search! Update table as you type
+                    self.parse_table_filter();
+                    self.update_table_data()?;
+                }
+                ratatui::crossterm::event::KeyCode::Backspace => {
+                    // Delete characters
+                    self.table_state.filter_query.pop();
+
+                    // Optional: Live search! Update table as you delete
+                    self.parse_table_filter();
+                    self.update_table_data()?;
+                }
+                _ => {}
+            },
             Mode::Normal => {
                 // 1. Convert the raw key event to a string (e.g., "j", "<C-s>", "<Esc>")
                 let key_str = Self::event_to_string(event);
@@ -2708,6 +2907,70 @@ impl App {
             .split(f.area());
 
         match self.mode {
+            Mode::TableBrowser | Mode::TableBrowserFilter => {
+                let table_chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(5), Constraint::Length(3)])
+                    .split(chunks[0]);
+
+                // Render Table
+                let header_cells = self.table_state.columns.iter().enumerate().map(|(i, h)| {
+                    let mut title = h.clone();
+                    if i == self.table_state.sort_col {
+                        title.push_str(if self.table_state.sort_asc {
+                            " ▲"
+                        } else {
+                            " ▼"
+                        });
+                    }
+                    Cell::from(title).style(Style::default().fg(Color::LightBlue))
+                });
+                let header = Row::new(header_cells).bottom_margin(1);
+
+                let rows: Vec<Row> = self
+                    .table_state
+                    .rows
+                    .iter()
+                    .map(|data_row| {
+                        let cells = data_row.iter().map(|c| Cell::from(c.as_str()));
+                        Row::new(cells)
+                    })
+                    .collect();
+
+                let widths = [
+                    Constraint::Percentage(30), // File
+                    Constraint::Percentage(40), // Tags
+                    Constraint::Percentage(10), // Date
+                    Constraint::Percentage(10), // Chapters
+                    Constraint::Percentage(10), // Done
+                ];
+
+                let t = Table::new(rows, widths)
+                    .header(header)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title("Database Browser"),
+                    )
+                    .row_highlight_style(Style::default().bg(Color::White).fg(Color::Black));
+                f.render_stateful_widget(t, table_chunks[0], &mut self.table_state.list_state);
+
+                // Render Filter Bar
+                let filter_block =
+                    Paragraph::new(format!("Filter: {}", self.table_state.filter_query))
+                        .block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .title("Search (+include -exclude text)"),
+                        )
+                        .style(if self.mode == Mode::TableBrowserFilter {
+                            Style::default().fg(Color::Yellow)
+                        } else {
+                            Style::default().fg(Color::White)
+                        });
+
+                f.render_widget(filter_block, table_chunks[1]);
+            }
             Mode::Search => {
                 // If CustomSql is active, we don't display results until Enter is hit.
                 if self.search_state.search_type == SearchType::CustomSql
@@ -4133,6 +4396,56 @@ impl App {
                         Err(e) => self.status = format!("Lua img resolve err: {}", e),
                     }
                 }
+                EditorCommand::OpenTableBrowser => {
+                    // Update the table data right before switching modes to ensure it's fresh
+                    if let Err(e) = self.update_table_data() {
+                        self.status = format!("Failed to load table data: {}", e);
+                    } else {
+                        // Remember the previous mode so we can return to it later if needed
+                        self.prev_mode = Some(self.mode);
+
+                        // Switch to the Table Browser mode
+                        self.mode = Mode::TableBrowser;
+                        self.status = "Database Browser Mode".to_string();
+                    }
+                }
+                EditorCommand::OpenCustomTable {
+                    columns,
+                    query,
+                    formatter_key,
+                } => {
+                    // Only reset the sorting state if opening a completely new table query
+                    if self.table_state.sql_query != query {
+                        self.table_state.sort_col = 0;
+                        self.table_state.sort_asc = true;
+                    } else {
+                        // Just in case columns dynamically changed, keep it within bounds
+                        if self.table_state.sort_col >= columns.len() {
+                            self.table_state.sort_col = 0;
+                        }
+                    }
+
+                    self.table_state.columns = columns;
+                    self.table_state.sql_query = query;
+                    self.table_state.formatter_key = formatter_key;
+
+                    if let Err(e) = self.update_table_data() {
+                        self.status = format!("Lua Table Error: {}", e);
+                    } else {
+                        self.prev_mode = Some(self.mode);
+                        self.mode = Mode::TableBrowser;
+                        self.status = "Table Browser".to_string();
+                    }
+                }
+                EditorCommand::SortTable(col) => {
+                    if self.table_state.sort_col == col {
+                        self.table_state.sort_asc = !self.table_state.sort_asc;
+                    } else {
+                        self.table_state.sort_col = col;
+                        self.table_state.sort_asc = true;
+                    }
+                    let _ = self.update_table_data();
+                }
                 _ => {}
             }
         }
@@ -4242,6 +4555,247 @@ impl App {
 
         // 3. Normal text line
         (line, original_col)
+    }
+    pub fn update_table_data(&mut self) -> Result<(), EditorError> {
+        if self.table_state.sql_query.is_empty() {
+            return Ok(());
+        }
+
+        // 1. Run the Raw SQL Query EXACTLY as provided by the Lua config.
+        let mut stmt = self.db.prepare(&self.table_state.sql_query)?;
+        let col_names: Vec<String> = stmt.column_names().into_iter().map(String::from).collect();
+        let column_count = stmt.column_count();
+
+        let mut raw_rows = Vec::new();
+        let mut rows_iter = stmt.query([])?; // No parameters needed anymore!
+
+        while let Some(row) = rows_iter.next()? {
+            let mut row_data = Vec::new();
+            for i in 0..column_count {
+                let val: String = match row.get_ref(i)? {
+                    rusqlite::types::ValueRef::Null => String::new(),
+                    rusqlite::types::ValueRef::Integer(num) => num.to_string(),
+                    rusqlite::types::ValueRef::Real(num) => num.to_string(),
+                    rusqlite::types::ValueRef::Text(t) => String::from_utf8_lossy(t).to_string(),
+                    rusqlite::types::ValueRef::Blob(b) => String::from_utf8_lossy(b).to_string(),
+                };
+                row_data.push(val);
+            }
+            raw_rows.push(row_data);
+        }
+
+        // 2. PIPE THROUGH LUA FORMATTER
+        let mut formatted_rows = Vec::new();
+        if let Some(ref reg_key) = self.table_state.formatter_key {
+            if let Ok(func) = self.lua.registry_value::<mlua::Function>(&**reg_key) {
+                for row_data in raw_rows {
+                    if let Ok(modified_row) = func.call::<_, Vec<String>>(row_data.clone()) {
+                        formatted_rows.push(modified_row);
+                    } else {
+                        formatted_rows.push(row_data);
+                    }
+                }
+            }
+        } else {
+            formatted_rows = raw_rows;
+        }
+
+        // 3. APPLY IN-MEMORY FILTERS
+        let search_text_lower = self.table_state.search_text.to_lowercase();
+
+        let mut filtered_rows: Vec<Vec<String>> = formatted_rows
+            .into_iter()
+            .filter(|row| {
+                // A. Search Text Filter (Any column contains the literal text, spacing included)
+                if !search_text_lower.is_empty() {
+                    let matches_search = row
+                        .iter()
+                        .any(|cell| cell.to_lowercase().contains(&search_text_lower));
+                    if !matches_search {
+                        return false;
+                    }
+                }
+
+                // Helper to get column index from Lua header name OR SQL alias
+                let get_col_idx = |name: &str| -> Option<usize> {
+                    self.table_state
+                        .columns
+                        .iter()
+                        .position(|c| c.to_lowercase() == name.to_lowercase())
+                        .or_else(|| {
+                            col_names
+                                .iter()
+                                .position(|c| c.to_lowercase() == name.to_lowercase())
+                        })
+                };
+
+                // Helper: Splits by comma and forces an EXACT match
+                let exact_match = |cell: &str, target: &str| -> bool {
+                    cell.split(',')
+                        .map(|s| s.trim().to_lowercase())
+                        .any(|s| s == target.to_lowercase())
+                };
+
+                // B. Include Tags (+)
+                for (col_opt, tag) in &self.table_state.include_tags {
+                    if let Some(col_name) = col_opt {
+                        if let Some(idx) = get_col_idx(col_name) {
+                            if let Some(cell) = row.get(idx) {
+                                if !exact_match(cell, tag) {
+                                    return false;
+                                }
+                            } else {
+                                return false;
+                            }
+                        } else {
+                            return false;
+                        } // ADDED: Fail if column missing
+                    } else {
+                        let has_tag = row.iter().any(|cell| exact_match(cell, tag));
+                        if !has_tag {
+                            return false;
+                        }
+                    }
+                }
+
+                // C. Exclude Tags (-)
+                for (col_opt, tag) in &self.table_state.exclude_tags {
+                    if let Some(col_name) = col_opt {
+                        if let Some(idx) = get_col_idx(col_name) {
+                            if let Some(cell) = row.get(idx) {
+                                if exact_match(cell, tag) {
+                                    return false;
+                                }
+                            }
+                        } else {
+                            return false;
+                        } // ADDED: Fail if column missing
+                    } else {
+                        let has_tag = row.iter().any(|cell| exact_match(cell, tag));
+                        if has_tag {
+                            return false;
+                        }
+                    }
+                }
+
+                true // Passed all filters!
+            })
+            .collect();
+
+        // 4. SORTING
+        let sort_col = self.table_state.sort_col;
+        let sort_asc = self.table_state.sort_asc;
+
+        filtered_rows.sort_by(|a, b| {
+            let val_a = a.get(sort_col).unwrap_or(&String::new()).to_lowercase();
+            let val_b = b.get(sort_col).unwrap_or(&String::new()).to_lowercase();
+
+            if let (Ok(num_a), Ok(num_b)) = (val_a.parse::<f64>(), val_b.parse::<f64>()) {
+                if sort_asc {
+                    num_a.partial_cmp(&num_b).unwrap()
+                } else {
+                    num_b.partial_cmp(&num_a).unwrap()
+                }
+            } else {
+                if sort_asc {
+                    val_a.cmp(&val_b)
+                } else {
+                    val_b.cmp(&val_a)
+                }
+            }
+        });
+
+        self.table_state.rows = filtered_rows;
+
+        // 5. UPDATE SELECTION
+        if !self.table_state.rows.is_empty() {
+            let current = self.table_state.list_state.selected().unwrap_or(0);
+            self.table_state
+                .list_state
+                .select(Some(current.min(self.table_state.rows.len() - 1)));
+        } else {
+            self.table_state.list_state.select(None);
+        }
+
+        Ok(())
+    }
+
+    pub fn parse_table_filter(&mut self) {
+        self.table_state.include_tags.clear();
+        self.table_state.exclude_tags.clear();
+
+        let mut search_terms = Vec::new();
+        let mut tokens = Vec::new();
+        let mut current_token = String::new();
+        let mut in_quotes = false;
+        let mut quote_char = '\0';
+
+        // 1. Smart Tokenizer: Respects quotes, allowing spaces inside them.
+        for c in self.table_state.filter_query.chars() {
+            if (c == '"' || c == '\'') && (!in_quotes || c == quote_char) {
+                in_quotes = !in_quotes;
+                if in_quotes {
+                    quote_char = c;
+                }
+                continue; // Skip appending the quote mark itself
+            }
+
+            // Split by space ONLY if we are not inside a quoted string
+            if c == ' ' && !in_quotes {
+                if !current_token.is_empty() {
+                    tokens.push(current_token.clone());
+                    current_token.clear();
+                }
+            } else {
+                current_token.push(c);
+            }
+        }
+
+        // Push the final token if there is one
+        if !current_token.is_empty() {
+            tokens.push(current_token);
+        }
+
+        // Helper to verify if the prefix is an actual column
+        let is_column = |name: &str| -> bool {
+            self.table_state
+                .columns
+                .iter()
+                .any(|c| c.to_lowercase() == name.to_lowercase())
+        };
+
+        // 2. Parse the safe tokens
+        for part in tokens {
+            if part.starts_with('+') && part.len() > 1 {
+                self.table_state
+                    .include_tags
+                    .push((None, part[1..].to_string()));
+            } else if part.starts_with('-') && part.len() > 1 {
+                self.table_state
+                    .exclude_tags
+                    .push((None, part[1..].to_string()));
+            } else if let Some(idx) = part.find('+') {
+                if idx > 0 && idx < part.len() - 1 && is_column(&part[..idx]) {
+                    self.table_state
+                        .include_tags
+                        .push((Some(part[..idx].to_string()), part[idx + 1..].to_string()));
+                } else {
+                    search_terms.push(part);
+                }
+            } else if let Some(idx) = part.find('-') {
+                if idx > 0 && idx < part.len() - 1 && is_column(&part[..idx]) {
+                    self.table_state
+                        .exclude_tags
+                        .push((Some(part[..idx].to_string()), part[idx + 1..].to_string()));
+                } else {
+                    search_terms.push(part);
+                }
+            } else {
+                search_terms.push(part);
+            }
+        }
+
+        self.table_state.search_text = search_terms.join(" ");
     }
 }
 

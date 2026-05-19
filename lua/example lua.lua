@@ -408,3 +408,36 @@ end)
 -- (Optional) Keep your other specific template maps if you still want fast-tracks
 editor:map("n", "\\nm", function() editor:process_template("Templates/meeting.md") end)
 editor:map("n", "\\ig", function() editor:process_template("Templates/img-gallery.md") end)
+
+
+
+-- Map sorting keys to the Table mode!
+editor:map("t", "1", function() editor:sort_table(0) end)
+editor:map("t", "2", function() editor:sort_table(1) end)
+editor:map("t", "3", function() editor:sort_table(2) end)
+editor:map("t", "4", function() editor:sort_table(3) end)
+editor:map("t", "5", function() editor:sort_table(4) end)
+
+editor:map("n", "<C-b>", function()
+    editor:open_table({
+        columns = { "File", "Tags", "Backlinks" },
+        query = [[
+            SELECT f.file_name as file,
+                   GROUP_CONCAT(DISTINCT t.tag) as tags,
+                   GROUP_CONCAT(DISTINCT fb.file_name) as backlinks
+            FROM files f
+            LEFT JOIN file_tags ft ON f.id = ft.file_id
+            LEFT JOIN tags t ON ft.tag_id = t.id
+            LEFT JOIN backlinks b ON f.id = b.file_id
+            LEFT JOIN files fb ON fb.id = b.backlink_id
+            GROUP BY f.id
+        ]],
+        formatter = function(row)
+            local file = row[1] or ""
+            local tags = row[2] or ""
+            local backlinks = row[3] or ""
+
+            return { file, tags, backlinks }
+        end
+    })
+end)

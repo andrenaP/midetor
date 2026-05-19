@@ -60,7 +60,7 @@ function editor:set_mode(mode) end
 ---@param msg string
 function editor:set_status(msg) end
 
----@param mode "n"|"v"
+---@param mode "n"|"v"|"t"
 ---@param seq string
 ---@param func function
 function editor:map(mode, seq, func) end
@@ -107,3 +107,9 @@ function editor:start_custom_search(provider, on_select) end
 ---@param path string
 ---@param row number
 function editor:show_image(path, row) end
+
+function editor:open_table_browser() end
+
+function editor:sort_table(col) end
+
+function editor:open_table(columns, query, formatter) end
