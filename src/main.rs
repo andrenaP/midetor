@@ -1,4 +1,4 @@
-use clap::{Arg, Command};
+use clap::{Arg, command};
 use crossterm::{
     cursor::Show,
     event::{self, Event},
@@ -20,9 +20,7 @@ use error::EditorError;
 
 fn main() -> Result<(), EditorError> {
     // Define CLI using clap
-    let matches = Command::new("midetor")
-        .version("1.2.0")
-        .about("A terminal-based vim like Markdown editor with Obsidian-like features")
+    let matches = command!()
         .arg(
             Arg::new("file_path")
                 .help("Path to the Markdown file to edit")

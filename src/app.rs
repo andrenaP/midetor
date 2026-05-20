@@ -37,6 +37,7 @@ use mlua::Lua;
 use ratatui::widgets::{Cell, Row, Table};
 use std::cell::RefCell;
 use std::rc::Rc;
+use unicode_width::UnicodeWidthStr;
 
 macro_rules! set_textarea_delafult_style {
     ($textarea:expr) => {
@@ -2908,11 +2909,6 @@ impl App {
 
         match self.mode {
             Mode::TableBrowser | Mode::TableBrowserFilter => {
-                let table_chunks = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Min(5), Constraint::Length(3)])
-                    .split(chunks[0]);
-
                 // Render Table
                 let header_cells = self.table_state.columns.iter().enumerate().map(|(i, h)| {
                     let mut title = h.clone();
@@ -2937,13 +2933,65 @@ impl App {
                     })
                     .collect();
 
-                let widths = [
-                    Constraint::Percentage(30), // File
-                    Constraint::Percentage(40), // Tags
-                    Constraint::Percentage(10), // Date
-                    Constraint::Percentage(10), // Chapters
-                    Constraint::Percentage(10), // Done
-                ];
+                let table_chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(5), Constraint::Length(3)])
+                    .split(chunks[0]);
+
+                // 1. Calculate required widths for each column (Header + padding for sort arrows)
+                let mut col_req_widths: Vec<u16> = self
+                    .table_state
+                    .columns
+                    .iter()
+                    .map(|h| (h.width() + 2) as u16)
+                    .collect();
+
+                // 2. Check all rows to find the absolute maximum required width per column
+                for row in &self.table_state.rows {
+                    for (i, cell) in row.iter().enumerate() {
+                        if i < col_req_widths.len() {
+                            col_req_widths[i] = col_req_widths[i].max(cell.width() as u16);
+                        }
+                    }
+                }
+
+                // 3. Smart Space Allocation
+                // Account for table borders (2) and default column spacing between cells (cols - 1)
+                let total_spacing = (col_req_widths.len() as u16).saturating_sub(1);
+                let available_width = table_chunks[0].width.saturating_sub(2 + total_spacing);
+
+                let mut allocated_widths = vec![0; col_req_widths.len()];
+                let mut col_indices: Vec<usize> = (0..col_req_widths.len()).collect();
+
+                // Sort indices by required width (smallest columns get allocated space first)
+                col_indices.sort_by_key(|&i| col_req_widths[i]);
+
+                let mut remaining_width = available_width;
+                let mut remaining_cols = col_req_widths.len() as u16;
+
+                for &i in &col_indices {
+                    let req = col_req_widths[i];
+                    let fair_share = remaining_width / remaining_cols.max(1);
+
+                    if req <= fair_share {
+                        // The column fits comfortably within its fair share.
+                        // Give it exactly what it needs and save the rest for the bigger columns.
+                        allocated_widths[i] = req;
+                        remaining_width = remaining_width.saturating_sub(req);
+                    } else {
+                        // The column is too big for its fair share. Give it the maximum fair share
+                        // available so it uses all remaining freed up space.
+                        allocated_widths[i] = fair_share;
+                        remaining_width = remaining_width.saturating_sub(fair_share);
+                    }
+                    remaining_cols = remaining_cols.saturating_sub(1);
+                }
+
+                // 4. Convert to Exact Length constraints
+                let widths: Vec<Constraint> = allocated_widths
+                    .into_iter()
+                    .map(Constraint::Length)
+                    .collect();
 
                 let t = Table::new(rows, widths)
                     .header(header)
