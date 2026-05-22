@@ -152,3 +152,73 @@ editor:map("n", "<C-b>", function()
         end
     })
 end)
+
+
+
+local function open_dir_table(dir_path)
+    local cmd = string.format('ls -lh --time-style=+"%%Y-%%m-%%d" "%s"', dir_path)
+    local handle = io.popen(cmd)
+
+    if not handle then
+        editor:echo("Failed to execute ls")
+        return
+    end
+
+    local result = handle:read("*a")
+    handle:close()
+
+    local formatted_data = {}
+
+    if dir_path ~= "." and dir_path ~= "" then
+        local parent = dir_path:match("^(.*)/[^/]+$") or "."
+        -- Changed 'true' to '"true"' (String)
+        table.insert(formatted_data, { "📁 ..", "", "", "drwxr-xr-x", "", "..", parent, "true" })
+    end
+
+    for line in result:gmatch("[^\r\n]+") do
+        if not line:match("^total") then
+            local perms, links, owner, group, size, date_str, name =
+                line:match("^(%S+)%s+(%S+)%s+(%S+)%s+(%S+)%s+(%S+)%s+(%S+)%s+(.+)$")
+
+            if name then
+                local is_dir = (perms:sub(1, 1) == "d")
+                local icon = is_dir and "📁" or "📄"
+                local display_name = icon .. " " .. name
+
+                local full_path = (dir_path == ".") and name or (dir_path .. "/" .. name)
+
+                -- Convert the boolean to a string before inserting
+                local dir_flag = is_dir and "true" or "false"
+
+                table.insert(formatted_data, {
+                    display_name, size, date_str, perms, owner,
+                    name, full_path, dir_flag
+                })
+            end
+        end
+    end
+
+    editor:open_table({
+        columns = { "Name", "Size", "Date", "Permissions", "Owner" },
+        data = formatted_data,
+        on_submit = function(row)
+            local full_path = row[7]
+            -- Evaluate the string back into a boolean
+            local is_dir = (row[8] == "true")
+
+            if is_dir then
+                open_dir_table(full_path)
+            else
+                if string.find(full_path, ".md") then
+                    editor:open_file(full_path)
+                else
+                    editor:echo("Can't open: " .. full_path)
+                end
+            end
+        end
+    })
+end
+
+editor:map("n", "<C-l>", function()
+    open_dir_table(".")
+end)

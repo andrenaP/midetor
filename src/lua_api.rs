@@ -1,4 +1,5 @@
 use mlua::{UserData, UserDataMethods};
+use rusqlite::Connection;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -68,8 +69,8 @@ pub enum EditorCommand {
     OpenTableBrowser,
     OpenCustomTable {
         columns: Vec<String>,
-        query: String,
-        formatter_key: Option<Rc<mlua::RegistryKey>>, // We use registry keys to safely pass Lua functions
+        data: Vec<Vec<String>>, // Takes raw data directly instead of query/formatter
+        on_submit_key: Option<Rc<mlua::RegistryKey>>,
     },
     SortTable(usize),
 }
@@ -79,7 +80,8 @@ pub struct LuaEditorAPI {
     pub normal_keymaps: Rc<RefCell<HashMap<String, mlua::RegistryKey>>>,
     pub visual_keymaps: Rc<RefCell<HashMap<String, mlua::RegistryKey>>>,
     pub table_keymaps: Rc<RefCell<HashMap<String, mlua::RegistryKey>>>,
-    pub context: Rc<RefCell<EditorContext>>, // <-- NEW: The shared snapshot
+    pub context: Rc<RefCell<EditorContext>>,
+    pub db: Rc<RefCell<Connection>>,
 }
 
 impl UserData for LuaEditorAPI {
@@ -402,14 +404,65 @@ impl UserData for LuaEditorAPI {
                 .push(EditorCommand::OpenTableBrowser);
             Ok(())
         });
-        // Open Custom Table
+
+        // Trigger Sorting
+        methods.add_method("sort_table", |_, this, col: usize| {
+            this.command_queue
+                .borrow_mut()
+                .push(EditorCommand::SortTable(col));
+            Ok(())
+        });
+
+        // Execute Raw SQL Query directly returning (columns, row_data)
+        methods.add_method("query_db", |_, this, query: String| {
+            let db = this.db.borrow();
+            let mut stmt = db
+                .prepare(&query)
+                .map_err(|e| mlua::Error::RuntimeError(format!("SQL Prepare Error: {}", e)))?;
+
+            let column_count = stmt.column_count();
+            let col_names: Vec<String> =
+                stmt.column_names().into_iter().map(String::from).collect();
+
+            let mut raw_rows = Vec::new();
+            let mut rows_iter = stmt
+                .query([])
+                .map_err(|e| mlua::Error::RuntimeError(e.to_string()))?;
+
+            while let Some(row) = rows_iter
+                .next()
+                .map_err(|e| mlua::Error::RuntimeError(e.to_string()))?
+            {
+                let mut row_data = Vec::new();
+                for i in 0..column_count {
+                    let val: String =
+                        match row.get_ref(i).unwrap_or(rusqlite::types::ValueRef::Null) {
+                            rusqlite::types::ValueRef::Null => String::new(),
+                            rusqlite::types::ValueRef::Integer(num) => num.to_string(),
+                            rusqlite::types::ValueRef::Real(num) => num.to_string(),
+                            rusqlite::types::ValueRef::Text(t) => {
+                                String::from_utf8_lossy(t).to_string()
+                            }
+                            rusqlite::types::ValueRef::Blob(b) => {
+                                String::from_utf8_lossy(b).to_string()
+                            }
+                        };
+                    row_data.push(val);
+                }
+                raw_rows.push(row_data);
+            }
+            Ok((col_names, raw_rows))
+        });
+
+        // Simplified table opening - receives data pre-processed
+        // Inside `add_methods` for `LuaEditorAPI`:
         methods.add_method("open_table", |lua, this, config: mlua::Table| {
             let columns: Vec<String> = config.get("columns")?;
-            let query: String = config.get("query")?;
-            let formatter: Option<mlua::Function> = config.get("formatter").ok();
+            let data: Vec<Vec<String>> = config.get("data")?;
+            let on_submit: Option<mlua::Function> = config.get("on_submit").ok();
 
-            let formatter_key = if let Some(f) = formatter {
-                Some(Rc::new(lua.create_registry_value(f)?)) // <-- Wrap in Rc::new()
+            let on_submit_key = if let Some(f) = on_submit {
+                Some(Rc::new(lua.create_registry_value(f)?))
             } else {
                 None
             };
@@ -418,17 +471,9 @@ impl UserData for LuaEditorAPI {
                 .borrow_mut()
                 .push(EditorCommand::OpenCustomTable {
                     columns,
-                    query,
-                    formatter_key,
+                    data,
+                    on_submit_key,
                 });
-            Ok(())
-        });
-
-        // Trigger Sorting
-        methods.add_method("sort_table", |_, this, col: usize| {
-            this.command_queue
-                .borrow_mut()
-                .push(EditorCommand::SortTable(col));
             Ok(())
         });
     }

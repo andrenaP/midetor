@@ -84,15 +84,15 @@ pub enum Mode {
 pub struct TableState {
     pub list_state: ratatui::widgets::TableState,
     pub columns: Vec<String>,
-    pub rows: Vec<Vec<String>>, // The queried data
-    pub filter_query: String,   // e.g., "+rust -dead book_title"
+    pub raw_data: Vec<Vec<String>>, // Stores the unfiltered base data
+    pub rows: Vec<Vec<String>>,     // Filtered and sorted data
+    pub filter_query: String,
     pub include_tags: Vec<(Option<String>, String)>,
     pub exclude_tags: Vec<(Option<String>, String)>,
     pub search_text: String,
-    pub sql_query: String,
-    pub formatter_key: Option<Rc<mlua::RegistryKey>>,
     pub sort_col: usize,
     pub sort_asc: bool,
+    pub on_submit_key: Option<Rc<mlua::RegistryKey>>,
 }
 
 impl Default for TableState {
@@ -100,15 +100,15 @@ impl Default for TableState {
         Self {
             list_state: ratatui::widgets::TableState::default(),
             columns: Vec::new(),
+            raw_data: Vec::new(),
             rows: Vec::new(),
             filter_query: String::new(),
             include_tags: Vec::new(),
             exclude_tags: Vec::new(),
             search_text: String::new(),
-            sql_query: String::new(),
-            formatter_key: None,
             sort_col: 0,
             sort_asc: true,
+            on_submit_key: None,
         }
     }
 }
@@ -174,7 +174,7 @@ pub enum BufferMode {
 }
 
 pub struct App {
-    db: Connection,
+    db: Rc<RefCell<Connection>>,
     file_path: String,
     base_dir: String,
     music_path: String,
@@ -258,15 +258,18 @@ pub struct SearchState {
 impl App {
     pub fn new(file_path: &str, base_dir: &str, music_path: &str) -> Result<Self, EditorError> {
         let db_path = Path::new(base_dir).join("markdown_data.db");
-        let db = Connection::open(db_path)?;
-        db.execute("PRAGMA foreign_keys = ON;", [])?;
+        let raw_db = Connection::open(db_path)?;
+        raw_db.execute("PRAGMA foreign_keys = ON;", [])?;
+        let db = Rc::new(RefCell::new(raw_db));
+
+        db.borrow().execute("PRAGMA foreign_keys = ON;", [])?;
 
         let content = fs::read_to_string(file_path).unwrap_or_default();
         let mut textarea = TextArea::new(content.lines().map(|s| s.to_string()).collect());
         set_textarea_delafult_style!(textarea);
-        let file_id = App::get_file_id(&db, file_path)?;
-        let tags = App::load_tags(&db, file_id)?;
-        let backlinks = App::load_backlinks(&db, file_id)?;
+        let file_id = App::get_file_id(&db.borrow(), file_path)?;
+        let tags = App::load_tags(&db.borrow(), file_id)?;
+        let backlinks = App::load_backlinks(&db.borrow(), file_id)?;
 
         // Initialize syntax highlighting
         let syntax_set = SyntaxSet::load_defaults_newlines();
@@ -294,6 +297,7 @@ impl App {
             visual_keymaps: Rc::clone(&visual_keymaps),
             table_keymaps: Rc::clone(&table_keymaps),
             context: Rc::clone(&shared_context),
+            db: Rc::clone(&db), // Share DB connection with Lua
         };
 
         // 2. Expose the API to Lua under the global variable `editor`
@@ -567,8 +571,8 @@ impl App {
             list_state: ListState::default(),
             trigger_start: (0, 0),
         };
-        self.tags = App::load_tags(&self.db, self.file_id)?;
-        self.backlinks = App::load_backlinks(&self.db, self.file_id)?;
+        self.tags = App::load_tags(&self.db.borrow(), self.file_id)?;
+        self.backlinks = App::load_backlinks(&self.db.borrow(), self.file_id)?;
         self.view = View::Editor;
         self.mode = Mode::Normal;
         self.status = "Normal".to_string();
@@ -579,7 +583,7 @@ impl App {
         self.yt_videos.clear();
         let query = "SELECT json_extract(metadata, '$.ytVideos') FROM files WHERE path = ?1";
 
-        if let Ok(Some(json_str)) = self.db.query_row(query, params![path], |row| {
+        if let Ok(Some(json_str)) = self.db.borrow().query_row(query, params![path], |row| {
             row.get::<usize, Option<String>>(0)
         }) {
             // Parse as an array of JSON objects instead of tuples
@@ -630,9 +634,8 @@ impl App {
 
         // Try to find the file by file_name in the database
         let file_result = {
-            let mut stmt = self
-                .db
-                .prepare("SELECT id, path FROM files WHERE file_name = ?")?;
+            let db_lock = self.db.borrow();
+            let mut stmt = db_lock.prepare("SELECT id, path FROM files WHERE file_name = ?")?;
             stmt.query_row([&file_name], |row| {
                 Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
             })
@@ -658,9 +661,8 @@ impl App {
                     let error_msg = String::from_utf8_lossy(&output.stderr).into_owned();
                     return Err(EditorError::Scanner(error_msg));
                 }
-                let mut stmt = self
-                    .db
-                    .prepare("SELECT id FROM files WHERE file_name = ?")?;
+                let db_lock = self.db.borrow();
+                let mut stmt = db_lock.prepare("SELECT id FROM files WHERE file_name = ?")?;
                 let file_id = stmt
                     .query_row([&file_name], |row| row.get(0))
                     .map_err(|e| EditorError::Database(e))?;
@@ -783,7 +785,9 @@ impl App {
                     UNION
                     SELECT backlink AS result FROM backlinks WHERE backlink LIKE ?
                 ) LIMIT 10";
-                let mut stmt = self.db.prepare(sql)?;
+                let db_lock = self.db.borrow();
+                let mut stmt = db_lock.prepare(sql)?;
+
                 let closure = |row: &rusqlite::Row| row.get::<_, String>(0);
                 let mapped_rows =
                     stmt.query_map(params![search_pattern, search_pattern], closure)?;
@@ -792,7 +796,8 @@ impl App {
             CompletionType::Tag => {
                 let search_pattern = format!("%{}%", query);
                 let sql = "SELECT tag FROM tags WHERE tag LIKE ? LIMIT 10";
-                let mut stmt = self.db.prepare(sql)?;
+                let db_lock = self.db.borrow();
+                let mut stmt = db_lock.prepare(sql)?;
                 let closure = |row: &rusqlite::Row| row.get::<_, String>(0);
                 let mapped_rows = stmt.query_map(params![search_pattern], closure)?;
                 mapped_rows.collect::<Result<Vec<_>, _>>()?
@@ -926,7 +931,8 @@ impl App {
     }
 
     fn load_tag_files(&mut self, tag: &str) -> Result<(), EditorError> {
-        let mut stmt = self.db.prepare(
+        let db_lock = self.db.borrow();
+        let mut stmt = db_lock.prepare(
             "SELECT f.file_name, f.id FROM files f
              JOIN file_tags ft ON f.id = ft.file_id
              JOIN tags t ON ft.tag_id = t.id
@@ -953,13 +959,15 @@ impl App {
     fn select_tag_file(&mut self) -> Result<(), EditorError> {
         if let Some(selected) = self.tag_files_state.selected() {
             if let Some((_file_name, file_id)) = self.tag_files.get(selected) {
-                // Retrieve full path from database
-                let path: String = self
-                    .db
-                    .query_row("SELECT path FROM files WHERE id = ?", [file_id], |row| {
-                        row.get(0)
-                    })
-                    .map_err(|e| EditorError::Database(e))?;
+                let path: String = {
+                    let db_lock = self.db.borrow();
+                    db_lock
+                        .query_row("SELECT path FROM files WHERE id = ?", [file_id], |row| {
+                            row.get(0)
+                        })
+                        .map_err(|e| EditorError::Database(e))?
+                }; // <--- db_lock is safely dropped right here
+
                 self.history.truncate(self.history_index + 1);
                 self.history.push((path.clone(), *file_id));
                 self.history_index += 1;
@@ -1045,7 +1053,8 @@ impl App {
                      JOIN files f ON b.file_id = f.id
                      JOIN files fp ON b.backlink_id = fp.id
                      WHERE fp.file_name LIKE ? AND f.id != ?";
-        let mut stmt = self.db.prepare(query)?;
+        let db_lock = self.db.borrow();
+        let mut stmt = db_lock.prepare(query)?;
         let results = stmt
             .query_map(params![format!("{}", target), self.file_id], |row| {
                 let file_name: String = row.get(0)?;
@@ -1064,7 +1073,8 @@ impl App {
 
     fn search_tags(&mut self) -> Result<(), EditorError> {
         let query = "SELECT DISTINCT tag FROM tags WHERE tag LIKE ?";
-        let mut stmt = self.db.prepare(query)?;
+        let db_lock = self.db.borrow();
+        let mut stmt = db_lock.prepare(query)?;
         let search_pattern = if self.search_state.query.is_empty() {
             "%".to_string()
         } else {
@@ -1083,7 +1093,8 @@ impl App {
 
     fn search_files(&mut self) -> Result<(), EditorError> {
         let query = "SELECT file_name, id, json_extract (files.metadata, '$.created_at') as created_at FROM files WHERE file_name LIKE ? ORDER BY created_at DESC";
-        let mut stmt = self.db.prepare(query)?;
+        let db_lock = self.db.borrow();
+        let mut stmt = db_lock.prepare(query)?;
         let search_pattern = if self.search_state.query.is_empty() {
             "%".to_string()
         } else {
@@ -1151,14 +1162,16 @@ impl App {
                     SearchType::Backlinks | SearchType::Files | SearchType::CustomSql => {
                         if let Some(file_id) = file_id {
                             // Retrieve full path from database
-                            let path: String = self
-                                .db
-                                .query_row(
-                                    "SELECT path FROM files WHERE id = ?",
-                                    [file_id],
-                                    |row| row.get(0),
-                                )
-                                .map_err(|e| EditorError::Database(e))?;
+                            let path: String = {
+                                let db_lock = self.db.borrow();
+                                db_lock
+                                    .query_row(
+                                        "SELECT path FROM files WHERE id = ?",
+                                        [file_id],
+                                        |row| row.get(0),
+                                    )
+                                    .map_err(|e| EditorError::Database(e))?
+                            };
                             self.history.truncate(self.history_index + 1);
                             self.history.push((path.clone(), file_id));
                             self.history_index += 1;
@@ -1953,9 +1966,33 @@ impl App {
                     ratatui::crossterm::event::KeyCode::Enter => {
                         if let Some(selected) = self.table_state.list_state.selected() {
                             if let Some(row) = self.table_state.rows.get(selected) {
-                                let file_name = row[0].clone();
-                                self.open_wikilink_file(file_name)?;
-                                self.mode = Mode::Normal;
+                                if let Some(ref key) = self.table_state.on_submit_key {
+                                    let mut lua_error = None;
+                                    {
+                                        if let Ok(func) =
+                                            self.lua.registry_value::<mlua::Function>(&**key)
+                                        {
+                                            // Pass the entire selected row as a table to Lua
+                                            if let Err(e) = func.call::<_, ()>(row.clone()) {
+                                                lua_error = Some(e.to_string());
+                                            }
+                                        }
+                                    }
+
+                                    if let Some(err) = lua_error {
+                                        self.status = format!("Lua on_submit error: {}", err);
+                                    } else {
+                                        self.mode = Mode::Normal; // Exit table mode automatically
+                                    }
+
+                                    // Ensure any commands queued by the Lua callback are fired!
+                                    self.execute_lua_commands()?;
+                                } else {
+                                    // Fallback for old tables without an on_submit defined
+                                    let file_name = row[0].clone();
+                                    self.open_wikilink_file(file_name)?;
+                                    self.mode = Mode::Normal;
+                                }
                             }
                         }
                     }
@@ -3774,7 +3811,8 @@ impl App {
         // println!("Resolving image path for: {}", image_path);
 
         let query = "SELECT path FROM files WHERE file_name = ? OR path = ?";
-        let mut stmt = self.db.prepare(query)?;
+        let db_lock = self.db.borrow();
+        let mut stmt = db_lock.prepare(query)?;
         let path_result = stmt.query_row(params![image_path, image_path], |row| {
             row.get::<_, String>(0)
         });
@@ -3891,7 +3929,8 @@ impl App {
             return Ok(());
         }
 
-        let mut stmt = match self.db.prepare(query) {
+        let db_lock = self.db.borrow();
+        let mut stmt = match db_lock.prepare(query) {
             Ok(s) => s,
             Err(e) => {
                 self.status = format!("SQL Prepare Error: {}", e);
@@ -4457,25 +4496,17 @@ impl App {
                         self.status = "Database Browser Mode".to_string();
                     }
                 }
+                // Inside App::execute_lua_commands:
                 EditorCommand::OpenCustomTable {
                     columns,
-                    query,
-                    formatter_key,
+                    data,
+                    on_submit_key,
                 } => {
-                    // Only reset the sorting state if opening a completely new table query
-                    if self.table_state.sql_query != query {
-                        self.table_state.sort_col = 0;
-                        self.table_state.sort_asc = true;
-                    } else {
-                        // Just in case columns dynamically changed, keep it within bounds
-                        if self.table_state.sort_col >= columns.len() {
-                            self.table_state.sort_col = 0;
-                        }
-                    }
-
+                    self.table_state.sort_col = 0;
+                    self.table_state.sort_asc = true;
                     self.table_state.columns = columns;
-                    self.table_state.sql_query = query;
-                    self.table_state.formatter_key = formatter_key;
+                    self.table_state.raw_data = data;
+                    self.table_state.on_submit_key = on_submit_key; // <-- Store the key
 
                     if let Err(e) = self.update_table_data() {
                         self.status = format!("Lua Table Error: {}", e);
@@ -4605,56 +4636,17 @@ impl App {
         (line, original_col)
     }
     pub fn update_table_data(&mut self) -> Result<(), EditorError> {
-        if self.table_state.sql_query.is_empty() {
-            return Ok(());
-        }
+        // 1. Start with the raw unfiltered data
+        let formatted_rows = self.table_state.raw_data.clone();
 
-        // 1. Run the Raw SQL Query EXACTLY as provided by the Lua config.
-        let mut stmt = self.db.prepare(&self.table_state.sql_query)?;
-        let col_names: Vec<String> = stmt.column_names().into_iter().map(String::from).collect();
-        let column_count = stmt.column_count();
-
-        let mut raw_rows = Vec::new();
-        let mut rows_iter = stmt.query([])?; // No parameters needed anymore!
-
-        while let Some(row) = rows_iter.next()? {
-            let mut row_data = Vec::new();
-            for i in 0..column_count {
-                let val: String = match row.get_ref(i)? {
-                    rusqlite::types::ValueRef::Null => String::new(),
-                    rusqlite::types::ValueRef::Integer(num) => num.to_string(),
-                    rusqlite::types::ValueRef::Real(num) => num.to_string(),
-                    rusqlite::types::ValueRef::Text(t) => String::from_utf8_lossy(t).to_string(),
-                    rusqlite::types::ValueRef::Blob(b) => String::from_utf8_lossy(b).to_string(),
-                };
-                row_data.push(val);
-            }
-            raw_rows.push(row_data);
-        }
-
-        // 2. PIPE THROUGH LUA FORMATTER
-        let mut formatted_rows = Vec::new();
-        if let Some(ref reg_key) = self.table_state.formatter_key {
-            if let Ok(func) = self.lua.registry_value::<mlua::Function>(&**reg_key) {
-                for row_data in raw_rows {
-                    if let Ok(modified_row) = func.call::<_, Vec<String>>(row_data.clone()) {
-                        formatted_rows.push(modified_row);
-                    } else {
-                        formatted_rows.push(row_data);
-                    }
-                }
-            }
-        } else {
-            formatted_rows = raw_rows;
-        }
-
-        // 3. APPLY IN-MEMORY FILTERS
+        // 2. APPLY IN-MEMORY FILTERS
         let search_text_lower = self.table_state.search_text.to_lowercase();
+        let col_names = self.table_state.columns.clone();
 
         let mut filtered_rows: Vec<Vec<String>> = formatted_rows
             .into_iter()
             .filter(|row| {
-                // A. Search Text Filter (Any column contains the literal text, spacing included)
+                // A. Search Text Filter
                 if !search_text_lower.is_empty() {
                     let matches_search = row
                         .iter()
@@ -4664,20 +4656,12 @@ impl App {
                     }
                 }
 
-                // Helper to get column index from Lua header name OR SQL alias
                 let get_col_idx = |name: &str| -> Option<usize> {
-                    self.table_state
-                        .columns
+                    col_names
                         .iter()
                         .position(|c| c.to_lowercase() == name.to_lowercase())
-                        .or_else(|| {
-                            col_names
-                                .iter()
-                                .position(|c| c.to_lowercase() == name.to_lowercase())
-                        })
                 };
 
-                // Helper: Splits by comma and forces an EXACT match
                 let exact_match = |cell: &str, target: &str| -> bool {
                     cell.split(',')
                         .map(|s| s.trim().to_lowercase())
@@ -4697,7 +4681,7 @@ impl App {
                             }
                         } else {
                             return false;
-                        } // ADDED: Fail if column missing
+                        }
                     } else {
                         let has_tag = row.iter().any(|cell| exact_match(cell, tag));
                         if !has_tag {
@@ -4717,7 +4701,7 @@ impl App {
                             }
                         } else {
                             return false;
-                        } // ADDED: Fail if column missing
+                        }
                     } else {
                         let has_tag = row.iter().any(|cell| exact_match(cell, tag));
                         if has_tag {
@@ -4726,7 +4710,7 @@ impl App {
                     }
                 }
 
-                true // Passed all filters!
+                true
             })
             .collect();
 
@@ -4735,27 +4719,57 @@ impl App {
         let sort_asc = self.table_state.sort_asc;
 
         filtered_rows.sort_by(|a, b| {
-            let val_a = a.get(sort_col).unwrap_or(&String::new()).to_lowercase();
-            let val_b = b.get(sort_col).unwrap_or(&String::new()).to_lowercase();
+            // SAFE ACCESS: Get the strings, default to empty
+            let val_a = a.get(sort_col).map(|s| s.as_str()).unwrap_or("");
+            let val_b = b.get(sort_col).map(|s| s.as_str()).unwrap_or("");
 
-            if let (Ok(num_a), Ok(num_b)) = (val_a.parse::<f64>(), val_b.parse::<f64>()) {
-                if sort_asc {
-                    num_a.partial_cmp(&num_b).unwrap()
-                } else {
-                    num_b.partial_cmp(&num_a).unwrap()
+            // Helper to parse numeric values safely
+            let parse_num = |s: &str| -> Option<f64> {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    return None;
                 }
-            } else {
-                if sort_asc {
-                    val_a.cmp(&val_b)
-                } else {
-                    val_b.cmp(&val_a)
+
+                // Use chars to find the suffix, avoiding byte-index panics
+                let chars: Vec<char> = trimmed.chars().collect();
+                let last_char = *chars.last().unwrap();
+
+                if last_char.is_numeric() {
+                    return trimmed.parse::<f64>().ok();
                 }
-            }
+
+                // Handle suffixes (K, M, G, T)
+                let num_part: String = chars.iter().take(chars.len() - 1).collect();
+                if let Ok(num) = num_part.parse::<f64>() {
+                    let mult = match last_char.to_ascii_lowercase() {
+                        'k' => 1024.0,
+                        'm' => 1024.0 * 1024.0,
+                        'g' => 1024.0 * 1024.0 * 1024.0,
+                        't' => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+                        _ => return None,
+                    };
+                    return Some(num * mult);
+                }
+                None
+            };
+
+            let num_a = parse_num(val_a);
+            let num_b = parse_num(val_b);
+
+            // Compare
+            let cmp = match (num_a, num_b) {
+                (Some(na), Some(nb)) => na.partial_cmp(&nb).unwrap_or(std::cmp::Ordering::Equal),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => val_a.to_lowercase().cmp(&val_b.to_lowercase()),
+            };
+
+            if sort_asc { cmp } else { cmp.reverse() }
         });
 
         self.table_state.rows = filtered_rows;
 
-        // 5. UPDATE SELECTION
+        // 4. UPDATE SELECTION
         if !self.table_state.rows.is_empty() {
             let current = self.table_state.list_state.selected().unwrap_or(0);
             self.table_state
