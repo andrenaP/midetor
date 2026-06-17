@@ -452,11 +452,24 @@ impl App {
 
     fn get_file_id(db: &Connection, path: &str) -> Result<i64, EditorError> {
         let mut stmt = db.prepare("SELECT id FROM files WHERE path = ?")?;
-        stmt.query_row([path], |row| row.get(0))
-            .map_err(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => EditorError::FileNotFound(path.to_string()),
-                e => EditorError::Database(e),
-            })
+        match stmt.query_row([path], |row| row.get(0)) {
+            Ok(id) => Ok(id),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                // The file isn't in the DB. Let's check if it exists on disk.
+                if std::path::Path::new(path).exists() {
+                    // Self-healing: Insert it into the DB right now so we don't crash.
+                    db.execute("INSERT INTO files (path) VALUES (?)", [path])
+                        .map_err(EditorError::Database)?;
+
+                    // Return the newly created ID
+                    Ok(db.last_insert_rowid())
+                } else {
+                    // It genuinely doesn't exist anywhere
+                    Err(EditorError::FileNotFound(path.to_string()))
+                }
+            }
+            Err(e) => Err(EditorError::Database(e)),
+        }
     }
 
     fn load_tags(db: &Connection, file_id: i64) -> Result<Vec<String>, EditorError> {
@@ -3655,14 +3668,34 @@ impl App {
             let (image_area, title_str) = if self.image_full_screen {
                 (area, "Image (Full Screen)")
             } else {
-                let popup_width = (inner_area.width as f32 * 0.4)
+                // 1. Establish the maximum allowed bounds
+                let max_popup_width = (inner_area.width as f32 * 0.4)
                     .max(30.0)
                     .min(inner_area.width as f32) as u16;
-                let popup_height = (inner_area.height as f32 * 0.6)
+                let max_popup_height = (inner_area.height as f32 * 0.6)
                     .max(10.0)
                     .min(inner_area.height as f32) as u16;
-                let max_y = inner_area.y + inner_area.height.saturating_sub(popup_height);
-                let max_x = inner_area.x + inner_area.width.saturating_sub(popup_width);
+
+                // 2. Extract image dimensions and adjust for terminal cell aspect ratio (~1:2)
+                let img_w = dyn_img.width() as f32;
+                let img_h = (dyn_img.height() as f32) / 2.0;
+
+                // 3. Find the scale factor to fit the image into the max bounds perfectly
+                let scale_w = max_popup_width.saturating_sub(2) as f32 / img_w.max(1.0);
+                let scale_h = max_popup_height.saturating_sub(2) as f32 / img_h.max(1.0);
+                let scale = f32::min(scale_w, scale_h); // Scale down to fit
+
+                // 4. Calculate the final container bounds (+2 accounts for the outer borders)
+                let final_width = ((img_w * scale).round() as u16 + 2)
+                    .max(15) // Ensure the title has enough room
+                    .min(max_popup_width);
+                let final_height = ((img_h * scale).round() as u16 + 2)
+                    .max(3)
+                    .min(max_popup_height);
+
+                // 5. Position the shrunk container
+                let max_y = inner_area.y + inner_area.height.saturating_sub(final_height);
+                let max_x = inner_area.x + inner_area.width.saturating_sub(final_width);
 
                 let mut popup_y;
                 if self.read_mode
@@ -3679,8 +3712,8 @@ impl App {
                 let popup_area = Rect {
                     x: max_x,
                     y: popup_y,
-                    width: popup_width,
-                    height: popup_height,
+                    width: final_width,
+                    height: final_height,
                 };
 
                 (popup_area, "Image")
@@ -4524,6 +4557,9 @@ impl App {
                         self.table_state.sort_asc = true;
                     }
                     let _ = self.update_table_data();
+                }
+                EditorCommand::DeleteFile(path) => {
+                    self.delete_file(&path)?;
                 }
                 _ => {}
             }

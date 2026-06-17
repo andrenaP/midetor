@@ -73,6 +73,8 @@ pub enum EditorCommand {
         on_submit_key: Option<Rc<mlua::RegistryKey>>,
     },
     SortTable(usize),
+
+    DeleteFile(String),
 }
 
 pub struct LuaEditorAPI {
@@ -474,6 +476,13 @@ impl UserData for LuaEditorAPI {
                     data,
                     on_submit_key,
                 });
+            Ok(())
+        });
+
+        methods.add_method("delete_file", |_, this, path: String| {
+            this.command_queue
+                .borrow_mut()
+                .push(EditorCommand::DeleteFile(path));
             Ok(())
         });
     }
