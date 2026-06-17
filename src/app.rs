@@ -80,6 +80,19 @@ pub enum Mode {
     TableBrowserFilter,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum FilterCondition {
+    Search(String),
+    Include(Option<String>, String),
+    Exclude(Option<String>, String),
+}
+#[derive(Clone, Debug, PartialEq)]
+pub enum FilterExpr {
+    Condition(FilterCondition),
+    And(Vec<FilterExpr>),
+    Or(Vec<FilterExpr>),
+}
+
 // State for the Table Browser
 pub struct TableState {
     pub list_state: ratatui::widgets::TableState,
@@ -87,9 +100,10 @@ pub struct TableState {
     pub raw_data: Vec<Vec<String>>, // Stores the unfiltered base data
     pub rows: Vec<Vec<String>>,     // Filtered and sorted data
     pub filter_query: String,
-    pub include_tags: Vec<(Option<String>, String)>,
-    pub exclude_tags: Vec<(Option<String>, String)>,
-    pub search_text: String,
+    pub parsed_filter: Option<FilterExpr>,
+    // pub include_tags: Vec<(Option<String>, String)>,
+    // pub exclude_tags: Vec<(Option<String>, String)>,
+    // pub search_text: String,
     pub sort_col: usize,
     pub sort_asc: bool,
     pub on_submit_key: Option<Rc<mlua::RegistryKey>>,
@@ -103,9 +117,10 @@ impl Default for TableState {
             raw_data: Vec::new(),
             rows: Vec::new(),
             filter_query: String::new(),
-            include_tags: Vec::new(),
-            exclude_tags: Vec::new(),
-            search_text: String::new(),
+            parsed_filter: None,
+            // include_tags: Vec::new(),
+            // exclude_tags: Vec::new(),
+            // search_text: String::new(),
             sort_col: 0,
             sort_asc: true,
             on_submit_key: None,
@@ -4693,86 +4708,88 @@ impl App {
         (line, original_col)
     }
     pub fn update_table_data(&mut self) -> Result<(), EditorError> {
-        // 1. Start with the raw unfiltered data
         let formatted_rows = self.table_state.raw_data.clone();
-
-        // 2. APPLY IN-MEMORY FILTERS
-        let search_text_lower = self.table_state.search_text.to_lowercase();
         let col_names = self.table_state.columns.clone();
 
+        let is_filter_empty = self.table_state.parsed_filter.is_none();
+
+        // APPLY IN-MEMORY FILTERS
         let mut filtered_rows: Vec<Vec<String>> = formatted_rows
             .into_iter()
             .filter(|row| {
-                // A. Search Text Filter
-                if !search_text_lower.is_empty() {
-                    let matches_search = row
-                        .iter()
-                        .any(|cell| cell.to_lowercase().contains(&search_text_lower));
-                    if !matches_search {
-                        return false;
-                    }
+                if is_filter_empty {
+                    return true;
                 }
 
-                let get_col_idx = |name: &str| -> Option<usize> {
-                    if let Ok(idx) = name.parse::<usize>() {
-                        if idx > 0 && idx <= col_names.len() {
-                            return Some(idx - 1); // Convert 1-based to 0-based index
-                        }
-                    }
-                    col_names
-                        .iter()
-                        .position(|c| c.to_lowercase() == name.to_lowercase())
-                };
-
-                let exact_match = |cell: &str, target: &str| -> bool {
-                    cell.split(',')
-                        .map(|s| s.trim().to_lowercase())
-                        .any(|s| s == target.to_lowercase())
-                };
-
-                // B. Include Tags (+)
-                for (col_opt, tag) in &self.table_state.include_tags {
-                    if let Some(col_name) = col_opt {
-                        if let Some(idx) = get_col_idx(col_name) {
-                            if let Some(cell) = row.get(idx) {
-                                if !exact_match(cell, tag) {
-                                    return false;
-                                }
-                            } else {
-                                return false;
+                // Recursive evaluator
+                fn eval_expr(expr: &FilterExpr, row: &[String], col_names: &[String]) -> bool {
+                    let get_col_idx = |name: &str| -> Option<usize> {
+                        if let Ok(idx) = name.parse::<usize>() {
+                            if idx > 0 && idx <= col_names.len() {
+                                return Some(idx - 1);
                             }
-                        } else {
-                            return false;
                         }
-                    } else {
-                        let has_tag = row.iter().any(|cell| exact_match(cell, tag));
-                        if !has_tag {
-                            return false;
-                        }
-                    }
-                }
+                        col_names
+                            .iter()
+                            .position(|c| c.to_lowercase() == name.to_lowercase())
+                    };
 
-                // C. Exclude Tags (-)
-                for (col_opt, tag) in &self.table_state.exclude_tags {
-                    if let Some(col_name) = col_opt {
-                        if let Some(idx) = get_col_idx(col_name) {
-                            if let Some(cell) = row.get(idx) {
-                                if exact_match(cell, tag) {
-                                    return false;
+                    let exact_match = |cell: &str, target: &str| -> bool {
+                        cell.split(',')
+                            .map(|s| s.trim().to_lowercase())
+                            .any(|s| s == target.to_lowercase())
+                    };
+
+                    match expr {
+                        FilterExpr::And(nodes) => {
+                            nodes.iter().all(|n| eval_expr(n, row, col_names))
+                        }
+                        FilterExpr::Or(nodes) => nodes.iter().any(|n| eval_expr(n, row, col_names)),
+                        FilterExpr::Condition(cond) => match cond {
+                            FilterCondition::Search(text) => {
+                                let text_lower = text.to_lowercase();
+                                row.iter()
+                                    .any(|cell| cell.to_lowercase().contains(&text_lower))
+                            }
+                            FilterCondition::Include(col_opt, tag) => {
+                                if let Some(col_name) = col_opt {
+                                    if let Some(idx) = get_col_idx(col_name) {
+                                        if let Some(cell) = row.get(idx) {
+                                            exact_match(cell, tag)
+                                        } else {
+                                            false
+                                        }
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    row.iter().any(|cell| exact_match(cell, tag))
                                 }
                             }
-                        } else {
-                            return false;
-                        }
-                    } else {
-                        let has_tag = row.iter().any(|cell| exact_match(cell, tag));
-                        if has_tag {
-                            return false;
-                        }
+                            FilterCondition::Exclude(col_opt, tag) => {
+                                if let Some(col_name) = col_opt {
+                                    if let Some(idx) = get_col_idx(col_name) {
+                                        if let Some(cell) = row.get(idx) {
+                                            !exact_match(cell, tag)
+                                        } else {
+                                            true
+                                        }
+                                    } else {
+                                        true
+                                    }
+                                } else {
+                                    !row.iter().any(|cell| exact_match(cell, tag))
+                                }
+                            }
+                        },
                     }
                 }
 
-                true
+                if let Some(expr) = &self.table_state.parsed_filter {
+                    eval_expr(expr, row, &col_names)
+                } else {
+                    true
+                }
             })
             .collect();
 
@@ -4781,26 +4798,19 @@ impl App {
         let sort_asc = self.table_state.sort_asc;
 
         filtered_rows.sort_by(|a, b| {
-            // SAFE ACCESS: Get the strings, default to empty
             let val_a = a.get(sort_col).map(|s| s.as_str()).unwrap_or("");
             let val_b = b.get(sort_col).map(|s| s.as_str()).unwrap_or("");
 
-            // Helper to parse numeric values safely
             let parse_num = |s: &str| -> Option<f64> {
                 let trimmed = s.trim();
                 if trimmed.is_empty() {
                     return None;
                 }
-
-                // Use chars to find the suffix, avoiding byte-index panics
                 let chars: Vec<char> = trimmed.chars().collect();
                 let last_char = *chars.last().unwrap();
-
                 if last_char.is_numeric() {
                     return trimmed.parse::<f64>().ok();
                 }
-
-                // Handle suffixes (K, M, G, T)
                 let num_part: String = chars.iter().take(chars.len() - 1).collect();
                 if let Ok(num) = num_part.parse::<f64>() {
                     let mult = match last_char.to_ascii_lowercase() {
@@ -4818,7 +4828,6 @@ impl App {
             let num_a = parse_num(val_a);
             let num_b = parse_num(val_b);
 
-            // Compare
             let cmp = match (num_a, num_b) {
                 (Some(na), Some(nb)) => na.partial_cmp(&nb).unwrap_or(std::cmp::Ordering::Equal),
                 (Some(_), None) => std::cmp::Ordering::Less,
@@ -4831,7 +4840,6 @@ impl App {
 
         self.table_state.rows = filtered_rows;
 
-        // 4. UPDATE SELECTION
         if !self.table_state.rows.is_empty() {
             let current = self.table_state.list_state.selected().unwrap_or(0);
             self.table_state
@@ -4845,26 +4853,26 @@ impl App {
     }
 
     pub fn parse_table_filter(&mut self) {
-        self.table_state.include_tags.clear();
-        self.table_state.exclude_tags.clear();
-
-        let mut search_terms = Vec::new();
         let mut tokens = Vec::new();
         let mut current_token = String::new();
         let mut in_quotes = false;
         let mut quote_char = '\0';
 
-        // 1. Smart Tokenizer: Respects quotes, allowing spaces inside them.
-        for c in self.table_state.filter_query.chars() {
+        // 1. Tokenize (safely padding parentheses so they parse distinctively)
+        let padded_query = self
+            .table_state
+            .filter_query
+            .replace("(", " ( ")
+            .replace(")", " ) ");
+
+        for c in padded_query.chars() {
             if (c == '"' || c == '\'') && (!in_quotes || c == quote_char) {
                 in_quotes = !in_quotes;
                 if in_quotes {
                     quote_char = c;
                 }
-                continue; // Skip appending the quote mark itself
+                continue;
             }
-
-            // Split by space ONLY if we are not inside a quoted string
             if c == ' ' && !in_quotes {
                 if !current_token.is_empty() {
                     tokens.push(current_token.clone());
@@ -4874,13 +4882,10 @@ impl App {
                 current_token.push(c);
             }
         }
-
-        // Push the final token if there is one
         if !current_token.is_empty() {
             tokens.push(current_token);
         }
 
-        // Helper to verify if the prefix is an actual column (by name or 1-based index)
         let is_column = |name: &str| -> bool {
             if let Ok(idx) = name.parse::<usize>() {
                 if idx > 0 && idx <= self.table_state.columns.len() {
@@ -4893,38 +4898,129 @@ impl App {
                 .any(|c| c.to_lowercase() == name.to_lowercase())
         };
 
-        // 2. Parse the safe tokens
-        for part in tokens {
+        let parse_condition = |part: &str| -> FilterExpr {
+            let condition;
             if part.starts_with('+') && part.len() > 1 {
-                self.table_state
-                    .include_tags
-                    .push((None, part[1..].to_string()));
+                condition = FilterCondition::Include(None, part[1..].to_string());
             } else if part.starts_with('-') && part.len() > 1 {
-                self.table_state
-                    .exclude_tags
-                    .push((None, part[1..].to_string()));
+                condition = FilterCondition::Exclude(None, part[1..].to_string());
             } else if let Some(idx) = part.find('+') {
                 if idx > 0 && idx < part.len() - 1 && is_column(&part[..idx]) {
-                    self.table_state
-                        .include_tags
-                        .push((Some(part[..idx].to_string()), part[idx + 1..].to_string()));
+                    condition = FilterCondition::Include(
+                        Some(part[..idx].to_string()),
+                        part[idx + 1..].to_string(),
+                    );
                 } else {
-                    search_terms.push(part);
+                    condition = FilterCondition::Search(part.to_string());
                 }
             } else if let Some(idx) = part.find('-') {
                 if idx > 0 && idx < part.len() - 1 && is_column(&part[..idx]) {
-                    self.table_state
-                        .exclude_tags
-                        .push((Some(part[..idx].to_string()), part[idx + 1..].to_string()));
+                    condition = FilterCondition::Exclude(
+                        Some(part[..idx].to_string()),
+                        part[idx + 1..].to_string(),
+                    );
                 } else {
-                    search_terms.push(part);
+                    condition = FilterCondition::Search(part.to_string());
                 }
             } else {
-                search_terms.push(part);
+                condition = FilterCondition::Search(part.to_string());
+            }
+            FilterExpr::Condition(condition)
+        };
+
+        // 2. Recursive Descent Parser
+        fn parse_or(
+            tokens: &[String],
+            pos: &mut usize,
+            parse_cond: &dyn Fn(&str) -> FilterExpr,
+        ) -> Option<FilterExpr> {
+            let mut nodes = Vec::new();
+            if let Some(node) = parse_and(tokens, pos, parse_cond) {
+                nodes.push(node);
+            } else {
+                return None;
+            }
+
+            while *pos < tokens.len() {
+                let tok = tokens[*pos].to_uppercase();
+                if tok == "OR" || tok == "||" {
+                    *pos += 1;
+                    if let Some(node) = parse_and(tokens, pos, parse_cond) {
+                        nodes.push(node);
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            if nodes.len() == 1 {
+                Some(nodes.pop().unwrap())
+            } else {
+                Some(FilterExpr::Or(nodes))
             }
         }
 
-        self.table_state.search_text = search_terms.join(" ");
+        fn parse_and(
+            tokens: &[String],
+            pos: &mut usize,
+            parse_cond: &dyn Fn(&str) -> FilterExpr,
+        ) -> Option<FilterExpr> {
+            let mut nodes = Vec::new();
+            if let Some(node) = parse_primary(tokens, pos, parse_cond) {
+                nodes.push(node);
+            } else {
+                return None;
+            }
+
+            while *pos < tokens.len() {
+                let tok = tokens[*pos].to_uppercase();
+                if tok == "AND" || tok == "&&" {
+                    *pos += 1;
+                    if let Some(node) = parse_primary(tokens, pos, parse_cond) {
+                        nodes.push(node);
+                    }
+                } else if tok == "OR" || tok == "||" || tok == ")" {
+                    break;
+                } else {
+                    // Implicit AND if operators are missing
+                    if let Some(node) = parse_primary(tokens, pos, parse_cond) {
+                        nodes.push(node);
+                    }
+                }
+            }
+
+            if nodes.len() == 1 {
+                Some(nodes.pop().unwrap())
+            } else {
+                Some(FilterExpr::And(nodes))
+            }
+        }
+
+        fn parse_primary(
+            tokens: &[String],
+            pos: &mut usize,
+            parse_cond: &dyn Fn(&str) -> FilterExpr,
+        ) -> Option<FilterExpr> {
+            if *pos >= tokens.len() {
+                return None;
+            }
+
+            if tokens[*pos] == "(" {
+                *pos += 1;
+                let node = parse_or(tokens, pos, parse_cond);
+                if *pos < tokens.len() && tokens[*pos] == ")" {
+                    *pos += 1; // Consume ')'
+                }
+                node
+            } else {
+                let node = parse_cond(&tokens[*pos]);
+                *pos += 1;
+                Some(node)
+            }
+        }
+
+        let mut pos = 0;
+        self.table_state.parsed_filter = parse_or(&tokens, &mut pos, &parse_condition);
     }
 }
 
