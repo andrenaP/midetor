@@ -71,6 +71,9 @@ pub enum EditorCommand {
         columns: Vec<String>,
         data: Vec<Vec<String>>, // Takes raw data directly instead of query/formatter
         on_submit_key: Option<Rc<mlua::RegistryKey>>,
+        filter: Option<String>,
+        sort_col: Option<usize>, // 1-based index passed from Lua
+        sort_asc: Option<bool>,
     },
     SortTable(usize),
 
@@ -461,6 +464,9 @@ impl UserData for LuaEditorAPI {
         methods.add_method("open_table", |lua, this, config: mlua::Table| {
             let columns: Vec<String> = config.get("columns")?;
             let data: Vec<Vec<String>> = config.get("data")?;
+            let filter: Option<String> = config.get("filter")?;
+            let sort_col: Option<usize> = config.get("sort_col")?;
+            let sort_asc: Option<bool> = config.get("sort_asc")?;
             let on_submit: Option<mlua::Function> = config.get("on_submit").ok();
 
             let on_submit_key = if let Some(f) = on_submit {
@@ -475,6 +481,9 @@ impl UserData for LuaEditorAPI {
                     columns,
                     data,
                     on_submit_key,
+                    filter,
+                    sort_col,
+                    sort_asc,
                 });
             Ok(())
         });

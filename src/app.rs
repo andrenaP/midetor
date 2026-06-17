@@ -4534,12 +4534,33 @@ impl App {
                     columns,
                     data,
                     on_submit_key,
+                    filter,
+                    sort_col,
+                    sort_asc,
                 } => {
-                    self.table_state.sort_col = 0;
-                    self.table_state.sort_asc = true;
                     self.table_state.columns = columns;
                     self.table_state.raw_data = data;
-                    self.table_state.on_submit_key = on_submit_key; // <-- Store the key
+                    self.table_state.on_submit_key = on_submit_key;
+
+                    // Apply preloaded sort if provided (convert 1-based Lua index to 0-based)
+                    if let Some(col) = sort_col {
+                        self.table_state.sort_col = col.saturating_sub(1);
+                    } else if self.table_state.sort_col >= self.table_state.columns.len() {
+                        // Only reset if the previous sort column is now out of bounds
+                        self.table_state.sort_col = 0;
+                    }
+
+                    if let Some(asc) = sort_asc {
+                        self.table_state.sort_asc = asc;
+                    }
+
+                    // Apply preloaded filter if provided
+                    if let Some(f_query) = filter {
+                        self.table_state.filter_query = f_query;
+                    }
+
+                    // Parse the filter (either the new one or the persisted one)
+                    self.parse_table_filter();
 
                     if let Err(e) = self.update_table_data() {
                         self.status = format!("Lua Table Error: {}", e);
@@ -4693,6 +4714,11 @@ impl App {
                 }
 
                 let get_col_idx = |name: &str| -> Option<usize> {
+                    if let Ok(idx) = name.parse::<usize>() {
+                        if idx > 0 && idx <= col_names.len() {
+                            return Some(idx - 1); // Convert 1-based to 0-based index
+                        }
+                    }
                     col_names
                         .iter()
                         .position(|c| c.to_lowercase() == name.to_lowercase())
@@ -4854,8 +4880,13 @@ impl App {
             tokens.push(current_token);
         }
 
-        // Helper to verify if the prefix is an actual column
+        // Helper to verify if the prefix is an actual column (by name or 1-based index)
         let is_column = |name: &str| -> bool {
+            if let Ok(idx) = name.parse::<usize>() {
+                if idx > 0 && idx <= self.table_state.columns.len() {
+                    return true;
+                }
+            }
             self.table_state
                 .columns
                 .iter()
