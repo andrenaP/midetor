@@ -2286,10 +2286,14 @@ impl App {
                         self.completion_state.list_state.select(Some(selected + 1));
                     }
                 }
-                ratatui::crossterm::event::KeyCode::Char(_) => {
-                    let input = Input::from(event);
-                    self.textarea.input(input);
-                    self.update_completion()?;
+                ratatui::crossterm::event::KeyCode::Char(c) => {
+                    if c == ':' || c == '!' || c == '?' || c == ';' || c == '~' {
+                        // Ignore this character, do not process it or update completion based on input change.
+                    } else {
+                        let input = Input::from(event);
+                        self.textarea.input(input);
+                        self.update_completion()?;
+                    }
                 }
                 ratatui::crossterm::event::KeyCode::Backspace => {
                     let input = Input::from(event);
