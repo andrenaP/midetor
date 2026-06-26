@@ -227,6 +227,7 @@ pub struct App {
     prev_mode: Option<Mode>,
     tree_visual_anchor: Option<usize>,
     tree_width_percent: u16,
+    tree_selected_paths: std::collections::HashSet<String>,
     full_tree: bool,
     buffer_mode: Option<BufferMode>,
     image_picker: Option<Picker>,
@@ -406,6 +407,7 @@ impl App {
             prev_mode: None,
             tree_visual_anchor: None,
             tree_width_percent: 40,
+            tree_selected_paths: std::collections::HashSet::new(),
             full_tree: true,
             buffer_mode: None,
             image_picker: Some(picker),
@@ -1410,6 +1412,29 @@ impl App {
         }
     }
 
+    fn toggle_tree_selection(&mut self) {
+        if let Some(selected) = self.tree_state.selected() {
+            let item = self.visible_items[selected].clone();
+
+            // Prevent selecting directories
+            if !item.is_dir {
+                if self.tree_selected_paths.contains(&item.path) {
+                    self.tree_selected_paths.remove(&item.path);
+                    self.status = format!("Unselected {}", item.path);
+                } else {
+                    self.tree_selected_paths.insert(item.path.clone());
+                    self.status = format!(
+                        "Selected {} (Total: {})",
+                        item.path,
+                        self.tree_selected_paths.len()
+                    );
+                }
+            } else {
+                self.status = "Cannot cherry-pick directories".to_string();
+            }
+        }
+    }
+
     fn update_visible(&mut self) {
         let mut visible = Vec::new();
         Self::add_nodes_to_visible(&self.file_tree, 0, &mut visible);
@@ -1628,22 +1653,28 @@ impl App {
     }
 
     fn delete_selected_files(&mut self) -> Result<(), EditorError> {
-        let current = self.tree_state.selected().unwrap_or(0);
-        let anchor = self.tree_visual_anchor.unwrap_or(current);
-        let min = anchor.min(current);
-        let max = anchor.max(current);
         let mut to_delete = Vec::new();
-        for i in min..=max {
-            let item = self.visible_items[i].clone();
-            if !item.is_dir {
-                to_delete.push(item.path);
+
+        if !self.tree_selected_paths.is_empty() {
+            to_delete.extend(self.tree_selected_paths.drain());
+        } else {
+            let current = self.tree_state.selected().unwrap_or(0);
+            let anchor = self.tree_visual_anchor.unwrap_or(current);
+            let min = anchor.min(current);
+            let max = anchor.max(current);
+
+            for i in min..=max {
+                let item = self.visible_items[i].clone();
+                if !item.is_dir {
+                    to_delete.push(item.path);
+                }
             }
         }
+
         for path in to_delete {
             self.delete_file(&path)?;
         }
         self.update_visible();
-        self.tree_state.select(Some(min));
         Ok(())
     }
 
@@ -1675,15 +1706,23 @@ impl App {
     }
 
     fn yank_selected(&mut self) {
-        let current = self.tree_state.selected().unwrap_or(0);
-        let anchor = self.tree_visual_anchor.unwrap_or(current);
-        let min = anchor.min(current);
-        let max = anchor.max(current);
         self.yanked_paths.clear();
-        for i in min..=max {
-            let item = &self.visible_items[i];
-            if !item.is_dir {
-                self.yanked_paths.push(item.path.clone());
+
+        if !self.tree_selected_paths.is_empty() {
+            // 1. Process cherry-picked files
+            self.yanked_paths.extend(self.tree_selected_paths.drain());
+        } else {
+            // 2. Fallback to Visual Range or single hover
+            let current = self.tree_state.selected().unwrap_or(0);
+            let anchor = self.tree_visual_anchor.unwrap_or(current);
+            let min = anchor.min(current);
+            let max = anchor.max(current);
+
+            for i in min..=max {
+                let item = &self.visible_items[i];
+                if !item.is_dir {
+                    self.yanked_paths.push(item.path.clone());
+                }
             }
         }
         self.status = format!("Yanked {} paths", self.yanked_paths.len());
@@ -2797,8 +2836,17 @@ impl App {
                 }
                 match event.code {
                     ratatui::crossterm::event::KeyCode::Esc => {
-                        self.mode = Mode::Normal;
-                        self.status = "Normal".to_string();
+                        // Clear cherry-picks if any exist, otherwise exit mode
+                        if !self.tree_selected_paths.is_empty() {
+                            self.tree_selected_paths.clear();
+                            self.status = "Cleared file selections".to_string();
+                        } else {
+                            self.mode = Mode::Normal;
+                            self.status = "Normal".to_string();
+                        }
+                    }
+                    ratatui::crossterm::event::KeyCode::Char(' ') => {
+                        self.toggle_tree_selection();
                     }
                     ratatui::crossterm::event::KeyCode::Up => {
                         let selected = self.tree_state.selected().unwrap_or(0);
@@ -2947,6 +2995,9 @@ impl App {
                     } else {
                         self.status = "Rename only for single file".to_string();
                     }
+                }
+                ratatui::crossterm::event::KeyCode::Char(' ') => {
+                    self.toggle_tree_selection(); // Allow cherry-picking while in visual mode
                 }
                 _ => {}
             },
@@ -3182,15 +3233,26 @@ impl App {
                             Style::default().fg(Color::White)
                         };
                         let mut li = ListItem::new(item.display.clone()).style(base_style);
-                        if self.mode == Mode::FileTreeVisual && i >= visual_min && i <= visual_max {
+
+                        let is_cherry_picked = self.tree_selected_paths.contains(&item.path);
+                        let in_visual_range =
+                            self.mode == Mode::FileTreeVisual && i >= visual_min && i <= visual_max;
+
+                        // Apply highlights based on selection priority
+                        if is_cherry_picked {
+                            // Yellow background for cherry-picked items
+                            li = li.style(Style::default().bg(Color::Yellow).fg(Color::Black));
+                        } else if in_visual_range {
+                            // LightBlue background for Vim-style visual range
                             li = li.style(Style::default().bg(Color::LightBlue));
                         } else if Some(i) == self.tree_state.selected() {
+                            // Standard white background for current cursor hover
                             li = li.style(Style::default().bg(Color::White).fg(Color::Black));
                         }
+
                         li
                     })
                     .collect();
-
                 let list = List::new(items).block(
                     Block::default()
                         .borders(Borders::ALL)
