@@ -20,6 +20,7 @@ pub mod lua_api;
 
 use app::App;
 use error::EditorError;
+use markdown_scanner::{delete_markdown_file, scan_markdown_file};
 
 fn main() -> Result<(), EditorError> {
     // Define CLI using clap
@@ -77,10 +78,18 @@ fn main() -> Result<(), EditorError> {
     // Check for and initialize markdown_data.db if it doesn't exist
     let db_path = Path::new(&base_dir).join("markdown_data.db");
     if !db_path.exists() {
-        ProcessCommand::new("markdown-scanner")
-            .arg(file_path)
-            .arg(&base_dir)
-            .output()?;
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| EditorError::Scanner(format!("Failed to start runtime: {}", e)))?;
+
+        let scan_result = rt.block_on(scan_markdown_file(
+            file_path,
+            &base_dir,
+            "markdown_data.db", // Ensure this matches your expected DB name
+            false,
+        ));
+        if let Err(e) = scan_result {
+            return Err(EditorError::Scanner(e.to_string()));
+        }
     }
 
     // 2. Force the scanner to run for this specific file on startup.

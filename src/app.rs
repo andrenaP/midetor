@@ -33,6 +33,7 @@ use walkdir::WalkDir;
 use unicode_width::UnicodeWidthChar;
 
 use crate::lua_api::{EditorCommand, EditorContext, LuaEditorAPI};
+use markdown_scanner::{delete_markdown_file, scan_markdown_file};
 use mlua::Lua;
 use ratatui::widgets::{Cell, Row, Table};
 use std::cell::RefCell;
@@ -570,14 +571,28 @@ impl App {
     fn save_file(&mut self) -> Result<(), EditorError> {
         fs::write(&self.file_path, self.textarea.lines().join("\n"))?;
 
-        let output = Command::new("markdown-scanner")
-            .arg(&self.file_path)
-            .arg(&self.base_dir)
-            .output()?;
+        // let output = Command::new("markdown-scanner")
+        //     .arg(&self.file_path)
+        //     .arg(&self.base_dir)
+        //     .output()?;
 
-        if !output.status.success() {
-            let error_msg = String::from_utf8_lossy(&output.stderr).into_owned();
-            return Err(EditorError::Scanner(error_msg));
+        // if !output.status.success() {
+        //     let error_msg = String::from_utf8_lossy(&output.stderr).into_owned();
+        //     return Err(EditorError::Scanner(error_msg));
+        // }
+
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| EditorError::Scanner(format!("Failed to start runtime: {}", e)))?;
+
+        let scan_result = rt.block_on(scan_markdown_file(
+            &self.file_path,
+            &self.base_dir,
+            "markdown_data.db", // Ensure this matches your expected DB name
+            false,
+        ));
+
+        if let Err(e) = scan_result {
+            return Err(EditorError::Scanner(e.to_string()));
         }
 
         self.status = "Saved".to_string();
@@ -683,13 +698,26 @@ impl App {
                 if !Path::new(&path).exists() {
                     fs::write(&path, "")?;
                 }
-                let output = Command::new("markdown-scanner")
-                    .arg(&path)
-                    .arg(&self.base_dir)
-                    .output()?;
-                if !output.status.success() {
-                    let error_msg = String::from_utf8_lossy(&output.stderr).into_owned();
-                    return Err(EditorError::Scanner(error_msg));
+                // let output = Command::new("markdown-scanner")
+                //     .arg(&path)
+                //     .arg(&self.base_dir)
+                //     .output()?;
+                // if !output.status.success() {
+                //     let error_msg = String::from_utf8_lossy(&output.stderr).into_owned();
+                //     return Err(EditorError::Scanner(error_msg));
+                // }
+                let rt = tokio::runtime::Runtime::new()
+                    .map_err(|e| EditorError::Scanner(format!("Failed to start runtime: {}", e)))?;
+
+                let scan_result = rt.block_on(scan_markdown_file(
+                    &path,
+                    &self.base_dir,
+                    "markdown_data.db", // Ensure this matches your expected DB name
+                    false,
+                ));
+
+                if let Err(e) = scan_result {
+                    return Err(EditorError::Scanner(e.to_string()));
                 }
                 let db_lock = self.db.borrow();
                 let mut stmt = db_lock.prepare("SELECT id FROM files WHERE file_name = ?")?;
@@ -1625,14 +1653,12 @@ impl App {
             .join(path)
             .to_string_lossy()
             .to_string();
-        let output = Command::new("markdown-scanner")
-            .arg("--delete")
-            .arg(&full_path)
-            .arg(&self.base_dir)
-            .output()?;
-        if !output.status.success() {
-            let error_msg = String::from_utf8_lossy(&output.stderr).into_owned();
-            return Err(EditorError::Scanner(error_msg));
+
+        // Call the synchronous function directly
+        let scan_result = delete_markdown_file(&full_path, &self.base_dir, "markdown_data.db");
+
+        if let Err(e) = scan_result {
+            return Err(EditorError::Scanner(e.to_string()));
         }
         fs::remove_file(&full_path)?;
         self.remove_node(path);
@@ -1805,13 +1831,18 @@ impl App {
                 .to_string_lossy()
                 .to_string();
             fs::write(&full_path, "")?;
-            let output = Command::new("markdown-scanner")
-                .arg(&full_path)
-                .arg(&self.base_dir)
-                .output()?;
-            if !output.status.success() {
-                let error_msg = String::from_utf8_lossy(&output.stderr).into_owned();
-                return Err(EditorError::Scanner(error_msg));
+            let rt = tokio::runtime::Runtime::new()
+                .map_err(|e| EditorError::Scanner(format!("Failed to start runtime: {}", e)))?;
+
+            let scan_result = rt.block_on(markdown_scanner::scan_markdown_file(
+                &full_path,
+                &self.base_dir,
+                "markdown_data.db", // Ensure this matches your expected DB name
+                false,
+            ));
+
+            if let Err(e) = scan_result {
+                return Err(EditorError::Scanner(e.to_string()));
             }
             self.file_tree = self.build_root();
             self.update_visible();
