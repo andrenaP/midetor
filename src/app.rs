@@ -842,7 +842,7 @@ impl App {
                     SELECT file_name AS result FROM files WHERE file_name LIKE ?
                     UNION
                     SELECT backlink AS result FROM backlinks WHERE backlink LIKE ?
-                ) LIMIT 10";
+                ) ORDER BY LENGTH(result) ASC LIMIT 10";
                 let db_lock = self.db.borrow();
                 let mut stmt = db_lock.prepare(sql)?;
 
@@ -853,7 +853,7 @@ impl App {
             }
             CompletionType::Tag => {
                 let search_pattern = format!("%{}%", query);
-                let sql = "SELECT tag FROM tags WHERE tag LIKE ? LIMIT 10";
+                let sql = "SELECT tag FROM tags WHERE tag LIKE ? ORDER BY LENGTH(tag) LIMIT 10";
                 let db_lock = self.db.borrow();
                 let mut stmt = db_lock.prepare(sql)?;
                 let closure = |row: &rusqlite::Row| row.get::<_, String>(0);
@@ -879,7 +879,9 @@ impl App {
             }
             CompletionType::None => Vec::new(),
         };
-
+        self.completion_state
+            .suggestions
+            .sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
         if !self.completion_state.suggestions.is_empty() {
             self.completion_state.list_state.select(Some(0));
         } else {
@@ -1080,6 +1082,12 @@ impl App {
             }
             SearchType::None => {}
         }
+
+        if matches!(self.search_state.search_type, SearchType::CustomLua { .. }) {
+            self.search_state
+                .results
+                .sort_by(|a, b| a.0.len().cmp(&b.0.len()).then_with(|| a.0.cmp(&b.0)));
+        }
         if !self.search_state.results.is_empty() {
             self.search_state.list_state.select(Some(0));
         } else {
@@ -1110,7 +1118,8 @@ impl App {
                      FROM backlinks b
                      JOIN files f ON b.file_id = f.id
                      JOIN files fp ON b.backlink_id = fp.id
-                     WHERE fp.file_name LIKE ? AND f.id != ?";
+                     WHERE fp.file_name LIKE ? AND f.id != ?
+                     ORDER BY LENGTH(f.file_name) ASC";
         let db_lock = self.db.borrow();
         let mut stmt = db_lock.prepare(query)?;
         let results = stmt
@@ -1130,7 +1139,7 @@ impl App {
     }
 
     fn search_tags(&mut self) -> Result<(), EditorError> {
-        let query = "SELECT DISTINCT tag FROM tags WHERE tag LIKE ?";
+        let query = "SELECT DISTINCT tag FROM tags WHERE tag LIKE ? ORDER BY LENGTH(tag) ASC";
         let db_lock = self.db.borrow();
         let mut stmt = db_lock.prepare(query)?;
         let search_pattern = if self.search_state.query.is_empty() {
@@ -1150,7 +1159,7 @@ impl App {
     }
 
     fn search_files(&mut self) -> Result<(), EditorError> {
-        let query = "SELECT file_name, id, json_extract (files.metadata, '$.created_at') as created_at FROM files WHERE file_name LIKE ? ORDER BY created_at DESC";
+        let query = "SELECT file_name, id, json_extract (files.metadata, '$.created_at') as created_at FROM files WHERE file_name LIKE ? ORDER BY LENGTH(file_name) ASC, created_at DESC";
         let db_lock = self.db.borrow();
         let mut stmt = db_lock.prepare(query)?;
         let search_pattern = if self.search_state.query.is_empty() {
