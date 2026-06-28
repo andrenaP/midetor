@@ -12,7 +12,6 @@ use ratatui::{
 use std::env;
 use std::io::stdout;
 use std::path::Path;
-use std::process::Command as ProcessCommand;
 
 mod app;
 mod error;
@@ -20,7 +19,7 @@ pub mod lua_api;
 
 use app::App;
 use error::EditorError;
-use markdown_scanner::{delete_markdown_file, scan_markdown_file};
+use markdown_scanner::scan_markdown_file;
 
 fn main() -> Result<(), EditorError> {
     // Define CLI using clap
@@ -45,46 +44,66 @@ fn main() -> Result<(), EditorError> {
         )
         .get_matches();
 
-    // Extract file_path
-    let file_path = matches.get_one::<String>("file_path").unwrap();
+    // Extract raw arguments
+    let raw_file_path = matches.get_one::<String>("file_path").unwrap();
     let music_path = matches
         .get_one::<String>("music_folder")
         .map(|s| s.to_string())
-        .or_else(|| env::var("MUSIC_FOLDER").ok()) // Standardized
-        .or_else(|| env::var("musik_folder").ok()) // Fallback
+        .or_else(|| env::var("MUSIC_FOLDER").ok())
+        .or_else(|| env::var("musik_folder").ok())
         .unwrap_or_else(|| env::current_dir().unwrap().to_string_lossy().to_string());
 
-    let base_dir = matches
+    let raw_base_dir = matches
         .get_one::<String>("base_dir")
         .map(|s| s.to_string())
-        .or_else(|| env::var("OBSIDIAN_VAULT_PATH").ok()) // Standardized
-        .or_else(|| env::var("Obsidian_valt_main_path").ok()) // Fallback
+        .or_else(|| env::var("OBSIDIAN_VAULT_PATH").ok())
+        .or_else(|| env::var("Obsidian_valt_main_path").ok())
         .unwrap_or_else(|| env::current_dir().unwrap().to_string_lossy().to_string());
 
-    // Ensure base_dir exists
-    if !Path::new(&base_dir).exists() {
+    // 1. Resolve and canonicalize the base directory
+    let base_dir_path = Path::new(&raw_base_dir);
+    if !base_dir_path.exists() {
         return Err(EditorError::InvalidPath(format!(
             "Base directory '{}' does not exist",
-            base_dir
+            raw_base_dir
         )));
     }
+    let base_dir_canonical = base_dir_path
+        .canonicalize()
+        .map_err(|e| EditorError::InvalidPath(format!("Failed to resolve base dir: {}", e)))?;
+    let base_dir_str = base_dir_canonical.to_string_lossy().to_string();
 
-    // Ensure the target file actually exists on the disk
-    let full_file_path = Path::new(&base_dir).join(file_path);
+    // 2. Resolve the full file path safely
+    // If raw_file_path is absolute, join() uses it directly.
+    // If it's relative, it smartly appends to the canonical base_dir.
+    let full_file_path = base_dir_canonical.join(raw_file_path);
+
+    // Ensure the target file (and any nested parent directories) exists
     if !full_file_path.exists() {
+        if let Some(parent) = full_file_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         std::fs::write(&full_file_path, "")?;
     }
 
-    // Check for and initialize markdown_data.db if it doesn't exist
-    let db_path = Path::new(&base_dir).join("markdown_data.db");
+    // Canonicalize the file path to strip any `./` or `../`
+    let full_file_path_canonical = full_file_path
+        .canonicalize()
+        .map_err(|e| EditorError::InvalidPath(format!("Failed to resolve file path: {}", e)))?;
+    let full_file_path_str = full_file_path_canonical.to_string_lossy().to_string();
+
+    // 3. Database check and Scanner initialization
+    let db_path = base_dir_canonical.join("markdown_data.db");
+    let db_path_str = db_path.to_string_lossy().to_string();
     if !db_path.exists() {
         let rt = tokio::runtime::Runtime::new()
             .map_err(|e| EditorError::Scanner(format!("Failed to start runtime: {}", e)))?;
 
+        // Pass the absolute db_path_str here!
         let scan_result = rt.block_on(scan_markdown_file(
-            file_path,
-            &base_dir,
-            "markdown_data.db", // Ensure this matches your expected DB name
+            &full_file_path_str,
+            &base_dir_str,
+            &db_path_str,
             false,
         ));
         if let Err(e) = scan_result {
@@ -92,25 +111,12 @@ fn main() -> Result<(), EditorError> {
         }
     }
 
-    // 2. Force the scanner to run for this specific file on startup.
-    // This ensures it is always in the database before App::new runs.
-    // let output = ProcessCommand::new("markdown-scanner")
-    //     .arg(&full_file_path)
-    //     .arg(&base_dir)
-    //     .output()?;
-
-    // if !output.status.success() {
-    //     let error_msg = String::from_utf8_lossy(&output.stderr).into_owned();
-    //     return Err(EditorError::Scanner(error_msg));
-    // }
-
     // Ensure terminal cleanup on exit
     struct TerminalGuard;
     impl Drop for TerminalGuard {
         fn drop(&mut self) {
             let _ = disable_raw_mode();
             let _ = execute!(stdout(), LeaveAlternateScreen, Show);
-            // let _ = ProcessCommand::new("stty").arg("echo").status();
         }
     }
     let _guard = TerminalGuard;
@@ -120,18 +126,15 @@ fn main() -> Result<(), EditorError> {
     execute!(stdout, EnterAlternateScreen, Show)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    let full_file_path_str = full_file_path.to_string_lossy().to_string();
 
-    let mut app = App::new(&full_file_path_str, &base_dir, &music_path)?;
+    // Pass the perfectly sanitized, absolute paths into the App
+    let mut app = App::new(&full_file_path_str, &base_dir_str, &music_path)?;
 
     while !app.should_quit {
-        // 1. Draw the UI
         app.render(&mut terminal)?;
 
-        // 2. Block until the user does *something* (Zero CPU usage while idle)
         let evt = event::read()?;
 
-        // 3. Process the event
         match evt {
             Event::Paste(s) => {
                 app.handle_paste(s)?;
@@ -141,9 +144,7 @@ fn main() -> Result<(), EditorError> {
                     app.handle_input(key_event)?;
                 }
             }
-            Event::Resize(_, _) => {
-                // Do nothing here. The loop will restart and automatically
-            }
+            Event::Resize(_, _) => {}
             _ => {}
         }
     }
