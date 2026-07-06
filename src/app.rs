@@ -191,6 +191,7 @@ pub enum BufferMode {
 
 pub struct App {
     db: Rc<RefCell<Connection>>,
+    db_path: String,
     file_path: String,
     base_dir: String,
     music_path: String,
@@ -274,8 +275,10 @@ pub struct SearchState {
 
 impl App {
     pub fn new(file_path: &str, base_dir: &str, music_path: &str) -> Result<Self, EditorError> {
-        let db_path = Path::new(base_dir).join("markdown_data.db");
-        let raw_db = Connection::open(db_path)?;
+        let db_path_buf = Path::new(base_dir).join("markdown_data.db");
+        let db_path = db_path_buf.to_string_lossy().to_string(); // Store for later
+
+        let raw_db = Connection::open(&db_path_buf)?;
         raw_db.execute("PRAGMA foreign_keys = ON;", [])?;
         let db = Rc::new(RefCell::new(raw_db));
 
@@ -359,6 +362,7 @@ impl App {
 
         let mut app = App {
             db,
+            db_path,
             file_path: file_path.to_string(),
             base_dir: base_dir.to_string(),
             music_path: music_path.to_string(),
@@ -580,15 +584,10 @@ impl App {
         let rt = tokio::runtime::Runtime::new()
             .map_err(|e| EditorError::Scanner(format!("Failed to start runtime: {}", e)))?;
 
-        let db_path = Path::new(&self.base_dir)
-            .join("markdown_data.db")
-            .to_string_lossy()
-            .to_string();
-
         let scan_result = rt.block_on(scan_markdown_file(
             &absolute_path.to_string_lossy(),
             &self.base_dir,
-            &db_path,
+            &self.db_path,
             false,
         ));
 
@@ -601,19 +600,46 @@ impl App {
     }
 
     fn open_file(&mut self, path: String, file_id: i64) -> Result<(), EditorError> {
-        self.file_path = path.clone();
-        self.file_id = file_id;
-        let absolute_path = if Path::new(&path).is_absolute() {
-            Path::new(&path).to_path_buf()
+        let path_buf = Path::new(&path);
+        let absolute_path = if path_buf.is_absolute() {
+            path_buf.to_path_buf()
         } else {
             Path::new(&self.base_dir).join(&path)
         };
+
+        // FIX: Ensure the file and its parent directories exist before running canonicalize()
+        // This prevents "OS Error 2" when opening entirely new files or dead links.
+        if !absolute_path.exists() {
+            if let Some(parent) = absolute_path.parent() {
+                fs::create_dir_all(parent).map_err(|e| {
+                    EditorError::InvalidPath(format!("Failed to create directories: {}", e))
+                })?;
+            }
+            fs::write(&absolute_path, "")
+                .map_err(|e| EditorError::InvalidPath(format!("Failed to create file: {}", e)))?;
+        }
+
+        // Use canonicalize to handle spaces, "./", and "../" correctly
+        let canonical_path = absolute_path.canonicalize().map_err(|e| {
+            EditorError::InvalidPath(format!(
+                "Cannot find path {}: {}",
+                absolute_path.display(),
+                e
+            ))
+        })?;
+
+        let path_str = canonical_path.to_string_lossy().to_string();
+
+        self.file_path = path_str;
+        self.file_id = file_id;
+
         let content = fs::read_to_string(&absolute_path).unwrap_or_default();
         let mut textarea = TextArea::new(content.lines().map(|s| s.to_string()).collect());
         set_textarea_delafult_style!(textarea);
         textarea.move_cursor(tui_textarea::CursorMove::Jump(0, 0));
         while textarea.undo() {}
         self.textarea = textarea;
+
         self.completion_state = CompletionState {
             active: false,
             completion_type: CompletionType::None,
@@ -622,6 +648,7 @@ impl App {
             list_state: ListState::default(),
             trigger_start: (0, 0),
         };
+
         self.tags = App::load_tags(&self.db.borrow(), self.file_id)?;
         self.backlinks = App::load_backlinks(&self.db.borrow(), self.file_id)?;
         self.view = View::Editor;
@@ -637,11 +664,9 @@ impl App {
         if let Ok(Some(json_str)) = self.db.borrow().query_row(query, params![path], |row| {
             row.get::<usize, Option<String>>(0)
         }) {
-            // Parse as an array of JSON objects instead of tuples
             match serde_json::from_str::<Vec<HashMap<String, String>>>(&json_str) {
                 Ok(videos) => {
                     for video in videos {
-                        // Safely extract the "url" and "title" keys from the JSON object
                         if let (Some(url), Some(title)) = (video.get("url"), video.get("title")) {
                             self.yt_videos.insert(url.trim().to_string(), title.clone());
                         }
@@ -652,116 +677,91 @@ impl App {
                 }
             }
         }
+
         // Load image at cursor or first image
         self.load_image_at_cursor()?;
 
         Ok(())
     }
 
-    fn open_wikilink_file(&mut self, wikilink: String) -> Result<(), EditorError> {
-        let current_file_id = self.file_id;
+    fn open_wikilink_file(&mut self, target: String) -> Result<(), EditorError> {
+        let target = target.trim();
+        if target.is_empty() {
+            return Err(EditorError::InvalidPath("Empty target".to_string()));
+        }
 
-        // 1. Try to resolve the exact target file using the backlinks table.
-        // We join `backlinks` with `files` to get the path of the file the link points to.
-        let target_result: Option<(i64, String)> = {
-            let db_lock = self.db.borrow();
-            if let Ok(mut stmt) = db_lock.prepare(
-                "SELECT f.id, f.path
-                     FROM backlinks b
-                     JOIN files f ON b.backlink_id = f.id
-                     WHERE b.file_id = ? AND b.backlink = ?",
-            ) {
-                stmt.query_row(rusqlite::params![current_file_id, wikilink], |row| {
-                    Ok((row.get(0)?, row.get(1)?))
-                })
-                .ok()
-            } else {
-                None
-            }
+        // 1. Normalize: Always ensure we have the .md extension for DB and Disk consistency
+        let relative_path = if target.ends_with(".md") {
+            target.to_string()
+        } else {
+            format!("{}.md", target)
         };
 
-        // 2. FALLBACK: If it hasn't been scanned as a backlink yet (e.g. newly typed but unsaved),
-        // try looking it up directly by file_name in the files table.
-        let target_result = target_result.or_else(|| {
-            let file_name = if wikilink.ends_with(".md") {
-                wikilink.clone()
-            } else {
-                format!("{}.md", wikilink)
-            };
+        let full_path = Path::new(&self.base_dir).join(&relative_path);
 
-            let db_lock = self.db.borrow();
-            let mut stmt = db_lock
-                .prepare("SELECT id, path FROM files WHERE file_name = ?")
-                .ok()?;
-            stmt.query_row([&file_name], |row| Ok((row.get(0)?, row.get(1)?)))
-                .ok()
-        });
+        // 2. Database Lookup (Isolated in a block to ensure 'db' is dropped)
+        let db_result: Option<(i64, String)> = {
+            let db = self.db.borrow();
+            // Query by relative path (the only way it is stored in DB)
+            let mut stmt = db.prepare(
+                "SELECT id, path FROM files WHERE path = ?1 OR file_name = ?1 OR file_name = ?2",
+            )?;
 
-        // 3. Resolve the (file_id, path) or CREATE a new file if it genuinely doesn't exist anywhere
-        let (file_id, path) = match target_result {
-            Some((id, path)) => (id, path),
+            stmt.query_row(params![relative_path, target], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .ok()
+        }; // <--- db lock is dropped here
+
+        // 3. Resolve to File ID and Path
+        let (file_id, path) = match db_result {
+            Some(res) => res,
             None => {
-                // File doesn't exist; create it in the base_dir
-                let file_name = if wikilink.ends_with(".md") {
-                    wikilink.clone()
-                } else {
-                    format!("{}.md", wikilink)
-                };
-                let path = format!("{}/{}", self.base_dir, file_name);
-                let path_buf = Path::new(&path);
-
-                if let Some(parent) = path_buf.parent() {
+                // File not in DB: Try to create/register it
+                if let Some(parent) = full_path.parent() {
                     fs::create_dir_all(parent)?;
                 }
-                if !path_buf.exists() {
-                    fs::write(&path_buf, "")?;
+                if !full_path.exists() {
+                    fs::write(&full_path, "")?;
                 }
 
-                // Start scanner to log it into the DB
-                let rt = tokio::runtime::Runtime::new()
-                    .map_err(|e| EditorError::Scanner(format!("Failed to start runtime: {}", e)))?;
+                // Scan it
+                let rt = tokio::runtime::Runtime::new().map_err(|e| {
+                    EditorError::Scanner(format!("Failed to create runtime: {}", e))
+                })?;
 
-                let db_path = Path::new(&self.base_dir)
-                    .join("markdown_data.db")
-                    .to_string_lossy()
-                    .to_string();
+                rt.block_on(scan_markdown_file(
+                    &full_path.to_string_lossy(),
+                    &self.base_dir,
+                    &self.db_path,
+                    false,
+                ))
+                .map_err(|e| EditorError::Scanner(e.to_string()))?;
 
-                let scan_result =
-                    rt.block_on(scan_markdown_file(&path, &self.base_dir, &db_path, false));
-
-                if let Err(e) = scan_result {
-                    return Err(EditorError::Scanner(e.to_string()));
-                }
-
-                // Re-fetch the newly created ID from the DB
-                let db_lock = self.db.borrow();
-                let mut stmt = db_lock.prepare("SELECT id FROM files WHERE path = ?")?;
-                let (file_id, resolved_path) = stmt
-                    .query_row([&file_name], |row| {
-                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-                    })
-                    .map_err(|e| EditorError::Database(e))?;
-
-                (file_id, resolved_path)
+                // Fetch the newly inserted ID
+                let db = self.db.borrow();
+                db.query_row(
+                    "SELECT id, path FROM files WHERE path = ?",
+                    [&relative_path],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )?
             }
         };
 
-        // 4. Record history and open the resolved file
+        // 4. Update History and Open
         self.history.truncate(self.history_index + 1);
         self.history.push((path.clone(), file_id));
         self.history_index += 1;
-        self.open_file(path, file_id)?;
 
-        Ok(())
+        self.open_file(path, file_id)
     }
 
     fn follow_backlink(&mut self, index: usize) -> Result<(), EditorError> {
         let (current_row, current_col) = self.textarea.cursor();
         let line = self.textarea.lines()[current_row].clone();
 
-        // If a specific index from the old logic is passed, use it.
-        // Otherwise (when index is usize::MAX), extract the link from the cursor position.
-        let wikilink = if index < self.backlinks.len() {
+        // 1. Determine if we are using a cached link or extracting from the cursor
+        let raw_link = if index < self.backlinks.len() {
             self.backlinks[index].0.clone()
         } else {
             self.extract_wikilink(&line, current_col).ok_or_else(|| {
@@ -769,7 +769,27 @@ impl App {
             })?
         };
 
-        // Clean incomplete autocompletions
+        // 2. Logic fix: Check if it's an @[[link]] and needs prefixing
+        // We look at the line text to see if an '@' precedes the wikilink
+        let mut final_link = raw_link.clone();
+
+        // Find the position of the wikilink in the line to check the prefix
+        if let Some(pos) = line.find(&format!("[[{}]]", raw_link)) {
+            if pos > 0 && line.chars().nth(pos - 1) == Some('@') {
+                // Get current file name (Assuming your struct tracks current_file or path)
+                // You might need to access self.current_file_path or similar
+                let file_stem = Path::new(&self.file_path) // Adjust this to your field name
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("");
+
+                if !file_stem.is_empty() {
+                    final_link = format!("{} - {}", file_stem, raw_link);
+                }
+            }
+        }
+
+        // Clean incomplete autocompletions (Keep your existing logic)
         if line.contains("[[") && !line.contains("]]") {
             let mut new_lines = self.textarea.lines().to_vec();
             new_lines[current_row] = line[..line.rfind("[[").unwrap_or(line.len())].to_string();
@@ -779,7 +799,8 @@ impl App {
                 .move_cursor(tui_textarea::CursorMove::Jump(current_row as u16, 0));
         }
 
-        self.open_wikilink_file(wikilink)?;
+        // 3. Open with the fully qualified path
+        self.open_wikilink_file(final_link)?;
 
         Ok(())
     }
@@ -1683,11 +1704,8 @@ impl App {
             .to_string();
 
         // Call the synchronous function directly
-        let db_path = Path::new(&self.base_dir)
-            .join("markdown_data.db")
-            .to_string_lossy()
-            .to_string();
-        let scan_result = delete_markdown_file(&full_path, &self.base_dir, &db_path);
+
+        let scan_result = delete_markdown_file(&full_path, &self.base_dir, &self.db_path);
 
         if let Err(e) = scan_result {
             return Err(EditorError::Scanner(e.to_string()));
@@ -1866,14 +1884,10 @@ impl App {
             let rt = tokio::runtime::Runtime::new()
                 .map_err(|e| EditorError::Scanner(format!("Failed to start runtime: {}", e)))?;
 
-            let db_path = Path::new(&self.base_dir)
-                .join("markdown_data.db")
-                .to_string_lossy()
-                .to_string();
-            let scan_result = rt.block_on(markdown_scanner::scan_markdown_file(
+            let scan_result = rt.block_on(scan_markdown_file(
                 &full_path,
                 &self.base_dir,
-                &db_path,
+                &self.db_path,
                 false,
             ));
 
@@ -1918,14 +1932,11 @@ impl App {
 
             let rt = tokio::runtime::Runtime::new()
                 .map_err(|e| EditorError::Scanner(format!("Failed to start runtime: {}", e)))?;
-            let db_path = Path::new(&self.base_dir)
-                .join("markdown_data.db")
-                .to_string_lossy()
-                .to_string();
-            let scan_result = rt.block_on(markdown_scanner::scan_markdown_file(
+
+            let scan_result = rt.block_on(scan_markdown_file(
                 &new_full,
                 &self.base_dir,
-                &db_path,
+                &self.db_path,
                 false,
             ));
             if let Err(e) = scan_result {
@@ -1957,14 +1968,11 @@ impl App {
             fs::rename(&old_full, &new_full)?;
             let rt = tokio::runtime::Runtime::new()
                 .map_err(|e| EditorError::Scanner(format!("Failed to start runtime: {}", e)))?;
-            let db_path = Path::new(&self.base_dir)
-                .join("markdown_data.db")
-                .to_string_lossy()
-                .to_string();
-            let scan_result = rt.block_on(markdown_scanner::scan_markdown_file(
+
+            let scan_result = rt.block_on(scan_markdown_file(
                 &new_full,
                 &self.base_dir,
-                &db_path,
+                &self.db_path,
                 false,
             ));
             if let Err(e) = scan_result {
@@ -1994,14 +2002,11 @@ impl App {
             fs::copy(&old_full, &new_full)?;
             let rt = tokio::runtime::Runtime::new()
                 .map_err(|e| EditorError::Scanner(format!("Failed to start runtime: {}", e)))?;
-            let db_path = Path::new(&self.base_dir)
-                .join("markdown_data.db")
-                .to_string_lossy()
-                .to_string();
-            let scan_result = rt.block_on(markdown_scanner::scan_markdown_file(
+
+            let scan_result = rt.block_on(scan_markdown_file(
                 &new_full,
                 &self.base_dir,
-                &db_path,
+                &self.db_path,
                 false,
             ));
             if let Err(e) = scan_result {
