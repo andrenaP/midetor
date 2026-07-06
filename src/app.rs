@@ -33,7 +33,6 @@ use walkdir::WalkDir;
 use unicode_width::UnicodeWidthChar;
 
 use crate::lua_api::{EditorCommand, EditorContext, LuaEditorAPI};
-use arboard::Clipboard;
 use markdown_scanner::{delete_markdown_file, scan_markdown_file};
 use mlua::Lua;
 use ratatui::widgets::{Cell, Row, Table};
@@ -3002,9 +3001,9 @@ impl App {
                     ratatui::crossterm::event::KeyCode::Char('x') => {
                         self.cut_selected();
                     }
-                    // ratatui::crossterm::event::KeyCode::Char('p') => {
-                    //     self.paste_buffer()?;
-                    // }
+                    ratatui::crossterm::event::KeyCode::Char('p') => {
+                        self.paste_buffer()?;
+                    }
                     ratatui::crossterm::event::KeyCode::Char('<') => {
                         if !self.full_tree && self.tree_width_percent > 10 {
                             self.tree_width_percent -= 5;
@@ -4756,8 +4755,8 @@ impl App {
                 EditorCommand::DeleteFile(path) => {
                     self.delete_file(&path)?;
                 }
-                EditorCommand::PasteImageFromClipboard => {
-                    self.paste_image_from_clipboard()?;
+                EditorCommand::PasteImageFromClipboard(path) => {
+                    self.paste_image_from_clipboard(&path)?;
                 }
                 _ => {}
             }
@@ -5184,9 +5183,9 @@ impl App {
         let mut pos = 0;
         self.table_state.parsed_filter = parse_or(&tokens, &mut pos, &parse_condition);
     }
-    pub fn paste_image_from_clipboard(&mut self) -> Result<(), EditorError> {
+    pub fn paste_image_from_clipboard(&mut self, path: &str) -> Result<(), EditorError> {
         // 1. Open the OS clipboard
-        let mut clipboard = match Clipboard::new() {
+        let mut clipboard = match arboard::Clipboard::new() {
             Ok(cb) => cb,
             Err(e) => {
                 self.status = format!("Clipboard error: {}", e);
@@ -5194,63 +5193,93 @@ impl App {
             }
         };
 
-        let mut dynamic_image_opt = None;
-
-        // 2. Scenario A: Try to grab raw image pixels (Browsers, Screenshots)
-        if let Ok(image_data) = clipboard.get_image() {
-            let width = image_data.width.try_into().unwrap_or(0);
-            let height = image_data.height.try_into().unwrap_or(0);
-
-            if let Some(img_buffer) =
-                image::RgbaImage::from_raw(width, height, image_data.bytes.into_owned())
-            {
-                dynamic_image_opt = Some(image::DynamicImage::ImageRgba8(img_buffer));
+        // 2. Construct target directory and ensure it exists (e.g., creates "Files" if missing)
+        let target_dir = Path::new(&self.base_dir).join(path);
+        if !target_dir.exists() {
+            if let Err(e) = fs::create_dir_all(&target_dir) {
+                self.status = format!("Failed to create folder '{}': {}", path, e);
+                return Ok(());
             }
         }
-        // 3. Scenario B: Try to grab text (Dolphin, Nautilus, Windows Explorer)
-        else if let Ok(text_data) = clipboard.get_text() {
-            // File managers often copy multiple files separated by newlines. We'll just take the first one.
-            let first_line = text_data.lines().next().unwrap_or("").trim();
 
-            let file_path: Option<PathBuf> = if first_line.starts_with("file://") {
-                // Parse the URI to safely handle spaces (%20) and special characters
-                Url::parse(first_line)
-                    .ok()
-                    .and_then(|url| url.to_file_path().ok())
-            } else if Path::new(first_line).exists() {
-                // Sometimes it's just a raw absolute path
-                Some(PathBuf::from(first_line))
-            } else {
-                None
-            };
+        let mut pasted_links = Vec::new();
 
-            // If we found a valid path, try to open it using the `image` crate
-            if let Some(path) = file_path {
-                if let Ok(img) = image::open(&path) {
-                    dynamic_image_opt = Some(img);
+        // 3. Scenario A: Handle File Paths (Dolphin, File Explorers)
+        if let Ok(text_data) = clipboard.get_text() {
+            // Iterate over every line in the clipboard text
+            for line in text_data.lines() {
+                let clean_line = line.trim();
+                if clean_line.is_empty() {
+                    continue;
+                }
+
+                // Extract valid PathBuf
+                let source_path: Option<PathBuf> = if clean_line.starts_with("file://") {
+                    Url::parse(clean_line)
+                        .ok()
+                        .and_then(|url| url.to_file_path().ok())
+                } else if Path::new(clean_line).exists() {
+                    Some(PathBuf::from(clean_line))
+                } else {
+                    None
+                };
+
+                // If we found a valid path, copy the file
+                if let Some(src_path) = source_path {
+                    if src_path.is_file() {
+                        if let Some(filename_os) = src_path.file_name() {
+                            let filename_str = filename_os.to_string_lossy().to_string();
+                            let dest_path = target_dir.join(filename_os);
+
+                            // Copy the file to the user-provided directory
+                            if let Err(e) = fs::copy(&src_path, &dest_path) {
+                                self.status = format!("Failed to copy {}: {}", filename_str, e);
+                                continue; // Skip this file but keep trying others
+                            }
+
+                            // Store the markdown link for successful copies
+                            pasted_links.push(format!("![[{}]]", filename_str));
+                        }
+                    }
                 }
             }
         }
 
-        // 4. Process the image if we successfully acquired it from either method
-        match dynamic_image_opt {
-            Some(dynamic_image) => {
-                let timestamp = chrono::Local::now().format("%Y%m%d%H%M%S");
-                let filename = format!("Pasted_Image_{}.png", timestamp);
-                let target_path = Path::new(&self.base_dir).join(&filename);
+        // 4. Scenario B: Fallback to Raw Image Pixels (Browser/Screenshots)
+        // Only attempt this if we didn't find any valid files in the text check
+        if pasted_links.is_empty() {
+            if let Ok(image_data) = clipboard.get_image() {
+                let width = image_data.width.try_into().unwrap_or(0);
+                let height = image_data.height.try_into().unwrap_or(0);
 
-                if let Err(e) = dynamic_image.save(&target_path) {
-                    self.status = format!("Failed to save image to disk: {}", e);
-                    return Ok(());
+                if let Some(img_buffer) =
+                    image::RgbaImage::from_raw(width, height, image_data.bytes.into_owned())
+                {
+                    let timestamp = chrono::Local::now().format("%Y%m%d%H%M%S");
+                    let filename = format!("Pasted_Image_{}.png", timestamp);
+                    let dest_path = target_dir.join(&filename);
+
+                    if image::DynamicImage::ImageRgba8(img_buffer)
+                        .save(&dest_path)
+                        .is_ok()
+                    {
+                        // For Obsidian-style markdown, we might want to include the folder path
+                        // depending on your exact link resolution logic.
+                        // pasted_links.push(format!("![[{}/{}]]", path, filename));
+                        pasted_links.push(format!("![[{}]]", filename));
+                    }
                 }
+            }
+        }
 
-                let markdown_link = format!("![[{}]]", filename);
-                self.textarea.insert_str(&markdown_link);
-                self.status = format!("Pasted image: {}", filename);
-            }
-            None => {
-                self.status = "No valid image or image file found in clipboard".to_string();
-            }
+        // 5. Update the text buffer and UI status
+        if !pasted_links.is_empty() {
+            // Join all links with a newline and insert into the textarea
+            let markdown_output = pasted_links.join("\n");
+            self.textarea.insert_str(&markdown_output);
+            self.status = format!("Successfully pasted {} file(s)", pasted_links.len());
+        } else {
+            self.status = "No valid files or image found in clipboard".to_string();
         }
 
         Ok(())

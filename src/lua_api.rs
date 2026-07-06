@@ -78,7 +78,7 @@ pub enum EditorCommand {
     SortTable(usize),
 
     DeleteFile(String),
-    PasteImageFromClipboard,
+    PasteImageFromClipboard(String),
 }
 
 pub struct LuaEditorAPI {
@@ -495,10 +495,10 @@ impl UserData for LuaEditorAPI {
                 .push(EditorCommand::DeleteFile(path));
             Ok(())
         });
-        methods.add_method("paste_image_from_clipboard", |_, this, ()| {
+        methods.add_method("paste_image_from_clipboard", |_, this, path: String| {
             this.command_queue
                 .borrow_mut()
-                .push(EditorCommand::PasteImageFromClipboard);
+                .push(EditorCommand::PasteImageFromClipboard(path));
             Ok(())
         });
     }
