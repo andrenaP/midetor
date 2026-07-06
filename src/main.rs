@@ -1,4 +1,4 @@
-use clap::{Arg, command};
+use clap::{Arg, ArgAction, Command};
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
@@ -19,33 +19,102 @@ pub mod lua_api;
 
 use app::App;
 use error::EditorError;
-use markdown_scanner::scan_markdown_file;
+use markdown_scanner::{delete_markdown_file, scan_markdown_file};
 
 fn main() -> Result<(), EditorError> {
-    // Define CLI using clap
-    let matches = command!()
+    // Define unified CLI using clap with subcommands
+    let matches = Command::new("midetor")
+        .version("1.2.0")
+        .about("Markdown editor and scanner combined")
+        // --- EDITOR ARGUMENTS (Default behavior) ---
         .arg(
             Arg::new("file_path")
                 .help("Path to the Markdown file to edit")
-                .required(true)
                 .index(1),
+                // Note: No longer .required(true) globally, so the `scan` subcommand can be run instead.
         )
         .arg(
             Arg::new("base_dir")
                 .help("Base directory of the Obsidian vault (defaults to OBSIDIAN_VAULT_PATH or current directory)")
                 .index(2)
-                .required(false),
         )
         .arg(
             Arg::new("music_folder")
                 .help("Music folder")
                 .index(3)
-                .required(false),
+        )
+        // --- SCANNER SUBCOMMAND ---
+        .subcommand(
+            Command::new("scan")
+                .about("Run the standalone markdown scanner")
+                .arg(Arg::new("file").required(true))
+                .arg(Arg::new("base_dir").required(true))
+                .arg(
+                    Arg::new("database")
+                        .long("database")
+                        .short('d')
+                        .default_value("markdown_data.db"),
+                )
+                .arg(
+                    Arg::new("json-only")
+                        .long("json-only")
+                        .action(ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("delete")
+                        .long("delete")
+                        .short('x')
+                        .action(ArgAction::SetTrue),
+                ),
         )
         .get_matches();
 
-    // Extract raw arguments
-    let raw_file_path = matches.get_one::<String>("file_path").unwrap();
+    // 1. Check if we are running the SCANNER
+
+    if let Some(scan_matches) = matches.subcommand_matches("scan") {
+        env_logger::init(); // Initialize logger only for the scanner if needed
+
+        let file_path = scan_matches.get_one::<String>("file").unwrap();
+        let base_dir = scan_matches.get_one::<String>("base_dir").unwrap();
+        let db_path = scan_matches.get_one::<String>("database").unwrap();
+        let json_only = scan_matches.get_flag("json-only");
+        let delete_flag = scan_matches.get_flag("delete");
+
+        // Spin up the tokio runtime for the async scanner code
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| EditorError::Scanner(format!("Failed to start runtime: {}", e)))?;
+
+        rt.block_on(async {
+            if delete_flag {
+                delete_markdown_file(file_path, base_dir, db_path)
+                    .map_err(|e| EditorError::Scanner(e.to_string()))?;
+            } else {
+                if let Some(json) = scan_markdown_file(file_path, base_dir, db_path, json_only)
+                    .await
+                    .map_err(|e| EditorError::Scanner(e.to_string()))?
+                {
+                    println!("{}", json);
+                }
+            }
+            Ok::<(), EditorError>(())
+        })?;
+
+        return Ok(()); // Exit early; we don't want to open the TUI editor
+    }
+
+    // 2. Otherwise, run the TUI EDITOR
+
+    // Ensure the user provided a file path (since it's only optional to allow subcommands)
+    let raw_file_path = match matches.get_one::<String>("file_path") {
+        Some(path) => path,
+        None => {
+            eprintln!("Error: 'file_path' is required unless using the 'scan' subcommand.");
+            eprintln!("Usage: midetor <file_path> [base_dir] [music_folder]");
+            eprintln!("       midetor scan <file> <base_dir> [OPTIONS]");
+            std::process::exit(1);
+        }
+    };
+
     let music_path = matches
         .get_one::<String>("music_folder")
         .map(|s| s.to_string())
@@ -60,7 +129,7 @@ fn main() -> Result<(), EditorError> {
         .or_else(|| env::var("Obsidian_valt_main_path").ok())
         .unwrap_or_else(|| env::current_dir().unwrap().to_string_lossy().to_string());
 
-    // 1. Resolve and canonicalize the base directory
+    // Resolve and canonicalize the base directory
     let base_dir_path = Path::new(&raw_base_dir);
     if !base_dir_path.exists() {
         return Err(EditorError::InvalidPath(format!(
@@ -73,17 +142,15 @@ fn main() -> Result<(), EditorError> {
         .map_err(|e| EditorError::InvalidPath(format!("Failed to resolve base dir: {}", e)))?;
     let base_dir_str = base_dir_canonical.to_string_lossy().to_string();
 
-    // 2. Resolve the full file path safely
-    // If raw_file_path is absolute, join() uses it directly.
-    // If it's relative, it smartly appends to the canonical base_dir.
+    // Resolve the full file path safely
     let full_file_path = base_dir_canonical.join(raw_file_path);
 
     // Ensure the target file (and any nested parent directories) exists
     if !full_file_path.exists() {
         if let Some(parent) = full_file_path.parent() {
-            std::fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(parent).map_err(|e| EditorError::InvalidPath(e.to_string()))?;
         }
-        std::fs::write(&full_file_path, "")?;
+        std::fs::write(&full_file_path, "").map_err(|e| EditorError::InvalidPath(e.to_string()))?;
     }
 
     // Canonicalize the file path to strip any `./` or `../`
@@ -92,14 +159,13 @@ fn main() -> Result<(), EditorError> {
         .map_err(|e| EditorError::InvalidPath(format!("Failed to resolve file path: {}", e)))?;
     let full_file_path_str = full_file_path_canonical.to_string_lossy().to_string();
 
-    // 3. Database check and Scanner initialization
+    // Database check and Scanner initialization
     let db_path = base_dir_canonical.join("markdown_data.db");
     let db_path_str = db_path.to_string_lossy().to_string();
     if !db_path.exists() {
         let rt = tokio::runtime::Runtime::new()
             .map_err(|e| EditorError::Scanner(format!("Failed to start runtime: {}", e)))?;
 
-        // Pass the absolute db_path_str here!
         let scan_result = rt.block_on(scan_markdown_file(
             &full_file_path_str,
             &base_dir_str,
@@ -121,11 +187,11 @@ fn main() -> Result<(), EditorError> {
     }
     let _guard = TerminalGuard;
 
-    enable_raw_mode()?;
+    enable_raw_mode().map_err(|e| EditorError::InvalidPath(e.to_string()))?; // map std::io::Error if needed
     let mut stdout = stdout();
-    execute!(stdout, EnterAlternateScreen, Show)?;
+    execute!(stdout, EnterAlternateScreen, Show).unwrap();
     let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    let mut terminal = Terminal::new(backend).unwrap();
 
     // Pass the perfectly sanitized, absolute paths into the App
     let mut app = App::new(&full_file_path_str, &base_dir_str, &music_path)?;
@@ -133,7 +199,7 @@ fn main() -> Result<(), EditorError> {
     while !app.should_quit {
         app.render(&mut terminal)?;
 
-        let evt = event::read()?;
+        let evt = event::read().unwrap();
 
         match evt {
             Event::Paste(s) => {

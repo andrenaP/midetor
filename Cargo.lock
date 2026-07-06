@@ -1493,6 +1493,7 @@ dependencies = [
  "chrono",
  "clap",
  "crossterm 0.27.0",
+ "env_logger",
  "image",
  "markdown-scanner",
  "mlua",

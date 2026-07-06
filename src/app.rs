@@ -539,7 +539,7 @@ impl App {
         let mut stmt = db.prepare(
             "SELECT DISTINCT b.backlink, f.id
              FROM backlinks b
-             JOIN files f ON b.backlink_id = f.id
+             JOIN vw_files_with_paths f ON b.backlink_id = f.id
              WHERE b.file_id = ?",
         )?;
         let mut backlinks = Vec::new();
