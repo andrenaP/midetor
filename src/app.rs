@@ -38,8 +38,10 @@ use markdown_scanner::{delete_markdown_file, scan_markdown_file};
 use mlua::Lua;
 use ratatui::widgets::{Cell, Row, Table};
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::rc::Rc;
 use unicode_width::UnicodeWidthStr;
+use url::Url;
 
 macro_rules! set_textarea_delafult_style {
     ($textarea:expr) => {
@@ -5188,47 +5190,67 @@ impl App {
             Ok(cb) => cb,
             Err(e) => {
                 self.status = format!("Clipboard error: {}", e);
-                return Ok(()); // Fail gracefully, don't crash the editor
-            }
-        };
-
-        // 2. Try to grab an image from the clipboard
-        let image_data = match clipboard.get_image() {
-            Ok(img) => img,
-            Err(_) => {
-                self.status = "No image found in clipboard".to_string();
                 return Ok(());
             }
         };
 
-        // 3. Convert arboard's raw byte array to an `image` crate buffer
-        let width = image_data.width.try_into().unwrap_or(0);
-        let height = image_data.height.try_into().unwrap_or(0);
+        let mut dynamic_image_opt = None;
 
-        if let Some(img_buffer) =
-            image::RgbaImage::from_raw(width, height, image_data.bytes.into_owned())
-        {
-            let dynamic_image = image::DynamicImage::ImageRgba8(img_buffer);
+        // 2. Scenario A: Try to grab raw image pixels (Browsers, Screenshots)
+        if let Ok(image_data) = clipboard.get_image() {
+            let width = image_data.width.try_into().unwrap_or(0);
+            let height = image_data.height.try_into().unwrap_or(0);
 
-            // 4. Generate an Obsidian-style timestamped filename
-            let timestamp = chrono::Local::now().format("%Y%m%d%H%M%S");
-            let filename = format!("Pasted_Image_{}.png", timestamp);
-
-            // Construct the absolute path where it will be saved
-            let target_path = Path::new(&self.base_dir).join(&filename);
-
-            // 5. Save the PNG to your workspace
-            if let Err(e) = dynamic_image.save(&target_path) {
-                self.status = format!("Failed to save image to disk: {}", e);
-                return Ok(());
+            if let Some(img_buffer) =
+                image::RgbaImage::from_raw(width, height, image_data.bytes.into_owned())
+            {
+                dynamic_image_opt = Some(image::DynamicImage::ImageRgba8(img_buffer));
             }
+        }
+        // 3. Scenario B: Try to grab text (Dolphin, Nautilus, Windows Explorer)
+        else if let Ok(text_data) = clipboard.get_text() {
+            // File managers often copy multiple files separated by newlines. We'll just take the first one.
+            let first_line = text_data.lines().next().unwrap_or("").trim();
 
-            // 6. Insert the markdown link into the current textarea buffer
-            let markdown_link = format!("![[{}]]", filename);
-            self.textarea.insert_str(&markdown_link);
-            self.status = format!("Pasted image: {}", filename);
-        } else {
-            self.status = "Failed to process clipboard image data".to_string();
+            let file_path: Option<PathBuf> = if first_line.starts_with("file://") {
+                // Parse the URI to safely handle spaces (%20) and special characters
+                Url::parse(first_line)
+                    .ok()
+                    .and_then(|url| url.to_file_path().ok())
+            } else if Path::new(first_line).exists() {
+                // Sometimes it's just a raw absolute path
+                Some(PathBuf::from(first_line))
+            } else {
+                None
+            };
+
+            // If we found a valid path, try to open it using the `image` crate
+            if let Some(path) = file_path {
+                if let Ok(img) = image::open(&path) {
+                    dynamic_image_opt = Some(img);
+                }
+            }
+        }
+
+        // 4. Process the image if we successfully acquired it from either method
+        match dynamic_image_opt {
+            Some(dynamic_image) => {
+                let timestamp = chrono::Local::now().format("%Y%m%d%H%M%S");
+                let filename = format!("Pasted_Image_{}.png", timestamp);
+                let target_path = Path::new(&self.base_dir).join(&filename);
+
+                if let Err(e) = dynamic_image.save(&target_path) {
+                    self.status = format!("Failed to save image to disk: {}", e);
+                    return Ok(());
+                }
+
+                let markdown_link = format!("![[{}]]", filename);
+                self.textarea.insert_str(&markdown_link);
+                self.status = format!("Pasted image: {}", filename);
+            }
+            None => {
+                self.status = "No valid image or image file found in clipboard".to_string();
+            }
         }
 
         Ok(())
