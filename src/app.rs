@@ -33,6 +33,7 @@ use walkdir::WalkDir;
 use unicode_width::UnicodeWidthChar;
 
 use crate::lua_api::{EditorCommand, EditorContext, LuaEditorAPI};
+use arboard::Clipboard;
 use markdown_scanner::{delete_markdown_file, scan_markdown_file};
 use mlua::Lua;
 use ratatui::widgets::{Cell, Row, Table};
@@ -2999,9 +3000,9 @@ impl App {
                     ratatui::crossterm::event::KeyCode::Char('x') => {
                         self.cut_selected();
                     }
-                    ratatui::crossterm::event::KeyCode::Char('p') => {
-                        self.paste_buffer()?;
-                    }
+                    // ratatui::crossterm::event::KeyCode::Char('p') => {
+                    //     self.paste_buffer()?;
+                    // }
                     ratatui::crossterm::event::KeyCode::Char('<') => {
                         if !self.full_tree && self.tree_width_percent > 10 {
                             self.tree_width_percent -= 5;
@@ -4753,6 +4754,9 @@ impl App {
                 EditorCommand::DeleteFile(path) => {
                     self.delete_file(&path)?;
                 }
+                EditorCommand::PasteImageFromClipboard => {
+                    self.paste_image_from_clipboard()?;
+                }
                 _ => {}
             }
         }
@@ -5177,6 +5181,57 @@ impl App {
 
         let mut pos = 0;
         self.table_state.parsed_filter = parse_or(&tokens, &mut pos, &parse_condition);
+    }
+    pub fn paste_image_from_clipboard(&mut self) -> Result<(), EditorError> {
+        // 1. Open the OS clipboard
+        let mut clipboard = match Clipboard::new() {
+            Ok(cb) => cb,
+            Err(e) => {
+                self.status = format!("Clipboard error: {}", e);
+                return Ok(()); // Fail gracefully, don't crash the editor
+            }
+        };
+
+        // 2. Try to grab an image from the clipboard
+        let image_data = match clipboard.get_image() {
+            Ok(img) => img,
+            Err(_) => {
+                self.status = "No image found in clipboard".to_string();
+                return Ok(());
+            }
+        };
+
+        // 3. Convert arboard's raw byte array to an `image` crate buffer
+        let width = image_data.width.try_into().unwrap_or(0);
+        let height = image_data.height.try_into().unwrap_or(0);
+
+        if let Some(img_buffer) =
+            image::RgbaImage::from_raw(width, height, image_data.bytes.into_owned())
+        {
+            let dynamic_image = image::DynamicImage::ImageRgba8(img_buffer);
+
+            // 4. Generate an Obsidian-style timestamped filename
+            let timestamp = chrono::Local::now().format("%Y%m%d%H%M%S");
+            let filename = format!("Pasted_Image_{}.png", timestamp);
+
+            // Construct the absolute path where it will be saved
+            let target_path = Path::new(&self.base_dir).join(&filename);
+
+            // 5. Save the PNG to your workspace
+            if let Err(e) = dynamic_image.save(&target_path) {
+                self.status = format!("Failed to save image to disk: {}", e);
+                return Ok(());
+            }
+
+            // 6. Insert the markdown link into the current textarea buffer
+            let markdown_link = format!("![[{}]]", filename);
+            self.textarea.insert_str(&markdown_link);
+            self.status = format!("Pasted image: {}", filename);
+        } else {
+            self.status = "Failed to process clipboard image data".to_string();
+        }
+
+        Ok(())
     }
 }
 

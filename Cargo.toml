@@ -28,6 +28,7 @@ unicode-width = "0.1"
 mlua = { version = "0.9", features = ["lua54", "vendored", "serialize"] }
 markdown-scanner = { path = "../markdown-scanner" }
 tokio = { version = "1.0", features = ["full"] }
+arboard = "3.4"
 
 
 [profile.release]
