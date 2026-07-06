@@ -475,15 +475,42 @@ impl App {
     }
 
     fn get_file_id(db: &Connection, path: &str) -> Result<i64, EditorError> {
-        let mut stmt = db.prepare("SELECT id FROM files WHERE path = ?")?;
+        let mut stmt = db.prepare("SELECT id FROM vw_files_with_paths WHERE path = ?")?;
+
         match stmt.query_row([path], |row| row.get(0)) {
             Ok(id) => Ok(id),
             Err(rusqlite::Error::QueryReturnedNoRows) => {
                 // The file isn't in the DB. Let's check if it exists on disk.
                 if std::path::Path::new(path).exists() {
-                    // Self-healing: Insert it into the DB right now so we don't crash.
-                    db.execute("INSERT INTO files (path) VALUES (?)", [path])
-                        .map_err(EditorError::Database)?;
+                    // --- SELF HEALING LOGIC UPDATED FOR NEW SCHEMA ---
+                    let path_obj = std::path::Path::new(path);
+
+                    // Extract the file name and the parent folder path
+                    let file_name = path_obj.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                    let folder_path = path_obj.parent().and_then(|s| s.to_str()).unwrap_or("");
+
+                    // 1. Get the folder_id (or create the folder if it doesn't exist yet)
+                    let folder_id: i64 = match db.query_row(
+                        "SELECT id FROM folders WHERE path = ?",
+                        [folder_path],
+                        |row| row.get(0),
+                    ) {
+                        Ok(id) => id, // Folder exists, grab its ID
+                        Err(rusqlite::Error::QueryReturnedNoRows) => {
+                            // Folder doesn't exist in DB yet, insert it
+                            db.execute("INSERT INTO folders (path) VALUES (?)", [folder_path])
+                                .map_err(EditorError::Database)?;
+                            db.last_insert_rowid()
+                        }
+                        Err(e) => return Err(EditorError::Database(e)),
+                    };
+
+                    // 2. Insert the file using the file_name and the folder_id
+                    db.execute(
+                        "INSERT INTO files (file_name, folder_id) VALUES (?, ?)",
+                        rusqlite::params![file_name, folder_id],
+                    )
+                    .map_err(EditorError::Database)?;
 
                     // Return the newly created ID
                     Ok(db.last_insert_rowid())
@@ -544,13 +571,15 @@ impl App {
                     .find(|(b, _)| b == &backlink)
                     .expect("Backlink should exist");
                 let existing_path = db
-                    .query_row("SELECT path FROM files WHERE id = ?", [existing.1], |row| {
-                        row.get::<_, String>(0)
-                    })
+                    .query_row(
+                        "SELECT path FROM vw_files_with_paths WHERE id = ?",
+                        [existing.1],
+                        |row| row.get::<_, String>(0),
+                    )
                     .unwrap_or_default();
                 let new_path = db
                     .query_row(
-                        "SELECT path FROM files WHERE id = ?",
+                        "SELECT path FROM vw_files_with_paths WHERE id = ?",
                         [backlink_id],
                         |row| row.get::<_, String>(0),
                     )
@@ -661,7 +690,8 @@ impl App {
         self.last_wikilink = None;
 
         self.yt_videos.clear();
-        let query = "SELECT json_extract(metadata, '$.ytVideos') FROM files WHERE path = ?1";
+        let query =
+            "SELECT json_extract(metadata, '$.ytVideos') FROM vw_files_with_paths WHERE path = ?1";
 
         if let Ok(Some(json_str)) = self.db.borrow().query_row(query, params![path], |row| {
             row.get::<usize, Option<String>>(0)
@@ -706,7 +736,7 @@ impl App {
             let db = self.db.borrow();
             // Query by relative path (the only way it is stored in DB)
             let mut stmt = db.prepare(
-                "SELECT id, path FROM files WHERE path = ?1 OR file_name = ?1 OR file_name = ?2",
+                "SELECT id, path FROM vw_files_with_paths WHERE path = ?1 OR file_name = ?1 OR file_name = ?2",
             )?;
 
             stmt.query_row(params![relative_path, target], |row| {
@@ -743,7 +773,7 @@ impl App {
                 // Fetch the newly inserted ID
                 let db = self.db.borrow();
                 db.query_row(
-                    "SELECT id, path FROM files WHERE path = ?",
+                    "SELECT id, path FROM vw_files_with_paths WHERE path = ?",
                     [&relative_path],
                     |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
                 )?
@@ -881,7 +911,7 @@ impl App {
             CompletionType::File => {
                 let search_pattern = format!("%{}%", query);
                 let sql = "SELECT DISTINCT result FROM (
-                    SELECT file_name AS result FROM files WHERE file_name LIKE ?
+                    SELECT file_name AS result FROM vw_files_with_paths WHERE file_name LIKE ?
                     UNION
                     SELECT backlink AS result FROM backlinks WHERE backlink LIKE ?
                 ) ORDER BY LENGTH(result) ASC LIMIT 10";
@@ -1035,7 +1065,7 @@ impl App {
     fn load_tag_files(&mut self, tag: &str) -> Result<(), EditorError> {
         let db_lock = self.db.borrow();
         let mut stmt = db_lock.prepare(
-            "SELECT f.file_name, f.id FROM files f
+            "SELECT f.file_name, f.id FROM vw_files_with_paths f
              JOIN file_tags ft ON f.id = ft.file_id
              JOIN tags t ON ft.tag_id = t.id
              WHERE t.tag = ?",
@@ -1064,9 +1094,11 @@ impl App {
                 let path: String = {
                     let db_lock = self.db.borrow();
                     db_lock
-                        .query_row("SELECT path FROM files WHERE id = ?", [file_id], |row| {
-                            row.get(0)
-                        })
+                        .query_row(
+                            "SELECT path FROM vw_files_with_paths WHERE id = ?",
+                            [file_id],
+                            |row| row.get(0),
+                        )
                         .map_err(|e| EditorError::Database(e))?
                 }; // <--- db_lock is safely dropped right here
 
@@ -1201,7 +1233,7 @@ impl App {
     }
 
     fn search_files(&mut self) -> Result<(), EditorError> {
-        let query = "SELECT file_name, id, json_extract (files.metadata, '$.created_at') as created_at FROM files WHERE file_name LIKE ? ORDER BY LENGTH(file_name) ASC, created_at DESC";
+        let query = "SELECT file_name, id, json_extract (files.metadata, '$.created_at') as created_at FROM vw_files_with_paths WHERE file_name LIKE ? ORDER BY LENGTH(file_name) ASC, created_at DESC";
         let db_lock = self.db.borrow();
         let mut stmt = db_lock.prepare(query)?;
         let search_pattern = if self.search_state.query.is_empty() {
@@ -1275,7 +1307,7 @@ impl App {
                                 let db_lock = self.db.borrow();
                                 db_lock
                                     .query_row(
-                                        "SELECT path FROM files WHERE id = ?",
+                                        "SELECT path FROM vw_files_with_paths WHERE id = ?",
                                         [file_id],
                                         |row| row.get(0),
                                     )
@@ -4000,7 +4032,7 @@ impl App {
     }
 
     fn resolve_image_path(&self, image_path: &str) -> Result<String, EditorError> {
-        let query = "SELECT path FROM files WHERE file_name = ? OR path = ?";
+        let query = "SELECT path FROM vw_files_with_paths WHERE file_name = ? OR path = ?";
         let db_lock = self.db.borrow();
         let mut stmt = db_lock.prepare(query)?;
         let path_result = stmt.query_row(params![image_path, image_path], |row| {
