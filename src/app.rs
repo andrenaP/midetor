@@ -289,7 +289,7 @@ impl App {
         let content = fs::read_to_string(file_path).unwrap_or_default();
         let mut textarea = TextArea::new(content.lines().map(|s| s.to_string()).collect());
         set_textarea_delafult_style!(textarea);
-        let file_id = App::get_file_id(&db.borrow(), file_path)?;
+        let file_id = App::get_file_id(&db.borrow(), file_path, base_dir)?;
         let tags = App::load_tags(&db.borrow(), file_id)?;
         let backlinks = App::load_backlinks(&db.borrow(), file_id)?;
 
@@ -474,50 +474,50 @@ impl App {
         Ok(())
     }
 
-    fn get_file_id(db: &Connection, path: &str) -> Result<i64, EditorError> {
+    // Update this signature in your impl App block
+    fn get_file_id(db: &Connection, path: &str, base_dir: &str) -> Result<i64, EditorError> {
         let mut stmt = db.prepare("SELECT id FROM vw_files_with_paths WHERE path = ?")?;
 
         match stmt.query_row([path], |row| row.get(0)) {
             Ok(id) => Ok(id),
             Err(rusqlite::Error::QueryReturnedNoRows) => {
-                // The file isn't in the DB. Let's check if it exists on disk.
-                if std::path::Path::new(path).exists() {
-                    // --- SELF HEALING LOGIC UPDATED FOR NEW SCHEMA ---
-                    let path_obj = std::path::Path::new(path);
+                let path_obj = Path::new(path);
+                let file_name = path_obj.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                let parent_path = path_obj.parent().unwrap_or(Path::new(""));
 
-                    // Extract the file name and the parent folder path
-                    let file_name = path_obj.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                    let folder_path = path_obj.parent().and_then(|s| s.to_str()).unwrap_or("");
+                // Use strip_prefix to get the relative folder path
+                let base_path = Path::new(base_dir);
+                let relative_folder_path = parent_path
+                    .strip_prefix(base_path)
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| "".to_string()); // Default to root if outside base
 
-                    // 1. Get the folder_id (or create the folder if it doesn't exist yet)
-                    let folder_id: i64 = match db.query_row(
-                        "SELECT id FROM folders WHERE path = ?",
-                        [folder_path],
-                        |row| row.get(0),
-                    ) {
-                        Ok(id) => id, // Folder exists, grab its ID
-                        Err(rusqlite::Error::QueryReturnedNoRows) => {
-                            // Folder doesn't exist in DB yet, insert it
-                            db.execute("INSERT INTO folders (path) VALUES (?)", [folder_path])
-                                .map_err(EditorError::Database)?;
-                            db.last_insert_rowid()
-                        }
-                        Err(e) => return Err(EditorError::Database(e)),
-                    };
+                // 1. Get/Create Folder ID
+                let folder_id: i64 = match db.query_row(
+                    "SELECT id FROM folders WHERE path = ?",
+                    [&relative_folder_path],
+                    |row| row.get(0),
+                ) {
+                    Ok(id) => id,
+                    Err(rusqlite::Error::QueryReturnedNoRows) => {
+                        db.execute(
+                            "INSERT INTO folders (path) VALUES (?)",
+                            [&relative_folder_path],
+                        )
+                        .map_err(EditorError::Database)?;
+                        db.last_insert_rowid()
+                    }
+                    Err(e) => return Err(EditorError::Database(e)),
+                };
 
-                    // 2. Insert the file using the file_name and the folder_id
-                    db.execute(
-                        "INSERT INTO files (file_name, folder_id) VALUES (?, ?)",
-                        rusqlite::params![file_name, folder_id],
-                    )
-                    .map_err(EditorError::Database)?;
+                // 2. Insert the file
+                db.execute(
+                    "INSERT INTO files (file_name, folder_id) VALUES (?, ?)",
+                    params![file_name, folder_id],
+                )
+                .map_err(EditorError::Database)?;
 
-                    // Return the newly created ID
-                    Ok(db.last_insert_rowid())
-                } else {
-                    // It genuinely doesn't exist anywhere
-                    Err(EditorError::FileNotFound(path.to_string()))
-                }
+                Ok(db.last_insert_rowid())
             }
             Err(e) => Err(EditorError::Database(e)),
         }
@@ -722,7 +722,7 @@ impl App {
             return Err(EditorError::InvalidPath("Empty target".to_string()));
         }
 
-        // 1. Normalize: Always ensure we have the .md extension for DB and Disk consistency
+        // 1. Normalize
         let relative_path = if target.ends_with(".md") {
             target.to_string()
         } else {
@@ -731,19 +731,19 @@ impl App {
 
         let full_path = Path::new(&self.base_dir).join(&relative_path);
 
-        // 2. Database Lookup (Isolated in a block to ensure 'db' is dropped)
+        // 2. Database Lookup
         let db_result: Option<(i64, String)> = {
             let db = self.db.borrow();
-            // Query by relative path (the only way it is stored in DB)
+            // FIX: Added LIMIT 1 and LIKE for case-insensitive/safe matching
             let mut stmt = db.prepare(
-                "SELECT id, path FROM vw_files_with_paths WHERE path = ?1 OR file_name = ?1 OR file_name = ?2",
-            )?;
+                    "SELECT id, path FROM vw_files_with_paths WHERE path LIKE ?1 OR file_name LIKE ?1 OR file_name LIKE ?2 LIMIT 1",
+                )?;
 
             stmt.query_row(params![relative_path, target], |row| {
                 Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
             })
             .ok()
-        }; // <--- db lock is dropped here
+        };
 
         // 3. Resolve to File ID and Path
         let (file_id, path) = match db_result {
@@ -770,13 +770,13 @@ impl App {
                 ))
                 .map_err(|e| EditorError::Scanner(e.to_string()))?;
 
-                // Fetch the newly inserted ID
+                // FIX: Match the robust logic from above
                 let db = self.db.borrow();
                 db.query_row(
-                    "SELECT id, path FROM vw_files_with_paths WHERE path = ?",
-                    [&relative_path],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
-                )?
+                        "SELECT id, path FROM vw_files_with_paths WHERE path LIKE ?1 OR file_name LIKE ?1 LIMIT 1",
+                        params![relative_path],
+                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                    )?
             }
         };
 
@@ -805,12 +805,10 @@ impl App {
         // We look at the line text to see if an '@' precedes the wikilink
         let mut final_link = raw_link.clone();
 
-        // Find the position of the wikilink in the line to check the prefix
+        // Replaced line.chars().nth(pos - 1) with safe byte-slice ends_with
         if let Some(pos) = line.find(&format!("[[{}]]", raw_link)) {
-            if pos > 0 && line.chars().nth(pos - 1) == Some('@') {
-                // Get current file name (Assuming your struct tracks current_file or path)
-                // You might need to access self.current_file_path or similar
-                let file_stem = Path::new(&self.file_path) // Adjust this to your field name
+            if pos > 0 && line[..pos].ends_with('@') {
+                let file_stem = Path::new(&self.file_path)
                     .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("");
@@ -1233,7 +1231,7 @@ impl App {
     }
 
     fn search_files(&mut self) -> Result<(), EditorError> {
-        let query = "SELECT file_name, id, json_extract (files.metadata, '$.created_at') as created_at FROM vw_files_with_paths WHERE file_name LIKE ? ORDER BY LENGTH(file_name) ASC, created_at DESC";
+        let query = "SELECT file_name, id, json_extract(metadata, '$.created_at') as created_at FROM vw_files_with_paths WHERE file_name LIKE ? ORDER BY LENGTH(file_name) ASC, created_at DESC";
         let db_lock = self.db.borrow();
         let mut stmt = db_lock.prepare(query)?;
         let search_pattern = if self.search_state.query.is_empty() {
