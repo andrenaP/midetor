@@ -79,6 +79,7 @@ pub enum EditorCommand {
 
     DeleteFile(String),
     PasteImageFromClipboard(String),
+    CleanOrphanedFiles(),
 }
 
 pub struct LuaEditorAPI {
@@ -499,6 +500,13 @@ impl UserData for LuaEditorAPI {
             this.command_queue
                 .borrow_mut()
                 .push(EditorCommand::PasteImageFromClipboard(path));
+            Ok(())
+        });
+        // DeleteOrphanFiles
+        methods.add_method("clean_orphaned_files", |_, this, ()| {
+            this.command_queue
+                .borrow_mut()
+                .push(EditorCommand::CleanOrphanedFiles());
             Ok(())
         });
     }

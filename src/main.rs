@@ -19,7 +19,10 @@ pub mod lua_api;
 
 use app::App;
 use error::EditorError;
-use markdown_scanner::{delete_markdown_file, scan_markdown_file};
+use markdown_scanner::{
+    clean_orphaned_files, delete_asset_file, delete_markdown_file, register_asset_file,
+    scan_markdown_file,
+};
 
 fn main() -> Result<(), EditorError> {
     // Define unified CLI using clap with subcommands
@@ -31,7 +34,6 @@ fn main() -> Result<(), EditorError> {
             Arg::new("file_path")
                 .help("Path to the Markdown file to edit")
                 .index(1),
-                // Note: No longer .required(true) globally, so the `scan` subcommand can be run instead.
         )
         .arg(
             Arg::new("base_dir")
@@ -65,6 +67,12 @@ fn main() -> Result<(), EditorError> {
                         .long("delete")
                         .short('x')
                         .action(ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("clean")
+                        .long("clean")
+                        .short('c')
+                        .action(clap::ArgAction::SetTrue),
                 ),
         )
         .get_matches();
@@ -76,9 +84,22 @@ fn main() -> Result<(), EditorError> {
 
         let file_path = scan_matches.get_one::<String>("file").unwrap();
         let base_dir = scan_matches.get_one::<String>("base_dir").unwrap();
-        let db_path = scan_matches.get_one::<String>("database").unwrap();
+        let raw_db_path = scan_matches.get_one::<String>("database").unwrap();
         let json_only = scan_matches.get_flag("json-only");
         let delete_flag = scan_matches.get_flag("delete");
+        let clean_flag = scan_matches.get_flag("clean");
+
+        // If json-only is true, use an in-memory SQLite database to prevent creating a file on disk.
+        let db_path = if json_only { ":memory:" } else { raw_db_path };
+        if clean_flag {
+            clean_orphaned_files(base_dir, db_path)
+                .map_err(|e| EditorError::Scanner(e.to_string()))?;
+        }
+        let is_markdown = Path::new(file_path)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|s| s.eq_ignore_ascii_case("md"))
+            .unwrap_or(false);
 
         // Spin up the tokio runtime for the async scanner code
         let rt = tokio::runtime::Runtime::new()
@@ -86,14 +107,25 @@ fn main() -> Result<(), EditorError> {
 
         rt.block_on(async {
             if delete_flag {
-                delete_markdown_file(file_path, base_dir, db_path)
-                    .map_err(|e| EditorError::Scanner(e.to_string()))?;
+                if is_markdown {
+                    delete_markdown_file(file_path, base_dir, db_path)
+                        .map_err(|e| EditorError::Scanner(e.to_string()))?;
+                } else {
+                    delete_asset_file(file_path, base_dir, db_path)
+                        .map_err(|e| EditorError::Scanner(e.to_string()))?;
+                }
             } else {
-                if let Some(json) = scan_markdown_file(file_path, base_dir, db_path, json_only)
-                    .await
-                    .map_err(|e| EditorError::Scanner(e.to_string()))?
-                {
-                    println!("{}", json);
+                if is_markdown {
+                    if let Some(json) = scan_markdown_file(file_path, base_dir, db_path, json_only)
+                        .await
+                        .map_err(|e| EditorError::Scanner(e.to_string()))?
+                    {
+                        println!("{}", json);
+                    }
+                } else {
+                    // It's an image or another asset, register it in the folders/files tables
+                    register_asset_file(file_path, base_dir, db_path)
+                        .map_err(|e| EditorError::Scanner(e.to_string()))?;
                 }
             }
             Ok::<(), EditorError>(())
@@ -163,16 +195,28 @@ fn main() -> Result<(), EditorError> {
     let db_path = base_dir_canonical.join("markdown_data.db");
     let db_path_str = db_path.to_string_lossy().to_string();
     if !db_path.exists() {
+        let is_markdown = Path::new(&full_file_path_str)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|s| s.eq_ignore_ascii_case("md"))
+            .unwrap_or(false);
+
         let rt = tokio::runtime::Runtime::new()
             .map_err(|e| EditorError::Scanner(format!("Failed to start runtime: {}", e)))?;
 
-        let scan_result = rt.block_on(scan_markdown_file(
-            &full_file_path_str,
-            &base_dir_str,
-            &db_path_str,
-            false,
-        ));
-        if let Err(e) = scan_result {
+        // If the initialized editor file is markdown, scan it to initialize DB.
+        // Otherwise, register it as an asset.
+        let init_result = rt.block_on(async {
+            if is_markdown {
+                scan_markdown_file(&full_file_path_str, &base_dir_str, &db_path_str, false)
+                    .await
+                    .map(|_| ())
+            } else {
+                register_asset_file(&full_file_path_str, &base_dir_str, &db_path_str)
+            }
+        });
+
+        if let Err(e) = init_result {
             return Err(EditorError::Scanner(e.to_string()));
         }
     }

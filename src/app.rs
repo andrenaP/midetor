@@ -33,7 +33,7 @@ use walkdir::WalkDir;
 use unicode_width::UnicodeWidthChar;
 
 use crate::lua_api::{EditorCommand, EditorContext, LuaEditorAPI};
-use markdown_scanner::{delete_markdown_file, scan_markdown_file};
+use markdown_scanner::{clean_orphaned_files, delete_markdown_file, scan_markdown_file};
 use mlua::Lua;
 use ratatui::widgets::{Cell, Row, Table};
 use std::cell::RefCell;
@@ -510,14 +510,26 @@ impl App {
                     Err(e) => return Err(EditorError::Database(e)),
                 };
 
-                // 2. Insert the file
-                db.execute(
-                    "INSERT INTO files (file_name, folder_id) VALUES (?, ?)",
+                // 2. Safely Get/Create File ID
+                let file_id: i64 = match db.query_row(
+                    "SELECT id FROM files WHERE file_name = ? AND folder_id = ?",
                     params![file_name, folder_id],
-                )
-                .map_err(EditorError::Database)?;
+                    |row| row.get(0),
+                ) {
+                    Ok(id) => id, // It already exists under this folder! Grab the ID.
+                    Err(rusqlite::Error::QueryReturnedNoRows) => {
+                        // It truly doesn't exist. Safe to insert.
+                        db.execute(
+                            "INSERT INTO files (file_name, folder_id) VALUES (?, ?)",
+                            params![file_name, folder_id],
+                        )
+                        .map_err(EditorError::Database)?;
+                        db.last_insert_rowid()
+                    }
+                    Err(e) => return Err(EditorError::Database(e)),
+                };
 
-                Ok(db.last_insert_rowid())
+                Ok(file_id)
             }
             Err(e) => Err(EditorError::Database(e)),
         }
@@ -1981,40 +1993,85 @@ impl App {
         Ok(())
     }
     fn move_paths(&mut self, paths: Vec<String>, target_dir: String) -> Result<(), EditorError> {
+        let target_base = if Path::new(&target_dir).is_absolute() {
+            Path::new(&target_dir).to_path_buf()
+        } else {
+            Path::new(&self.base_dir).join(&target_dir)
+        };
+
+        if !target_base.exists() {
+            fs::create_dir_all(&target_base)?;
+        }
+
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| EditorError::Scanner(format!("Failed to start runtime: {}", e)))?;
+
         for old_path in paths {
             let old_full = Path::new(&self.base_dir)
                 .join(&old_path)
                 .to_string_lossy()
                 .to_string();
+
             let filename = Path::new(&old_path)
                 .file_name()
                 .and_then(|s| s.to_str())
                 .unwrap_or("")
                 .to_string();
-            let new_path = format!("{}/{}", target_dir, filename);
-            let new_full = Path::new(&self.base_dir)
-                .join(&new_path)
-                .to_string_lossy()
-                .to_string();
-            self.delete_file(&old_full)?;
-            fs::rename(&old_full, &new_full)?;
-            let rt = tokio::runtime::Runtime::new()
-                .map_err(|e| EditorError::Scanner(format!("Failed to start runtime: {}", e)))?;
 
-            let scan_result = rt.block_on(scan_markdown_file(
-                &new_full,
-                &self.base_dir,
-                &self.db_path,
-                false,
-            ));
-            if let Err(e) = scan_result {
-                return Err(EditorError::Scanner(e.to_string()));
+            let new_full_path = target_base.join(&filename);
+            let new_full = new_full_path.to_string_lossy().to_string();
+
+            let src_path = Path::new(&old_full);
+            if !src_path.exists() {
+                continue;
             }
+
+            if let Some(parent) = new_full_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+
+            // 1. Remove old file/node tracking from DB/tree
             self.remove_node(&old_path);
+            let _ = delete_markdown_file(&old_full, &self.base_dir, &self.db_path);
+
+            // 2. Move/rename the file or directory on disk
+            fs::rename(&old_full, &new_full)?;
+
+            // 3. Recursively scan markdown files at the new location
+            if new_full_path.is_dir() {
+                for entry in WalkDir::new(&new_full_path)
+                    .into_iter()
+                    .filter_map(|e| e.ok())
+                {
+                    let path = entry.path();
+                    if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("md") {
+                        let scan_result = rt.block_on(scan_markdown_file(
+                            &path.to_string_lossy(),
+                            &self.base_dir,
+                            &self.db_path,
+                            false,
+                        ));
+                        if let Err(e) = scan_result {
+                            return Err(EditorError::Scanner(e.to_string()));
+                        }
+                    }
+                }
+            } else if new_full_path.is_file() {
+                if new_full_path.extension().and_then(|s| s.to_str()) == Some("md") {
+                    let scan_result = rt.block_on(scan_markdown_file(
+                        &new_full,
+                        &self.base_dir,
+                        &self.db_path,
+                        false,
+                    ));
+                    if let Err(e) = scan_result {
+                        return Err(EditorError::Scanner(e.to_string()));
+                    }
+                }
+            }
         }
         Ok(())
     }
-
     fn copy_paths(&mut self, paths: Vec<String>, target_dir: String) -> Result<(), EditorError> {
         for old_path in paths {
             let old_full = Path::new(&self.base_dir)
@@ -2031,18 +2088,51 @@ impl App {
                 .join(&new_path)
                 .to_string_lossy()
                 .to_string();
-            fs::copy(&old_full, &new_full)?;
-            let rt = tokio::runtime::Runtime::new()
-                .map_err(|e| EditorError::Scanner(format!("Failed to start runtime: {}", e)))?;
 
-            let scan_result = rt.block_on(scan_markdown_file(
-                &new_full,
-                &self.base_dir,
-                &self.db_path,
-                false,
-            ));
-            if let Err(e) = scan_result {
-                return Err(EditorError::Scanner(e.to_string()));
+            let src_path = Path::new(&old_full);
+            let dest_path = Path::new(&new_full);
+
+            if let Some(parent) = dest_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+
+            if src_path.is_dir() {
+                // Recursively copy directory contents
+                Self::copy_dir_all(src_path, dest_path)?;
+            } else if src_path.is_file() {
+                fs::copy(&old_full, &new_full)?;
+                // Only scan if it's a markdown file
+                if dest_path.extension().and_then(|s| s.to_str()) == Some("md") {
+                    let rt = tokio::runtime::Runtime::new().map_err(|e| {
+                        EditorError::Scanner(format!("Failed to start runtime: {}", e))
+                    })?;
+
+                    let scan_result = rt.block_on(scan_markdown_file(
+                        &new_full,
+                        &self.base_dir,
+                        &self.db_path,
+                        false,
+                    ));
+                    if let Err(e) = scan_result {
+                        return Err(EditorError::Scanner(e.to_string()));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // Helper to recursively copy directories
+    fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<(), io::Error> {
+        fs::create_dir_all(&dst)?;
+        for entry in fs::read_dir(src)? {
+            let entry = entry?;
+            let ty = entry.file_type()?;
+            let dest_path = dst.as_ref().join(entry.file_name());
+            if ty.is_dir() {
+                Self::copy_dir_all(entry.path(), dest_path)?;
+            } else {
+                fs::copy(entry.path(), dest_path)?;
             }
         }
         Ok(())
@@ -4787,6 +4877,10 @@ impl App {
                 }
                 EditorCommand::PasteImageFromClipboard(path) => {
                     self.paste_image_from_clipboard(&path)?;
+                }
+                EditorCommand::CleanOrphanedFiles() => {
+                    clean_orphaned_files(&self.base_dir, &self.db_path)
+                        .map_err(|e| EditorError::Scanner(e.to_string()))?;
                 }
                 _ => {}
             }
