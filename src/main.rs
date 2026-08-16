@@ -27,7 +27,7 @@ use markdown_scanner::{
 fn main() -> Result<(), EditorError> {
     // Define unified CLI using clap with subcommands
     let matches = Command::new("midetor")
-        .version("1.2.0")
+        .version("1.3.0")
         .about("Markdown editor and scanner combined")
         // --- EDITOR ARGUMENTS (Default behavior) ---
         .arg(
