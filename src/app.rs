@@ -33,11 +33,14 @@ use walkdir::WalkDir;
 use unicode_width::UnicodeWidthChar;
 
 use crate::lua_api::{EditorCommand, EditorContext, LuaEditorAPI};
+use markdown_scanner::{clean_orphaned_files, delete_markdown_file, scan_markdown_file};
 use mlua::Lua;
 use ratatui::widgets::{Cell, Row, Table};
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::rc::Rc;
 use unicode_width::UnicodeWidthStr;
+use url::Url;
 
 macro_rules! set_textarea_delafult_style {
     ($textarea:expr) => {
@@ -80,19 +83,33 @@ pub enum Mode {
     TableBrowserFilter,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum FilterCondition {
+    Search(String),
+    Include(Option<String>, String),
+    Exclude(Option<String>, String),
+}
+#[derive(Clone, Debug, PartialEq)]
+pub enum FilterExpr {
+    Condition(FilterCondition),
+    And(Vec<FilterExpr>),
+    Or(Vec<FilterExpr>),
+}
+
 // State for the Table Browser
 pub struct TableState {
     pub list_state: ratatui::widgets::TableState,
     pub columns: Vec<String>,
-    pub rows: Vec<Vec<String>>, // The queried data
-    pub filter_query: String,   // e.g., "+rust -dead book_title"
-    pub include_tags: Vec<(Option<String>, String)>,
-    pub exclude_tags: Vec<(Option<String>, String)>,
-    pub search_text: String,
-    pub sql_query: String,
-    pub formatter_key: Option<Rc<mlua::RegistryKey>>,
+    pub raw_data: Vec<Vec<String>>, // Stores the unfiltered base data
+    pub rows: Vec<Vec<String>>,     // Filtered and sorted data
+    pub filter_query: String,
+    pub parsed_filter: Option<FilterExpr>,
+    // pub include_tags: Vec<(Option<String>, String)>,
+    // pub exclude_tags: Vec<(Option<String>, String)>,
+    // pub search_text: String,
     pub sort_col: usize,
     pub sort_asc: bool,
+    pub on_submit_key: Option<Rc<mlua::RegistryKey>>,
 }
 
 impl Default for TableState {
@@ -100,15 +117,16 @@ impl Default for TableState {
         Self {
             list_state: ratatui::widgets::TableState::default(),
             columns: Vec::new(),
+            raw_data: Vec::new(),
             rows: Vec::new(),
             filter_query: String::new(),
-            include_tags: Vec::new(),
-            exclude_tags: Vec::new(),
-            search_text: String::new(),
-            sql_query: String::new(),
-            formatter_key: None,
+            parsed_filter: None,
+            // include_tags: Vec::new(),
+            // exclude_tags: Vec::new(),
+            // search_text: String::new(),
             sort_col: 0,
             sort_asc: true,
+            on_submit_key: None,
         }
     }
 }
@@ -174,7 +192,8 @@ pub enum BufferMode {
 }
 
 pub struct App {
-    db: Connection,
+    db: Rc<RefCell<Connection>>,
+    db_path: String,
     file_path: String,
     base_dir: String,
     music_path: String,
@@ -212,6 +231,7 @@ pub struct App {
     prev_mode: Option<Mode>,
     tree_visual_anchor: Option<usize>,
     tree_width_percent: u16,
+    tree_selected_paths: std::collections::HashSet<String>,
     full_tree: bool,
     buffer_mode: Option<BufferMode>,
     image_picker: Option<Picker>,
@@ -257,16 +277,21 @@ pub struct SearchState {
 
 impl App {
     pub fn new(file_path: &str, base_dir: &str, music_path: &str) -> Result<Self, EditorError> {
-        let db_path = Path::new(base_dir).join("markdown_data.db");
-        let db = Connection::open(db_path)?;
-        db.execute("PRAGMA foreign_keys = ON;", [])?;
+        let db_path_buf = Path::new(base_dir).join("markdown_data.db");
+        let db_path = db_path_buf.to_string_lossy().to_string(); // Store for later
+
+        let raw_db = Connection::open(&db_path_buf)?;
+        raw_db.execute("PRAGMA foreign_keys = ON;", [])?;
+        let db = Rc::new(RefCell::new(raw_db));
+
+        db.borrow().execute("PRAGMA foreign_keys = ON;", [])?;
 
         let content = fs::read_to_string(file_path).unwrap_or_default();
         let mut textarea = TextArea::new(content.lines().map(|s| s.to_string()).collect());
         set_textarea_delafult_style!(textarea);
-        let file_id = App::get_file_id(&db, file_path)?;
-        let tags = App::load_tags(&db, file_id)?;
-        let backlinks = App::load_backlinks(&db, file_id)?;
+        let file_id = App::get_file_id(&db.borrow(), file_path, base_dir)?;
+        let tags = App::load_tags(&db.borrow(), file_id)?;
+        let backlinks = App::load_backlinks(&db.borrow(), file_id)?;
 
         // Initialize syntax highlighting
         let syntax_set = SyntaxSet::load_defaults_newlines();
@@ -294,6 +319,7 @@ impl App {
             visual_keymaps: Rc::clone(&visual_keymaps),
             table_keymaps: Rc::clone(&table_keymaps),
             context: Rc::clone(&shared_context),
+            db: Rc::clone(&db), // Share DB connection with Lua
         };
 
         // 2. Expose the API to Lua under the global variable `editor`
@@ -338,6 +364,7 @@ impl App {
 
         let mut app = App {
             db,
+            db_path,
             file_path: file_path.to_string(),
             base_dir: base_dir.to_string(),
             music_path: music_path.to_string(),
@@ -387,6 +414,7 @@ impl App {
             prev_mode: None,
             tree_visual_anchor: None,
             tree_width_percent: 40,
+            tree_selected_paths: std::collections::HashSet::new(),
             full_tree: true,
             buffer_mode: None,
             image_picker: Some(picker),
@@ -446,13 +474,65 @@ impl App {
         Ok(())
     }
 
-    fn get_file_id(db: &Connection, path: &str) -> Result<i64, EditorError> {
-        let mut stmt = db.prepare("SELECT id FROM files WHERE path = ?")?;
-        stmt.query_row([path], |row| row.get(0))
-            .map_err(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => EditorError::FileNotFound(path.to_string()),
-                e => EditorError::Database(e),
-            })
+    // Update this signature in your impl App block
+    fn get_file_id(db: &Connection, path: &str, base_dir: &str) -> Result<i64, EditorError> {
+        let mut stmt = db.prepare("SELECT id FROM vw_files_with_paths WHERE path = ?")?;
+
+        match stmt.query_row([path], |row| row.get(0)) {
+            Ok(id) => Ok(id),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                let path_obj = Path::new(path);
+                let file_name = path_obj.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                let parent_path = path_obj.parent().unwrap_or(Path::new(""));
+
+                // Use strip_prefix to get the relative folder path
+                let base_path = Path::new(base_dir);
+                let relative_folder_path = parent_path
+                    .strip_prefix(base_path)
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| "".to_string()); // Default to root if outside base
+
+                // 1. Get/Create Folder ID
+                let folder_id: i64 = match db.query_row(
+                    "SELECT id FROM folders WHERE path = ?",
+                    [&relative_folder_path],
+                    |row| row.get(0),
+                ) {
+                    Ok(id) => id,
+                    Err(rusqlite::Error::QueryReturnedNoRows) => {
+                        db.execute(
+                            "INSERT INTO folders (path) VALUES (?)",
+                            [&relative_folder_path],
+                        )
+                        .map_err(EditorError::Database)?;
+                        db.last_insert_rowid()
+                    }
+                    Err(e) => return Err(EditorError::Database(e)),
+                };
+
+                // 2. Safely Get/Create File ID
+                let file_id: i64 = match db.query_row(
+                    "SELECT id FROM files WHERE file_name = ? AND folder_id = ?",
+                    params![file_name, folder_id],
+                    |row| row.get(0),
+                ) {
+                    Ok(id) => id, // It already exists under this folder! Grab the ID.
+                    Err(rusqlite::Error::QueryReturnedNoRows) => {
+                        // It truly doesn't exist. Safe to insert.
+                        db.execute(
+                            "INSERT INTO files (file_name, folder_id) VALUES (?, ?)",
+                            params![file_name, folder_id],
+                        )
+                        .map_err(EditorError::Database)?;
+                        db.last_insert_rowid()
+                    }
+                    Err(e) => return Err(EditorError::Database(e)),
+                };
+
+                Ok(file_id)
+            }
+            Err(e) => Err(EditorError::Database(e)),
+        }
     }
 
     fn load_tags(db: &Connection, file_id: i64) -> Result<Vec<String>, EditorError> {
@@ -471,7 +551,7 @@ impl App {
         let mut stmt = db.prepare(
             "SELECT DISTINCT b.backlink, f.id
              FROM backlinks b
-             JOIN files f ON b.backlink_id = f.id
+             JOIN vw_files_with_paths f ON b.backlink_id = f.id
              WHERE b.file_id = ?",
         )?;
         let mut backlinks = Vec::new();
@@ -503,13 +583,15 @@ impl App {
                     .find(|(b, _)| b == &backlink)
                     .expect("Backlink should exist");
                 let existing_path = db
-                    .query_row("SELECT path FROM files WHERE id = ?", [existing.1], |row| {
-                        row.get::<_, String>(0)
-                    })
+                    .query_row(
+                        "SELECT path FROM vw_files_with_paths WHERE id = ?",
+                        [existing.1],
+                        |row| row.get::<_, String>(0),
+                    )
                     .unwrap_or_default();
                 let new_path = db
                     .query_row(
-                        "SELECT path FROM files WHERE id = ?",
+                        "SELECT path FROM vw_files_with_paths WHERE id = ?",
                         [backlink_id],
                         |row| row.get::<_, String>(0),
                     )
@@ -534,16 +616,26 @@ impl App {
     }
 
     fn save_file(&mut self) -> Result<(), EditorError> {
-        fs::write(&self.file_path, self.textarea.lines().join("\n"))?;
+        let absolute_path = if Path::new(&self.file_path).is_absolute() {
+            Path::new(&self.file_path).to_path_buf()
+        } else {
+            Path::new(&self.base_dir).join(&self.file_path)
+        };
 
-        let output = Command::new("markdown-scanner")
-            .arg(&self.file_path)
-            .arg(&self.base_dir)
-            .output()?;
+        fs::write(&absolute_path, self.textarea.lines().join("\n"))?;
 
-        if !output.status.success() {
-            let error_msg = String::from_utf8_lossy(&output.stderr).into_owned();
-            return Err(EditorError::Scanner(error_msg));
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| EditorError::Scanner(format!("Failed to start runtime: {}", e)))?;
+
+        let scan_result = rt.block_on(scan_markdown_file(
+            &absolute_path.to_string_lossy(),
+            &self.base_dir,
+            &self.db_path,
+            false,
+        ));
+
+        if let Err(e) = scan_result {
+            return Err(EditorError::Scanner(e.to_string()));
         }
 
         self.status = "Saved".to_string();
@@ -551,14 +643,46 @@ impl App {
     }
 
     fn open_file(&mut self, path: String, file_id: i64) -> Result<(), EditorError> {
-        self.file_path = path.clone();
+        let path_buf = Path::new(&path);
+        let absolute_path = if path_buf.is_absolute() {
+            path_buf.to_path_buf()
+        } else {
+            Path::new(&self.base_dir).join(&path)
+        };
+
+        // FIX: Ensure the file and its parent directories exist before running canonicalize()
+        // This prevents "OS Error 2" when opening entirely new files or dead links.
+        if !absolute_path.exists() {
+            if let Some(parent) = absolute_path.parent() {
+                fs::create_dir_all(parent).map_err(|e| {
+                    EditorError::InvalidPath(format!("Failed to create directories: {}", e))
+                })?;
+            }
+            fs::write(&absolute_path, "")
+                .map_err(|e| EditorError::InvalidPath(format!("Failed to create file: {}", e)))?;
+        }
+
+        // Use canonicalize to handle spaces, "./", and "../" correctly
+        let canonical_path = absolute_path.canonicalize().map_err(|e| {
+            EditorError::InvalidPath(format!(
+                "Cannot find path {}: {}",
+                absolute_path.display(),
+                e
+            ))
+        })?;
+
+        let path_str = canonical_path.to_string_lossy().to_string();
+
+        self.file_path = path_str;
         self.file_id = file_id;
-        let content = fs::read_to_string(&self.file_path).unwrap_or_default();
+
+        let content = fs::read_to_string(&absolute_path).unwrap_or_default();
         let mut textarea = TextArea::new(content.lines().map(|s| s.to_string()).collect());
         set_textarea_delafult_style!(textarea);
         textarea.move_cursor(tui_textarea::CursorMove::Jump(0, 0));
         while textarea.undo() {}
         self.textarea = textarea;
+
         self.completion_state = CompletionState {
             active: false,
             completion_type: CompletionType::None,
@@ -567,8 +691,9 @@ impl App {
             list_state: ListState::default(),
             trigger_start: (0, 0),
         };
-        self.tags = App::load_tags(&self.db, self.file_id)?;
-        self.backlinks = App::load_backlinks(&self.db, self.file_id)?;
+
+        self.tags = App::load_tags(&self.db.borrow(), self.file_id)?;
+        self.backlinks = App::load_backlinks(&self.db.borrow(), self.file_id)?;
         self.view = View::Editor;
         self.mode = Mode::Normal;
         self.status = "Normal".to_string();
@@ -577,16 +702,15 @@ impl App {
         self.last_wikilink = None;
 
         self.yt_videos.clear();
-        let query = "SELECT json_extract(metadata, '$.ytVideos') FROM files WHERE path = ?1";
+        let query =
+            "SELECT json_extract(metadata, '$.ytVideos') FROM vw_files_with_paths WHERE path = ?1";
 
-        if let Ok(Some(json_str)) = self.db.query_row(query, params![path], |row| {
+        if let Ok(Some(json_str)) = self.db.borrow().query_row(query, params![path], |row| {
             row.get::<usize, Option<String>>(0)
         }) {
-            // Parse as an array of JSON objects instead of tuples
             match serde_json::from_str::<Vec<HashMap<String, String>>>(&json_str) {
                 Ok(videos) => {
                     for video in videos {
-                        // Safely extract the "url" and "title" keys from the JSON object
                         if let (Some(url), Some(title)) = (video.get("url"), video.get("title")) {
                             self.yt_videos.insert(url.trim().to_string(), title.clone());
                         }
@@ -597,92 +721,91 @@ impl App {
                 }
             }
         }
+
         // Load image at cursor or first image
         self.load_image_at_cursor()?;
 
         Ok(())
     }
 
-    fn open_wikilink_file(&mut self, wikilink: String) -> Result<(), EditorError> {
-        // Extract file name from the path
-        let wikilink = if wikilink.ends_with(".md") {
-            wikilink
-        } else {
-            format!("{}.md", wikilink)
-        };
-        let file_name = Path::new(&wikilink)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .map(|s| {
-                // if s.ends_with(".md") {
-                s.to_string()
-                // } else {
-                //     format!("{}.md", s)
-                // }
-            })
-            .unwrap_or_else(|| {
-                if wikilink.ends_with(".md") {
-                    wikilink.clone()
-                } else {
-                    format!("{}.md", wikilink)
-                }
-            });
+    fn open_wikilink_file(&mut self, target: String) -> Result<(), EditorError> {
+        let target = target.trim();
+        if target.is_empty() {
+            return Err(EditorError::InvalidPath("Empty target".to_string()));
+        }
 
-        // Try to find the file by file_name in the database
-        let file_result = {
-            let mut stmt = self
-                .db
-                .prepare("SELECT id, path FROM files WHERE file_name = ?")?;
-            stmt.query_row([&file_name], |row| {
+        // 1. Normalize
+        let relative_path = if target.ends_with(".md") {
+            target.to_string()
+        } else {
+            format!("{}.md", target)
+        };
+
+        let full_path = Path::new(&self.base_dir).join(&relative_path);
+
+        // 2. Database Lookup
+        let db_result: Option<(i64, String)> = {
+            let db = self.db.borrow();
+            // FIX: Added LIMIT 1 and LIKE for case-insensitive/safe matching
+            let mut stmt = db.prepare(
+                    "SELECT id, path FROM vw_files_with_paths WHERE path LIKE ?1 OR file_name LIKE ?1 OR file_name LIKE ?2 LIMIT 1",
+                )?;
+
+            stmt.query_row(params![relative_path, target], |row| {
                 Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
             })
+            .ok()
         };
 
-        let (file_id, path) = match file_result {
-            Ok((id, path)) => (id, path),
-            Err(rusqlite::Error::QueryReturnedNoRows) => {
-                // File doesn't exist; create it in the base_dir
-                let path = format!("{}/{}", self.base_dir, wikilink); // Use original wikilink as path
-                if let Some(parent) = Path::new(&path).parent() {
+        // 3. Resolve to File ID and Path
+        let (file_id, path) = match db_result {
+            Some(res) => res,
+            None => {
+                // File not in DB: Try to create/register it
+                if let Some(parent) = full_path.parent() {
                     fs::create_dir_all(parent)?;
                 }
-                // Only write an empty file if it doesn't already exist
-                if !Path::new(&path).exists() {
-                    fs::write(&path, "")?;
+                if !full_path.exists() {
+                    fs::write(&full_path, "")?;
                 }
-                let output = Command::new("markdown-scanner")
-                    .arg(&path)
-                    .arg(&self.base_dir)
-                    .output()?;
-                if !output.status.success() {
-                    let error_msg = String::from_utf8_lossy(&output.stderr).into_owned();
-                    return Err(EditorError::Scanner(error_msg));
-                }
-                let mut stmt = self
-                    .db
-                    .prepare("SELECT id FROM files WHERE file_name = ?")?;
-                let file_id = stmt
-                    .query_row([&file_name], |row| row.get(0))
-                    .map_err(|e| EditorError::Database(e))?;
-                (file_id, path)
+
+                // Scan it
+                let rt = tokio::runtime::Runtime::new().map_err(|e| {
+                    EditorError::Scanner(format!("Failed to create runtime: {}", e))
+                })?;
+
+                rt.block_on(scan_markdown_file(
+                    &full_path.to_string_lossy(),
+                    &self.base_dir,
+                    &self.db_path,
+                    false,
+                ))
+                .map_err(|e| EditorError::Scanner(e.to_string()))?;
+
+                // FIX: Match the robust logic from above
+                let db = self.db.borrow();
+                db.query_row(
+                        "SELECT id, path FROM vw_files_with_paths WHERE path LIKE ?1 OR file_name LIKE ?1 LIMIT 1",
+                        params![relative_path],
+                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                    )?
             }
-            Err(e) => return Err(EditorError::Database(e)),
         };
 
+        // 4. Update History and Open
         self.history.truncate(self.history_index + 1);
         self.history.push((path.clone(), file_id));
         self.history_index += 1;
-        self.open_file(path, file_id)?;
-        Ok(())
+
+        self.open_file(path, file_id)
     }
 
     fn follow_backlink(&mut self, index: usize) -> Result<(), EditorError> {
         let (current_row, current_col) = self.textarea.cursor();
         let line = self.textarea.lines()[current_row].clone();
 
-        // If a specific index from the old logic is passed, use it.
-        // Otherwise (when index is usize::MAX), extract the link from the cursor position.
-        let wikilink = if index < self.backlinks.len() {
+        // 1. Determine if we are using a cached link or extracting from the cursor
+        let raw_link = if index < self.backlinks.len() {
             self.backlinks[index].0.clone()
         } else {
             self.extract_wikilink(&line, current_col).ok_or_else(|| {
@@ -690,7 +813,25 @@ impl App {
             })?
         };
 
-        // Clean incomplete autocompletions
+        // 2. Logic fix: Check if it's an @[[link]] and needs prefixing
+        // We look at the line text to see if an '@' precedes the wikilink
+        let mut final_link = raw_link.clone();
+
+        // Replaced line.chars().nth(pos - 1) with safe byte-slice ends_with
+        if let Some(pos) = line.find(&format!("[[{}]]", raw_link)) {
+            if pos > 0 && line[..pos].ends_with('@') {
+                let file_stem = Path::new(&self.file_path)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("");
+
+                if !file_stem.is_empty() {
+                    final_link = format!("{} - {}", file_stem, raw_link);
+                }
+            }
+        }
+
+        // Clean incomplete autocompletions (Keep your existing logic)
         if line.contains("[[") && !line.contains("]]") {
             let mut new_lines = self.textarea.lines().to_vec();
             new_lines[current_row] = line[..line.rfind("[[").unwrap_or(line.len())].to_string();
@@ -700,7 +841,8 @@ impl App {
                 .move_cursor(tui_textarea::CursorMove::Jump(current_row as u16, 0));
         }
 
-        self.open_wikilink_file(wikilink)?;
+        // 3. Open with the fully qualified path
+        self.open_wikilink_file(final_link)?;
 
         Ok(())
     }
@@ -779,11 +921,13 @@ impl App {
             CompletionType::File => {
                 let search_pattern = format!("%{}%", query);
                 let sql = "SELECT DISTINCT result FROM (
-                    SELECT file_name AS result FROM files WHERE file_name LIKE ?
+                    SELECT file_name AS result FROM vw_files_with_paths WHERE file_name LIKE ?
                     UNION
                     SELECT backlink AS result FROM backlinks WHERE backlink LIKE ?
-                ) LIMIT 10";
-                let mut stmt = self.db.prepare(sql)?;
+                ) ORDER BY LENGTH(result) ASC LIMIT 10";
+                let db_lock = self.db.borrow();
+                let mut stmt = db_lock.prepare(sql)?;
+
                 let closure = |row: &rusqlite::Row| row.get::<_, String>(0);
                 let mapped_rows =
                     stmt.query_map(params![search_pattern, search_pattern], closure)?;
@@ -791,8 +935,9 @@ impl App {
             }
             CompletionType::Tag => {
                 let search_pattern = format!("%{}%", query);
-                let sql = "SELECT tag FROM tags WHERE tag LIKE ? LIMIT 10";
-                let mut stmt = self.db.prepare(sql)?;
+                let sql = "SELECT tag FROM tags WHERE tag LIKE ? ORDER BY LENGTH(tag) LIMIT 10";
+                let db_lock = self.db.borrow();
+                let mut stmt = db_lock.prepare(sql)?;
                 let closure = |row: &rusqlite::Row| row.get::<_, String>(0);
                 let mapped_rows = stmt.query_map(params![search_pattern], closure)?;
                 mapped_rows.collect::<Result<Vec<_>, _>>()?
@@ -816,7 +961,9 @@ impl App {
             }
             CompletionType::None => Vec::new(),
         };
-
+        self.completion_state
+            .suggestions
+            .sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
         if !self.completion_state.suggestions.is_empty() {
             self.completion_state.list_state.select(Some(0));
         } else {
@@ -926,8 +1073,9 @@ impl App {
     }
 
     fn load_tag_files(&mut self, tag: &str) -> Result<(), EditorError> {
-        let mut stmt = self.db.prepare(
-            "SELECT f.file_name, f.id FROM files f
+        let db_lock = self.db.borrow();
+        let mut stmt = db_lock.prepare(
+            "SELECT f.file_name, f.id FROM vw_files_with_paths f
              JOIN file_tags ft ON f.id = ft.file_id
              JOIN tags t ON ft.tag_id = t.id
              WHERE t.tag = ?",
@@ -953,13 +1101,17 @@ impl App {
     fn select_tag_file(&mut self) -> Result<(), EditorError> {
         if let Some(selected) = self.tag_files_state.selected() {
             if let Some((_file_name, file_id)) = self.tag_files.get(selected) {
-                // Retrieve full path from database
-                let path: String = self
-                    .db
-                    .query_row("SELECT path FROM files WHERE id = ?", [file_id], |row| {
-                        row.get(0)
-                    })
-                    .map_err(|e| EditorError::Database(e))?;
+                let path: String = {
+                    let db_lock = self.db.borrow();
+                    db_lock
+                        .query_row(
+                            "SELECT path FROM vw_files_with_paths WHERE id = ?",
+                            [file_id],
+                            |row| row.get(0),
+                        )
+                        .map_err(|e| EditorError::Database(e))?
+                }; // <--- db_lock is safely dropped right here
+
                 self.history.truncate(self.history_index + 1);
                 self.history.push((path.clone(), *file_id));
                 self.history_index += 1;
@@ -1014,6 +1166,12 @@ impl App {
             }
             SearchType::None => {}
         }
+
+        if matches!(self.search_state.search_type, SearchType::CustomLua { .. }) {
+            self.search_state
+                .results
+                .sort_by(|a, b| a.0.len().cmp(&b.0.len()).then_with(|| a.0.cmp(&b.0)));
+        }
         if !self.search_state.results.is_empty() {
             self.search_state.list_state.select(Some(0));
         } else {
@@ -1044,8 +1202,10 @@ impl App {
                      FROM backlinks b
                      JOIN files f ON b.file_id = f.id
                      JOIN files fp ON b.backlink_id = fp.id
-                     WHERE fp.file_name LIKE ? AND f.id != ?";
-        let mut stmt = self.db.prepare(query)?;
+                     WHERE fp.file_name LIKE ? AND f.id != ?
+                     ORDER BY LENGTH(f.file_name) ASC";
+        let db_lock = self.db.borrow();
+        let mut stmt = db_lock.prepare(query)?;
         let results = stmt
             .query_map(params![format!("{}", target), self.file_id], |row| {
                 let file_name: String = row.get(0)?;
@@ -1063,8 +1223,9 @@ impl App {
     }
 
     fn search_tags(&mut self) -> Result<(), EditorError> {
-        let query = "SELECT DISTINCT tag FROM tags WHERE tag LIKE ?";
-        let mut stmt = self.db.prepare(query)?;
+        let query = "SELECT DISTINCT tag FROM tags WHERE tag LIKE ? ORDER BY LENGTH(tag) ASC";
+        let db_lock = self.db.borrow();
+        let mut stmt = db_lock.prepare(query)?;
         let search_pattern = if self.search_state.query.is_empty() {
             "%".to_string()
         } else {
@@ -1082,8 +1243,9 @@ impl App {
     }
 
     fn search_files(&mut self) -> Result<(), EditorError> {
-        let query = "SELECT file_name, id, json_extract (files.metadata, '$.created_at') as created_at FROM files WHERE file_name LIKE ? ORDER BY created_at DESC";
-        let mut stmt = self.db.prepare(query)?;
+        let query = "SELECT file_name, id, json_extract(metadata, '$.created_at') as created_at FROM vw_files_with_paths WHERE file_name LIKE ? ORDER BY LENGTH(file_name) ASC, created_at DESC";
+        let db_lock = self.db.borrow();
+        let mut stmt = db_lock.prepare(query)?;
         let search_pattern = if self.search_state.query.is_empty() {
             "%".to_string()
         } else {
@@ -1151,14 +1313,16 @@ impl App {
                     SearchType::Backlinks | SearchType::Files | SearchType::CustomSql => {
                         if let Some(file_id) = file_id {
                             // Retrieve full path from database
-                            let path: String = self
-                                .db
-                                .query_row(
-                                    "SELECT path FROM files WHERE id = ?",
-                                    [file_id],
-                                    |row| row.get(0),
-                                )
-                                .map_err(|e| EditorError::Database(e))?;
+                            let path: String = {
+                                let db_lock = self.db.borrow();
+                                db_lock
+                                    .query_row(
+                                        "SELECT path FROM vw_files_with_paths WHERE id = ?",
+                                        [file_id],
+                                        |row| row.get(0),
+                                    )
+                                    .map_err(|e| EditorError::Database(e))?
+                            };
                             self.history.truncate(self.history_index + 1);
                             self.history.push((path.clone(), file_id));
                             self.history_index += 1;
@@ -1369,6 +1533,29 @@ impl App {
         }
     }
 
+    fn toggle_tree_selection(&mut self) {
+        if let Some(selected) = self.tree_state.selected() {
+            let item = self.visible_items[selected].clone();
+
+            // Prevent selecting directories
+            if !item.is_dir {
+                if self.tree_selected_paths.contains(&item.path) {
+                    self.tree_selected_paths.remove(&item.path);
+                    self.status = format!("Unselected {}", item.path);
+                } else {
+                    self.tree_selected_paths.insert(item.path.clone());
+                    self.status = format!(
+                        "Selected {} (Total: {})",
+                        item.path,
+                        self.tree_selected_paths.len()
+                    );
+                }
+            } else {
+                self.status = "Cannot cherry-pick directories".to_string();
+            }
+        }
+    }
+
     fn update_visible(&mut self) {
         let mut visible = Vec::new();
         Self::add_nodes_to_visible(&self.file_tree, 0, &mut visible);
@@ -1559,14 +1746,13 @@ impl App {
             .join(path)
             .to_string_lossy()
             .to_string();
-        let output = Command::new("markdown-scanner")
-            .arg("--delete")
-            .arg(&full_path)
-            .arg(&self.base_dir)
-            .output()?;
-        if !output.status.success() {
-            let error_msg = String::from_utf8_lossy(&output.stderr).into_owned();
-            return Err(EditorError::Scanner(error_msg));
+
+        // Call the synchronous function directly
+
+        let scan_result = delete_markdown_file(&full_path, &self.base_dir, &self.db_path);
+
+        if let Err(e) = scan_result {
+            return Err(EditorError::Scanner(e.to_string()));
         }
         fs::remove_file(&full_path)?;
         self.remove_node(path);
@@ -1587,22 +1773,28 @@ impl App {
     }
 
     fn delete_selected_files(&mut self) -> Result<(), EditorError> {
-        let current = self.tree_state.selected().unwrap_or(0);
-        let anchor = self.tree_visual_anchor.unwrap_or(current);
-        let min = anchor.min(current);
-        let max = anchor.max(current);
         let mut to_delete = Vec::new();
-        for i in min..=max {
-            let item = self.visible_items[i].clone();
-            if !item.is_dir {
-                to_delete.push(item.path);
+
+        if !self.tree_selected_paths.is_empty() {
+            to_delete.extend(self.tree_selected_paths.drain());
+        } else {
+            let current = self.tree_state.selected().unwrap_or(0);
+            let anchor = self.tree_visual_anchor.unwrap_or(current);
+            let min = anchor.min(current);
+            let max = anchor.max(current);
+
+            for i in min..=max {
+                let item = self.visible_items[i].clone();
+                if !item.is_dir {
+                    to_delete.push(item.path);
+                }
             }
         }
+
         for path in to_delete {
             self.delete_file(&path)?;
         }
         self.update_visible();
-        self.tree_state.select(Some(min));
         Ok(())
     }
 
@@ -1634,15 +1826,23 @@ impl App {
     }
 
     fn yank_selected(&mut self) {
-        let current = self.tree_state.selected().unwrap_or(0);
-        let anchor = self.tree_visual_anchor.unwrap_or(current);
-        let min = anchor.min(current);
-        let max = anchor.max(current);
         self.yanked_paths.clear();
-        for i in min..=max {
-            let item = &self.visible_items[i];
-            if !item.is_dir {
-                self.yanked_paths.push(item.path.clone());
+
+        if !self.tree_selected_paths.is_empty() {
+            // 1. Process cherry-picked files
+            self.yanked_paths.extend(self.tree_selected_paths.drain());
+        } else {
+            // 2. Fallback to Visual Range or single hover
+            let current = self.tree_state.selected().unwrap_or(0);
+            let anchor = self.tree_visual_anchor.unwrap_or(current);
+            let min = anchor.min(current);
+            let max = anchor.max(current);
+
+            for i in min..=max {
+                let item = &self.visible_items[i];
+                if !item.is_dir {
+                    self.yanked_paths.push(item.path.clone());
+                }
             }
         }
         self.status = format!("Yanked {} paths", self.yanked_paths.len());
@@ -1725,13 +1925,18 @@ impl App {
                 .to_string_lossy()
                 .to_string();
             fs::write(&full_path, "")?;
-            let output = Command::new("markdown-scanner")
-                .arg(&full_path)
-                .arg(&self.base_dir)
-                .output()?;
-            if !output.status.success() {
-                let error_msg = String::from_utf8_lossy(&output.stderr).into_owned();
-                return Err(EditorError::Scanner(error_msg));
+            let rt = tokio::runtime::Runtime::new()
+                .map_err(|e| EditorError::Scanner(format!("Failed to start runtime: {}", e)))?;
+
+            let scan_result = rt.block_on(scan_markdown_file(
+                &full_path,
+                &self.base_dir,
+                &self.db_path,
+                false,
+            ));
+
+            if let Err(e) = scan_result {
+                return Err(EditorError::Scanner(e.to_string()));
             }
             self.file_tree = self.build_root();
             self.update_visible();
@@ -1766,23 +1971,20 @@ impl App {
                 .join(&new_path)
                 .to_string_lossy()
                 .to_string();
-            let output_delete = Command::new("markdown-scanner")
-                .arg("--delete")
-                .arg(&old_full)
-                .arg(&self.base_dir)
-                .output()?;
-            if !output_delete.status.success() {
-                let error_msg = String::from_utf8_lossy(&output_delete.stderr).into_owned();
-                return Err(EditorError::Scanner(error_msg));
-            }
+            self.delete_file(&old_full)?;
             fs::rename(&old_full, &new_full)?;
-            let output_scan = Command::new("markdown-scanner")
-                .arg(&new_full)
-                .arg(&self.base_dir)
-                .output()?;
-            if !output_scan.status.success() {
-                let error_msg = String::from_utf8_lossy(&output_scan.stderr).into_owned();
-                return Err(EditorError::Scanner(error_msg));
+
+            let rt = tokio::runtime::Runtime::new()
+                .map_err(|e| EditorError::Scanner(format!("Failed to start runtime: {}", e)))?;
+
+            let scan_result = rt.block_on(scan_markdown_file(
+                &new_full,
+                &self.base_dir,
+                &self.db_path,
+                false,
+            ));
+            if let Err(e) = scan_result {
+                return Err(EditorError::Scanner(e.to_string()));
             }
             self.remove_node(&old_path);
             self.file_tree = self.build_root();
@@ -1791,46 +1993,85 @@ impl App {
         Ok(())
     }
     fn move_paths(&mut self, paths: Vec<String>, target_dir: String) -> Result<(), EditorError> {
+        let target_base = if Path::new(&target_dir).is_absolute() {
+            Path::new(&target_dir).to_path_buf()
+        } else {
+            Path::new(&self.base_dir).join(&target_dir)
+        };
+
+        if !target_base.exists() {
+            fs::create_dir_all(&target_base)?;
+        }
+
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| EditorError::Scanner(format!("Failed to start runtime: {}", e)))?;
+
         for old_path in paths {
             let old_full = Path::new(&self.base_dir)
                 .join(&old_path)
                 .to_string_lossy()
                 .to_string();
+
             let filename = Path::new(&old_path)
                 .file_name()
                 .and_then(|s| s.to_str())
                 .unwrap_or("")
                 .to_string();
-            let new_path = format!("{}/{}", target_dir, filename);
-            let new_full = Path::new(&self.base_dir)
-                .join(&new_path)
-                .to_string_lossy()
-                .to_string();
-            let output_delete = Command::new("markdown-scanner")
-                .arg("--delete")
-                .arg(&old_full)
-                .arg(&self.base_dir)
-                .output()?;
-            if !output_delete.status.success() {
-                let error_msg = String::from_utf8_lossy(&output_delete.stderr).into_owned();
-                return Err(EditorError::Scanner(error_msg));
+
+            let new_full_path = target_base.join(&filename);
+            let new_full = new_full_path.to_string_lossy().to_string();
+
+            let src_path = Path::new(&old_full);
+            if !src_path.exists() {
+                continue;
             }
 
+            if let Some(parent) = new_full_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+
+            // 1. Remove old file/node tracking from DB/tree
+            self.remove_node(&old_path);
+            let _ = delete_markdown_file(&old_full, &self.base_dir, &self.db_path);
+
+            // 2. Move/rename the file or directory on disk
             fs::rename(&old_full, &new_full)?;
 
-            let output_scan = Command::new("markdown-scanner")
-                .arg(&new_full)
-                .arg(&self.base_dir)
-                .output()?;
-            if !output_scan.status.success() {
-                let error_msg = String::from_utf8_lossy(&output_scan.stderr).into_owned();
-                return Err(EditorError::Scanner(error_msg));
+            // 3. Recursively scan markdown files at the new location
+            if new_full_path.is_dir() {
+                for entry in WalkDir::new(&new_full_path)
+                    .into_iter()
+                    .filter_map(|e| e.ok())
+                {
+                    let path = entry.path();
+                    if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("md") {
+                        let scan_result = rt.block_on(scan_markdown_file(
+                            &path.to_string_lossy(),
+                            &self.base_dir,
+                            &self.db_path,
+                            false,
+                        ));
+                        if let Err(e) = scan_result {
+                            return Err(EditorError::Scanner(e.to_string()));
+                        }
+                    }
+                }
+            } else if new_full_path.is_file() {
+                if new_full_path.extension().and_then(|s| s.to_str()) == Some("md") {
+                    let scan_result = rt.block_on(scan_markdown_file(
+                        &new_full,
+                        &self.base_dir,
+                        &self.db_path,
+                        false,
+                    ));
+                    if let Err(e) = scan_result {
+                        return Err(EditorError::Scanner(e.to_string()));
+                    }
+                }
             }
-            self.remove_node(&old_path);
         }
         Ok(())
     }
-
     fn copy_paths(&mut self, paths: Vec<String>, target_dir: String) -> Result<(), EditorError> {
         for old_path in paths {
             let old_full = Path::new(&self.base_dir)
@@ -1847,14 +2088,51 @@ impl App {
                 .join(&new_path)
                 .to_string_lossy()
                 .to_string();
-            fs::copy(&old_full, &new_full)?;
-            let output_scan = Command::new("markdown-scanner")
-                .arg(&new_full)
-                .arg(&self.base_dir)
-                .output()?;
-            if !output_scan.status.success() {
-                let error_msg = String::from_utf8_lossy(&output_scan.stderr).into_owned();
-                return Err(EditorError::Scanner(error_msg));
+
+            let src_path = Path::new(&old_full);
+            let dest_path = Path::new(&new_full);
+
+            if let Some(parent) = dest_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+
+            if src_path.is_dir() {
+                // Recursively copy directory contents
+                Self::copy_dir_all(src_path, dest_path)?;
+            } else if src_path.is_file() {
+                fs::copy(&old_full, &new_full)?;
+                // Only scan if it's a markdown file
+                if dest_path.extension().and_then(|s| s.to_str()) == Some("md") {
+                    let rt = tokio::runtime::Runtime::new().map_err(|e| {
+                        EditorError::Scanner(format!("Failed to start runtime: {}", e))
+                    })?;
+
+                    let scan_result = rt.block_on(scan_markdown_file(
+                        &new_full,
+                        &self.base_dir,
+                        &self.db_path,
+                        false,
+                    ));
+                    if let Err(e) = scan_result {
+                        return Err(EditorError::Scanner(e.to_string()));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // Helper to recursively copy directories
+    fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<(), io::Error> {
+        fs::create_dir_all(&dst)?;
+        for entry in fs::read_dir(src)? {
+            let entry = entry?;
+            let ty = entry.file_type()?;
+            let dest_path = dst.as_ref().join(entry.file_name());
+            if ty.is_dir() {
+                Self::copy_dir_all(entry.path(), dest_path)?;
+            } else {
+                fs::copy(entry.path(), dest_path)?;
             }
         }
         Ok(())
@@ -1953,9 +2231,33 @@ impl App {
                     ratatui::crossterm::event::KeyCode::Enter => {
                         if let Some(selected) = self.table_state.list_state.selected() {
                             if let Some(row) = self.table_state.rows.get(selected) {
-                                let file_name = row[0].clone();
-                                self.open_wikilink_file(file_name)?;
-                                self.mode = Mode::Normal;
+                                if let Some(ref key) = self.table_state.on_submit_key {
+                                    let mut lua_error = None;
+                                    {
+                                        if let Ok(func) =
+                                            self.lua.registry_value::<mlua::Function>(&**key)
+                                        {
+                                            // Pass the entire selected row as a table to Lua
+                                            if let Err(e) = func.call::<_, ()>(row.clone()) {
+                                                lua_error = Some(e.to_string());
+                                            }
+                                        }
+                                    }
+
+                                    if let Some(err) = lua_error {
+                                        self.status = format!("Lua on_submit error: {}", err);
+                                    } else {
+                                        self.mode = Mode::Normal; // Exit table mode automatically
+                                    }
+
+                                    // Ensure any commands queued by the Lua callback are fired!
+                                    self.execute_lua_commands()?;
+                                } else {
+                                    // Fallback for old tables without an on_submit defined
+                                    let file_name = row[0].clone();
+                                    self.open_wikilink_file(file_name)?;
+                                    self.mode = Mode::Normal;
+                                }
                             }
                         }
                     }
@@ -2221,10 +2523,14 @@ impl App {
                         self.completion_state.list_state.select(Some(selected + 1));
                     }
                 }
-                ratatui::crossterm::event::KeyCode::Char(_) => {
-                    let input = Input::from(event);
-                    self.textarea.input(input);
-                    self.update_completion()?;
+                ratatui::crossterm::event::KeyCode::Char(c) => {
+                    if c == ':' || c == '!' || c == '?' || c == ';' || c == '~' {
+                        // Ignore this character, do not process it or update completion based on input change.
+                    } else {
+                        let input = Input::from(event);
+                        self.textarea.input(input);
+                        self.update_completion()?;
+                    }
                 }
                 ratatui::crossterm::event::KeyCode::Backspace => {
                     let input = Input::from(event);
@@ -2728,8 +3034,17 @@ impl App {
                 }
                 match event.code {
                     ratatui::crossterm::event::KeyCode::Esc => {
-                        self.mode = Mode::Normal;
-                        self.status = "Normal".to_string();
+                        // Clear cherry-picks if any exist, otherwise exit mode
+                        if !self.tree_selected_paths.is_empty() {
+                            self.tree_selected_paths.clear();
+                            self.status = "Cleared file selections".to_string();
+                        } else {
+                            self.mode = Mode::Normal;
+                            self.status = "Normal".to_string();
+                        }
+                    }
+                    ratatui::crossterm::event::KeyCode::Char(' ') => {
+                        self.toggle_tree_selection();
                     }
                     ratatui::crossterm::event::KeyCode::Up => {
                         let selected = self.tree_state.selected().unwrap_or(0);
@@ -2878,6 +3193,9 @@ impl App {
                     } else {
                         self.status = "Rename only for single file".to_string();
                     }
+                }
+                ratatui::crossterm::event::KeyCode::Char(' ') => {
+                    self.toggle_tree_selection(); // Allow cherry-picking while in visual mode
                 }
                 _ => {}
             },
@@ -3113,15 +3431,26 @@ impl App {
                             Style::default().fg(Color::White)
                         };
                         let mut li = ListItem::new(item.display.clone()).style(base_style);
-                        if self.mode == Mode::FileTreeVisual && i >= visual_min && i <= visual_max {
+
+                        let is_cherry_picked = self.tree_selected_paths.contains(&item.path);
+                        let in_visual_range =
+                            self.mode == Mode::FileTreeVisual && i >= visual_min && i <= visual_max;
+
+                        // Apply highlights based on selection priority
+                        if is_cherry_picked {
+                            // Yellow background for cherry-picked items
+                            li = li.style(Style::default().bg(Color::Yellow).fg(Color::Black));
+                        } else if in_visual_range {
+                            // LightBlue background for Vim-style visual range
                             li = li.style(Style::default().bg(Color::LightBlue));
                         } else if Some(i) == self.tree_state.selected() {
+                            // Standard white background for current cursor hover
                             li = li.style(Style::default().bg(Color::White).fg(Color::Black));
                         }
+
                         li
                     })
                     .collect();
-
                 let list = List::new(items).block(
                     Block::default()
                         .borders(Borders::ALL)
@@ -3618,14 +3947,34 @@ impl App {
             let (image_area, title_str) = if self.image_full_screen {
                 (area, "Image (Full Screen)")
             } else {
-                let popup_width = (inner_area.width as f32 * 0.4)
+                // 1. Establish the maximum allowed bounds
+                let max_popup_width = (inner_area.width as f32 * 0.4)
                     .max(30.0)
                     .min(inner_area.width as f32) as u16;
-                let popup_height = (inner_area.height as f32 * 0.6)
+                let max_popup_height = (inner_area.height as f32 * 0.6)
                     .max(10.0)
                     .min(inner_area.height as f32) as u16;
-                let max_y = inner_area.y + inner_area.height.saturating_sub(popup_height);
-                let max_x = inner_area.x + inner_area.width.saturating_sub(popup_width);
+
+                // 2. Extract image dimensions and adjust for terminal cell aspect ratio (~1:2)
+                let img_w = dyn_img.width() as f32;
+                let img_h = (dyn_img.height() as f32) / 2.0;
+
+                // 3. Find the scale factor to fit the image into the max bounds perfectly
+                let scale_w = max_popup_width.saturating_sub(2) as f32 / img_w.max(1.0);
+                let scale_h = max_popup_height.saturating_sub(2) as f32 / img_h.max(1.0);
+                let scale = f32::min(scale_w, scale_h); // Scale down to fit
+
+                // 4. Calculate the final container bounds (+2 accounts for the outer borders)
+                let final_width = ((img_w * scale).round() as u16 + 2)
+                    .max(15) // Ensure the title has enough room
+                    .min(max_popup_width);
+                let final_height = ((img_h * scale).round() as u16 + 2)
+                    .max(3)
+                    .min(max_popup_height);
+
+                // 5. Position the shrunk container
+                let max_y = inner_area.y + inner_area.height.saturating_sub(final_height);
+                let max_x = inner_area.x + inner_area.width.saturating_sub(final_width);
 
                 let mut popup_y;
                 if self.read_mode
@@ -3642,8 +3991,8 @@ impl App {
                 let popup_area = Rect {
                     x: max_x,
                     y: popup_y,
-                    width: popup_width,
-                    height: popup_height,
+                    width: final_width,
+                    height: final_height,
                 };
 
                 (popup_area, "Image")
@@ -3771,37 +4120,52 @@ impl App {
     }
 
     fn resolve_image_path(&self, image_path: &str) -> Result<String, EditorError> {
-        // println!("Resolving image path for: {}", image_path);
-
-        let query = "SELECT path FROM files WHERE file_name = ? OR path = ?";
-        let mut stmt = self.db.prepare(query)?;
+        let query = "SELECT path FROM vw_files_with_paths WHERE file_name = ? OR path = ?";
+        let db_lock = self.db.borrow();
+        let mut stmt = db_lock.prepare(query)?;
         let path_result = stmt.query_row(params![image_path, image_path], |row| {
             row.get::<_, String>(0)
         });
 
         match path_result {
             Ok(path) => {
-                // println!("Found in database: {}", path);
-                let full_path = Path::new(&path)
+                let abs_path = if Path::new(&path).is_absolute() {
+                    Path::new(&path).to_path_buf()
+                } else {
+                    Path::new(&self.base_dir).join(&path)
+                };
+
+                let full_path = abs_path
                     .canonicalize()
                     .map_err(|e| {
-                        EditorError::FileNotFound(format!("Invalid path {}: {}", path, e))
+                        EditorError::FileNotFound(format!(
+                            "Invalid path {}: {}",
+                            abs_path.display(),
+                            e
+                        ))
                     })?
                     .to_string_lossy()
                     .to_string();
-                // println!("Canonicalized path: {}", full_path);
                 Ok(full_path)
             }
             Err(rusqlite::Error::QueryReturnedNoRows) => {
-                let full_path = Path::new(&self.base_dir)
-                    .join(image_path)
+                let abs_path = if Path::new(image_path).is_absolute() {
+                    Path::new(image_path).to_path_buf()
+                } else {
+                    Path::new(&self.base_dir).join(image_path)
+                };
+
+                let full_path = abs_path
                     .canonicalize()
                     .map_err(|e| {
-                        EditorError::FileNotFound(format!("Invalid path {}: {}", image_path, e))
+                        EditorError::FileNotFound(format!(
+                            "Invalid path {}: {}",
+                            abs_path.display(),
+                            e
+                        ))
                     })?
                     .to_string_lossy()
                     .to_string();
-                // println!("Fallback path: {}", full_path);
                 Ok(full_path)
             }
             Err(e) => Err(EditorError::Scanner(format!("Database error: {}", e))),
@@ -3891,7 +4255,8 @@ impl App {
             return Ok(());
         }
 
-        let mut stmt = match self.db.prepare(query) {
+        let db_lock = self.db.borrow();
+        let mut stmt = match db_lock.prepare(query) {
             Ok(s) => s,
             Err(e) => {
                 self.status = format!("SQL Prepare Error: {}", e);
@@ -4457,25 +4822,38 @@ impl App {
                         self.status = "Database Browser Mode".to_string();
                     }
                 }
+                // Inside App::execute_lua_commands:
                 EditorCommand::OpenCustomTable {
                     columns,
-                    query,
-                    formatter_key,
+                    data,
+                    on_submit_key,
+                    filter,
+                    sort_col,
+                    sort_asc,
                 } => {
-                    // Only reset the sorting state if opening a completely new table query
-                    if self.table_state.sql_query != query {
+                    self.table_state.columns = columns;
+                    self.table_state.raw_data = data;
+                    self.table_state.on_submit_key = on_submit_key;
+
+                    // Apply preloaded sort if provided (convert 1-based Lua index to 0-based)
+                    if let Some(col) = sort_col {
+                        self.table_state.sort_col = col.saturating_sub(1);
+                    } else if self.table_state.sort_col >= self.table_state.columns.len() {
+                        // Only reset if the previous sort column is now out of bounds
                         self.table_state.sort_col = 0;
-                        self.table_state.sort_asc = true;
-                    } else {
-                        // Just in case columns dynamically changed, keep it within bounds
-                        if self.table_state.sort_col >= columns.len() {
-                            self.table_state.sort_col = 0;
-                        }
                     }
 
-                    self.table_state.columns = columns;
-                    self.table_state.sql_query = query;
-                    self.table_state.formatter_key = formatter_key;
+                    if let Some(asc) = sort_asc {
+                        self.table_state.sort_asc = asc;
+                    }
+
+                    // Apply preloaded filter if provided
+                    if let Some(f_query) = filter {
+                        self.table_state.filter_query = f_query;
+                    }
+
+                    // Parse the filter (either the new one or the persisted one)
+                    self.parse_table_filter();
 
                     if let Err(e) = self.update_table_data() {
                         self.status = format!("Lua Table Error: {}", e);
@@ -4493,6 +4871,16 @@ impl App {
                         self.table_state.sort_asc = true;
                     }
                     let _ = self.update_table_data();
+                }
+                EditorCommand::DeleteFile(path) => {
+                    self.delete_file(&path)?;
+                }
+                EditorCommand::PasteImageFromClipboard(path) => {
+                    self.paste_image_from_clipboard(&path)?;
+                }
+                EditorCommand::CleanOrphanedFiles() => {
+                    clean_orphaned_files(&self.base_dir, &self.db_path)
+                        .map_err(|e| EditorError::Scanner(e.to_string()))?;
                 }
                 _ => {}
             }
@@ -4605,128 +4993,88 @@ impl App {
         (line, original_col)
     }
     pub fn update_table_data(&mut self) -> Result<(), EditorError> {
-        if self.table_state.sql_query.is_empty() {
-            return Ok(());
-        }
+        let formatted_rows = self.table_state.raw_data.clone();
+        let col_names = self.table_state.columns.clone();
 
-        // 1. Run the Raw SQL Query EXACTLY as provided by the Lua config.
-        let mut stmt = self.db.prepare(&self.table_state.sql_query)?;
-        let col_names: Vec<String> = stmt.column_names().into_iter().map(String::from).collect();
-        let column_count = stmt.column_count();
+        let is_filter_empty = self.table_state.parsed_filter.is_none();
 
-        let mut raw_rows = Vec::new();
-        let mut rows_iter = stmt.query([])?; // No parameters needed anymore!
-
-        while let Some(row) = rows_iter.next()? {
-            let mut row_data = Vec::new();
-            for i in 0..column_count {
-                let val: String = match row.get_ref(i)? {
-                    rusqlite::types::ValueRef::Null => String::new(),
-                    rusqlite::types::ValueRef::Integer(num) => num.to_string(),
-                    rusqlite::types::ValueRef::Real(num) => num.to_string(),
-                    rusqlite::types::ValueRef::Text(t) => String::from_utf8_lossy(t).to_string(),
-                    rusqlite::types::ValueRef::Blob(b) => String::from_utf8_lossy(b).to_string(),
-                };
-                row_data.push(val);
-            }
-            raw_rows.push(row_data);
-        }
-
-        // 2. PIPE THROUGH LUA FORMATTER
-        let mut formatted_rows = Vec::new();
-        if let Some(ref reg_key) = self.table_state.formatter_key {
-            if let Ok(func) = self.lua.registry_value::<mlua::Function>(&**reg_key) {
-                for row_data in raw_rows {
-                    if let Ok(modified_row) = func.call::<_, Vec<String>>(row_data.clone()) {
-                        formatted_rows.push(modified_row);
-                    } else {
-                        formatted_rows.push(row_data);
-                    }
-                }
-            }
-        } else {
-            formatted_rows = raw_rows;
-        }
-
-        // 3. APPLY IN-MEMORY FILTERS
-        let search_text_lower = self.table_state.search_text.to_lowercase();
-
+        // APPLY IN-MEMORY FILTERS
         let mut filtered_rows: Vec<Vec<String>> = formatted_rows
             .into_iter()
             .filter(|row| {
-                // A. Search Text Filter (Any column contains the literal text, spacing included)
-                if !search_text_lower.is_empty() {
-                    let matches_search = row
-                        .iter()
-                        .any(|cell| cell.to_lowercase().contains(&search_text_lower));
-                    if !matches_search {
-                        return false;
-                    }
+                if is_filter_empty {
+                    return true;
                 }
 
-                // Helper to get column index from Lua header name OR SQL alias
-                let get_col_idx = |name: &str| -> Option<usize> {
-                    self.table_state
-                        .columns
-                        .iter()
-                        .position(|c| c.to_lowercase() == name.to_lowercase())
-                        .or_else(|| {
-                            col_names
-                                .iter()
-                                .position(|c| c.to_lowercase() == name.to_lowercase())
-                        })
-                };
-
-                // Helper: Splits by comma and forces an EXACT match
-                let exact_match = |cell: &str, target: &str| -> bool {
-                    cell.split(',')
-                        .map(|s| s.trim().to_lowercase())
-                        .any(|s| s == target.to_lowercase())
-                };
-
-                // B. Include Tags (+)
-                for (col_opt, tag) in &self.table_state.include_tags {
-                    if let Some(col_name) = col_opt {
-                        if let Some(idx) = get_col_idx(col_name) {
-                            if let Some(cell) = row.get(idx) {
-                                if !exact_match(cell, tag) {
-                                    return false;
-                                }
-                            } else {
-                                return false;
+                // Recursive evaluator
+                fn eval_expr(expr: &FilterExpr, row: &[String], col_names: &[String]) -> bool {
+                    let get_col_idx = |name: &str| -> Option<usize> {
+                        if let Ok(idx) = name.parse::<usize>() {
+                            if idx > 0 && idx <= col_names.len() {
+                                return Some(idx - 1);
                             }
-                        } else {
-                            return false;
-                        } // ADDED: Fail if column missing
-                    } else {
-                        let has_tag = row.iter().any(|cell| exact_match(cell, tag));
-                        if !has_tag {
-                            return false;
                         }
-                    }
-                }
+                        col_names
+                            .iter()
+                            .position(|c| c.to_lowercase() == name.to_lowercase())
+                    };
 
-                // C. Exclude Tags (-)
-                for (col_opt, tag) in &self.table_state.exclude_tags {
-                    if let Some(col_name) = col_opt {
-                        if let Some(idx) = get_col_idx(col_name) {
-                            if let Some(cell) = row.get(idx) {
-                                if exact_match(cell, tag) {
-                                    return false;
+                    let exact_match = |cell: &str, target: &str| -> bool {
+                        cell.split(',')
+                            .map(|s| s.trim().to_lowercase())
+                            .any(|s| s == target.to_lowercase())
+                    };
+
+                    match expr {
+                        FilterExpr::And(nodes) => {
+                            nodes.iter().all(|n| eval_expr(n, row, col_names))
+                        }
+                        FilterExpr::Or(nodes) => nodes.iter().any(|n| eval_expr(n, row, col_names)),
+                        FilterExpr::Condition(cond) => match cond {
+                            FilterCondition::Search(text) => {
+                                let text_lower = text.to_lowercase();
+                                row.iter()
+                                    .any(|cell| cell.to_lowercase().contains(&text_lower))
+                            }
+                            FilterCondition::Include(col_opt, tag) => {
+                                if let Some(col_name) = col_opt {
+                                    if let Some(idx) = get_col_idx(col_name) {
+                                        if let Some(cell) = row.get(idx) {
+                                            exact_match(cell, tag)
+                                        } else {
+                                            false
+                                        }
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    row.iter().any(|cell| exact_match(cell, tag))
                                 }
                             }
-                        } else {
-                            return false;
-                        } // ADDED: Fail if column missing
-                    } else {
-                        let has_tag = row.iter().any(|cell| exact_match(cell, tag));
-                        if has_tag {
-                            return false;
-                        }
+                            FilterCondition::Exclude(col_opt, tag) => {
+                                if let Some(col_name) = col_opt {
+                                    if let Some(idx) = get_col_idx(col_name) {
+                                        if let Some(cell) = row.get(idx) {
+                                            !exact_match(cell, tag)
+                                        } else {
+                                            true
+                                        }
+                                    } else {
+                                        true
+                                    }
+                                } else {
+                                    !row.iter().any(|cell| exact_match(cell, tag))
+                                }
+                            }
+                        },
                     }
                 }
 
-                true // Passed all filters!
+                if let Some(expr) = &self.table_state.parsed_filter {
+                    eval_expr(expr, row, &col_names)
+                } else {
+                    true
+                }
             })
             .collect();
 
@@ -4735,27 +5083,48 @@ impl App {
         let sort_asc = self.table_state.sort_asc;
 
         filtered_rows.sort_by(|a, b| {
-            let val_a = a.get(sort_col).unwrap_or(&String::new()).to_lowercase();
-            let val_b = b.get(sort_col).unwrap_or(&String::new()).to_lowercase();
+            let val_a = a.get(sort_col).map(|s| s.as_str()).unwrap_or("");
+            let val_b = b.get(sort_col).map(|s| s.as_str()).unwrap_or("");
 
-            if let (Ok(num_a), Ok(num_b)) = (val_a.parse::<f64>(), val_b.parse::<f64>()) {
-                if sort_asc {
-                    num_a.partial_cmp(&num_b).unwrap()
-                } else {
-                    num_b.partial_cmp(&num_a).unwrap()
+            let parse_num = |s: &str| -> Option<f64> {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    return None;
                 }
-            } else {
-                if sort_asc {
-                    val_a.cmp(&val_b)
-                } else {
-                    val_b.cmp(&val_a)
+                let chars: Vec<char> = trimmed.chars().collect();
+                let last_char = *chars.last().unwrap();
+                if last_char.is_numeric() {
+                    return trimmed.parse::<f64>().ok();
                 }
-            }
+                let num_part: String = chars.iter().take(chars.len() - 1).collect();
+                if let Ok(num) = num_part.parse::<f64>() {
+                    let mult = match last_char.to_ascii_lowercase() {
+                        'k' => 1024.0,
+                        'm' => 1024.0 * 1024.0,
+                        'g' => 1024.0 * 1024.0 * 1024.0,
+                        't' => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+                        _ => return None,
+                    };
+                    return Some(num * mult);
+                }
+                None
+            };
+
+            let num_a = parse_num(val_a);
+            let num_b = parse_num(val_b);
+
+            let cmp = match (num_a, num_b) {
+                (Some(na), Some(nb)) => na.partial_cmp(&nb).unwrap_or(std::cmp::Ordering::Equal),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => val_a.to_lowercase().cmp(&val_b.to_lowercase()),
+            };
+
+            if sort_asc { cmp } else { cmp.reverse() }
         });
 
         self.table_state.rows = filtered_rows;
 
-        // 5. UPDATE SELECTION
         if !self.table_state.rows.is_empty() {
             let current = self.table_state.list_state.selected().unwrap_or(0);
             self.table_state
@@ -4769,26 +5138,26 @@ impl App {
     }
 
     pub fn parse_table_filter(&mut self) {
-        self.table_state.include_tags.clear();
-        self.table_state.exclude_tags.clear();
-
-        let mut search_terms = Vec::new();
         let mut tokens = Vec::new();
         let mut current_token = String::new();
         let mut in_quotes = false;
         let mut quote_char = '\0';
 
-        // 1. Smart Tokenizer: Respects quotes, allowing spaces inside them.
-        for c in self.table_state.filter_query.chars() {
+        // 1. Tokenize (safely padding parentheses so they parse distinctively)
+        let padded_query = self
+            .table_state
+            .filter_query
+            .replace("(", " ( ")
+            .replace(")", " ) ");
+
+        for c in padded_query.chars() {
             if (c == '"' || c == '\'') && (!in_quotes || c == quote_char) {
                 in_quotes = !in_quotes;
                 if in_quotes {
                     quote_char = c;
                 }
-                continue; // Skip appending the quote mark itself
+                continue;
             }
-
-            // Split by space ONLY if we are not inside a quoted string
             if c == ' ' && !in_quotes {
                 if !current_token.is_empty() {
                     tokens.push(current_token.clone());
@@ -4798,52 +5167,246 @@ impl App {
                 current_token.push(c);
             }
         }
-
-        // Push the final token if there is one
         if !current_token.is_empty() {
             tokens.push(current_token);
         }
 
-        // Helper to verify if the prefix is an actual column
         let is_column = |name: &str| -> bool {
+            if let Ok(idx) = name.parse::<usize>() {
+                if idx > 0 && idx <= self.table_state.columns.len() {
+                    return true;
+                }
+            }
             self.table_state
                 .columns
                 .iter()
                 .any(|c| c.to_lowercase() == name.to_lowercase())
         };
 
-        // 2. Parse the safe tokens
-        for part in tokens {
+        let parse_condition = |part: &str| -> FilterExpr {
+            let condition;
             if part.starts_with('+') && part.len() > 1 {
-                self.table_state
-                    .include_tags
-                    .push((None, part[1..].to_string()));
+                condition = FilterCondition::Include(None, part[1..].to_string());
             } else if part.starts_with('-') && part.len() > 1 {
-                self.table_state
-                    .exclude_tags
-                    .push((None, part[1..].to_string()));
+                condition = FilterCondition::Exclude(None, part[1..].to_string());
             } else if let Some(idx) = part.find('+') {
                 if idx > 0 && idx < part.len() - 1 && is_column(&part[..idx]) {
-                    self.table_state
-                        .include_tags
-                        .push((Some(part[..idx].to_string()), part[idx + 1..].to_string()));
+                    condition = FilterCondition::Include(
+                        Some(part[..idx].to_string()),
+                        part[idx + 1..].to_string(),
+                    );
                 } else {
-                    search_terms.push(part);
+                    condition = FilterCondition::Search(part.to_string());
                 }
             } else if let Some(idx) = part.find('-') {
                 if idx > 0 && idx < part.len() - 1 && is_column(&part[..idx]) {
-                    self.table_state
-                        .exclude_tags
-                        .push((Some(part[..idx].to_string()), part[idx + 1..].to_string()));
+                    condition = FilterCondition::Exclude(
+                        Some(part[..idx].to_string()),
+                        part[idx + 1..].to_string(),
+                    );
                 } else {
-                    search_terms.push(part);
+                    condition = FilterCondition::Search(part.to_string());
                 }
             } else {
-                search_terms.push(part);
+                condition = FilterCondition::Search(part.to_string());
+            }
+            FilterExpr::Condition(condition)
+        };
+
+        // 2. Recursive Descent Parser
+        fn parse_or(
+            tokens: &[String],
+            pos: &mut usize,
+            parse_cond: &dyn Fn(&str) -> FilterExpr,
+        ) -> Option<FilterExpr> {
+            let mut nodes = Vec::new();
+            if let Some(node) = parse_and(tokens, pos, parse_cond) {
+                nodes.push(node);
+            } else {
+                return None;
+            }
+
+            while *pos < tokens.len() {
+                let tok = tokens[*pos].to_uppercase();
+                if tok == "OR" || tok == "||" {
+                    *pos += 1;
+                    if let Some(node) = parse_and(tokens, pos, parse_cond) {
+                        nodes.push(node);
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            if nodes.len() == 1 {
+                Some(nodes.pop().unwrap())
+            } else {
+                Some(FilterExpr::Or(nodes))
             }
         }
 
-        self.table_state.search_text = search_terms.join(" ");
+        fn parse_and(
+            tokens: &[String],
+            pos: &mut usize,
+            parse_cond: &dyn Fn(&str) -> FilterExpr,
+        ) -> Option<FilterExpr> {
+            let mut nodes = Vec::new();
+            if let Some(node) = parse_primary(tokens, pos, parse_cond) {
+                nodes.push(node);
+            } else {
+                return None;
+            }
+
+            while *pos < tokens.len() {
+                let tok = tokens[*pos].to_uppercase();
+                if tok == "AND" || tok == "&&" {
+                    *pos += 1;
+                    if let Some(node) = parse_primary(tokens, pos, parse_cond) {
+                        nodes.push(node);
+                    }
+                } else if tok == "OR" || tok == "||" || tok == ")" {
+                    break;
+                } else {
+                    // Implicit AND if operators are missing
+                    if let Some(node) = parse_primary(tokens, pos, parse_cond) {
+                        nodes.push(node);
+                    }
+                }
+            }
+
+            if nodes.len() == 1 {
+                Some(nodes.pop().unwrap())
+            } else {
+                Some(FilterExpr::And(nodes))
+            }
+        }
+
+        fn parse_primary(
+            tokens: &[String],
+            pos: &mut usize,
+            parse_cond: &dyn Fn(&str) -> FilterExpr,
+        ) -> Option<FilterExpr> {
+            if *pos >= tokens.len() {
+                return None;
+            }
+
+            if tokens[*pos] == "(" {
+                *pos += 1;
+                let node = parse_or(tokens, pos, parse_cond);
+                if *pos < tokens.len() && tokens[*pos] == ")" {
+                    *pos += 1; // Consume ')'
+                }
+                node
+            } else {
+                let node = parse_cond(&tokens[*pos]);
+                *pos += 1;
+                Some(node)
+            }
+        }
+
+        let mut pos = 0;
+        self.table_state.parsed_filter = parse_or(&tokens, &mut pos, &parse_condition);
+    }
+    pub fn paste_image_from_clipboard(&mut self, path: &str) -> Result<(), EditorError> {
+        // 1. Open the OS clipboard
+        let mut clipboard = match arboard::Clipboard::new() {
+            Ok(cb) => cb,
+            Err(e) => {
+                self.status = format!("Clipboard error: {}", e);
+                return Ok(());
+            }
+        };
+
+        // 2. Construct target directory and ensure it exists (e.g., creates "Files" if missing)
+        let target_dir = Path::new(&self.base_dir).join(path);
+        if !target_dir.exists() {
+            if let Err(e) = fs::create_dir_all(&target_dir) {
+                self.status = format!("Failed to create folder '{}': {}", path, e);
+                return Ok(());
+            }
+        }
+
+        let mut pasted_links = Vec::new();
+
+        // 3. Scenario A: Handle File Paths (Dolphin, File Explorers)
+        if let Ok(text_data) = clipboard.get_text() {
+            // Iterate over every line in the clipboard text
+            for line in text_data.lines() {
+                let clean_line = line.trim();
+                if clean_line.is_empty() {
+                    continue;
+                }
+
+                // Extract valid PathBuf
+                let source_path: Option<PathBuf> = if clean_line.starts_with("file://") {
+                    Url::parse(clean_line)
+                        .ok()
+                        .and_then(|url| url.to_file_path().ok())
+                } else if Path::new(clean_line).exists() {
+                    Some(PathBuf::from(clean_line))
+                } else {
+                    None
+                };
+
+                // If we found a valid path, copy the file
+                if let Some(src_path) = source_path {
+                    if src_path.is_file() {
+                        if let Some(filename_os) = src_path.file_name() {
+                            let filename_str = filename_os.to_string_lossy().to_string();
+                            let dest_path = target_dir.join(filename_os);
+
+                            // Copy the file to the user-provided directory
+                            if let Err(e) = fs::copy(&src_path, &dest_path) {
+                                self.status = format!("Failed to copy {}: {}", filename_str, e);
+                                continue; // Skip this file but keep trying others
+                            }
+
+                            // Store the markdown link for successful copies
+                            pasted_links.push(format!("![[{}]]", filename_str));
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4. Scenario B: Fallback to Raw Image Pixels (Browser/Screenshots)
+        // Only attempt this if we didn't find any valid files in the text check
+        if pasted_links.is_empty() {
+            if let Ok(image_data) = clipboard.get_image() {
+                let width = image_data.width.try_into().unwrap_or(0);
+                let height = image_data.height.try_into().unwrap_or(0);
+
+                if let Some(img_buffer) =
+                    image::RgbaImage::from_raw(width, height, image_data.bytes.into_owned())
+                {
+                    let timestamp = chrono::Local::now().format("%Y%m%d%H%M%S");
+                    let filename = format!("Pasted_Image_{}.png", timestamp);
+                    let dest_path = target_dir.join(&filename);
+
+                    if image::DynamicImage::ImageRgba8(img_buffer)
+                        .save(&dest_path)
+                        .is_ok()
+                    {
+                        // For Obsidian-style markdown, we might want to include the folder path
+                        // depending on your exact link resolution logic.
+                        // pasted_links.push(format!("![[{}/{}]]", path, filename));
+                        pasted_links.push(format!("![[{}]]", filename));
+                    }
+                }
+            }
+        }
+
+        // 5. Update the text buffer and UI status
+        if !pasted_links.is_empty() {
+            // Join all links with a newline and insert into the textarea
+            let markdown_output = pasted_links.join("\n");
+            self.textarea.insert_str(&markdown_output);
+            self.status = format!("Successfully pasted {} file(s)", pasted_links.len());
+        } else {
+            self.status = "No valid files or image found in clipboard".to_string();
+        }
+
+        Ok(())
     }
 }
 

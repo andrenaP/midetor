@@ -113,3 +113,6 @@ function editor:open_table_browser() end
 function editor:sort_table(col) end
 
 function editor:open_table(columns, query, formatter) end
+
+---@param query string
+function editor:query_db(query) end

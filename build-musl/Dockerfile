@@ -83,7 +83,10 @@ RUN meson setup build-dir --cross-file=/cross.txt --prefix=$PREFIX \
 # --------------------------- final builder (Arch) -------------------------
 FROM archlinux:latest AS rust-dav1d-builder
 
-RUN pacman -Syu --noconfirm && \
+# Overwrite default mirrorlist with reliable global mirrors to prevent rate-limiting/timeouts
+RUN echo 'Server = https://cloudflaremirrors.com/archlinux/$repo/os/$arch' > /etc/pacman.d/mirrorlist && \
+    echo 'Server = https://mirrors.kernel.org/archlinux/$repo/os/$arch' >> /etc/pacman.d/mirrorlist && \
+    pacman -Syu --noconfirm && \
     pacman -S --noconfirm base-devel pkgconf openssl git curl musl
 
 # rustup + musl targets
