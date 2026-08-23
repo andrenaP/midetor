@@ -323,7 +323,7 @@ editor:map("n", "<C-b>", function()
             SELECT f.file_name as file,
                    GROUP_CONCAT(DISTINCT t.tag) as tags,
                    GROUP_CONCAT(DISTINCT fb.file_name) as backlinks,
-                   strftime('%Y-%m-%d', json_extract(f.metadata, '$.created_at'), 'unixepoch') as Date,
+                   strftime('%Y-%m-%d', f.created_at, 'unixepoch') as Date,
                    COALESCE(json_extract(f.metadata, '$.chapters'), 0) as chapters,
                    json_extract(f.metadata, '$.Finished') as Done
             FROM files f

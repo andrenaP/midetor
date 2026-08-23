@@ -1,6 +1,6 @@
 [package]
 name = "midetor"
-version = "1.3.0"
+version = "1.3.1"
 edition = "2024"
 license-file="LICENSE"
 keywords = ["editor", "markdown"]
@@ -9,6 +9,7 @@ description = "midetor is a terminal-based vim like Markdown editor. You need ma
 repository = "https://github.com/andrenaP/midetor"
 readme = "README.md"
 exclude = ["images/*",]
+parallel_compiler=true
 
 [dependencies]
 crossterm = "0.27.0"
@@ -26,7 +27,8 @@ walkdir = "2.5"
 serde_json = "1.0.149"
 unicode-width = "0.1"
 mlua = { version = "0.9", features = ["lua54", "vendored", "serialize"] }
-markdown-scanner = "1.3.0"
+markdown-scanner = "1.3.1"
+# markdown-scanner = { path = "../markdown-scanner" }
 tokio = { version = "1.0", features = ["full"] }
 arboard = { version = "3.4", features = ["wayland-data-control"] }
 url = "2.5"

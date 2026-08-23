@@ -27,7 +27,7 @@ use markdown_scanner::{
 fn main() -> Result<(), EditorError> {
     // Define unified CLI using clap with subcommands
     let matches = Command::new("midetor")
-        .version("1.3.0")
+        .version("1.3.1")
         .about("Markdown editor and scanner combined")
         // --- EDITOR ARGUMENTS (Default behavior) ---
         .arg(
@@ -125,6 +125,7 @@ fn main() -> Result<(), EditorError> {
                 } else {
                     // It's an image or another asset, register it in the folders/files tables
                     register_asset_file(file_path, base_dir, db_path)
+                        .await
                         .map_err(|e| EditorError::Scanner(e.to_string()))?;
                 }
             }
@@ -212,7 +213,7 @@ fn main() -> Result<(), EditorError> {
                     .await
                     .map(|_| ())
             } else {
-                register_asset_file(&full_file_path_str, &base_dir_str, &db_path_str)
+                register_asset_file(&full_file_path_str, &base_dir_str, &db_path_str).await
             }
         });
 

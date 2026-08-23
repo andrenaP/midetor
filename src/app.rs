@@ -1243,7 +1243,7 @@ impl App {
     }
 
     fn search_files(&mut self) -> Result<(), EditorError> {
-        let query = "SELECT file_name, id, json_extract(metadata, '$.created_at') as created_at FROM vw_files_with_paths WHERE file_name LIKE ? ORDER BY LENGTH(file_name) ASC, created_at DESC";
+        let query = "SELECT file_name, id, created_at FROM vw_files_with_paths WHERE file_name LIKE ? ORDER BY LENGTH(file_name) ASC, created_at DESC";
         let db_lock = self.db.borrow();
         let mut stmt = db_lock.prepare(query)?;
         let search_pattern = if self.search_state.query.is_empty() {
