@@ -43,3 +43,13 @@ codegen-units = 1
 lto = "fat"
 debug = false
 strip = "symbols"
+
+# Custom profile for the i686 musl build
+[profile.i686-release]
+inherits = "release"
+opt-level = "s"
+overflow-checks = false
+
+# Drop overflow checks for dependencies in the custom profile
+[profile.i686-release.package."*"]
+overflow-checks = false

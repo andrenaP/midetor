@@ -1,5 +1,6 @@
 # =============================================================================
 # Multi-arch static dav1d + Rust builder (Arch Linux)
+# Added: i686-unknown-linux-musl (32-bit x86 for CheerpX / v86)
 # =============================================================================
 FROM messense/rust-musl-cross:x86_64-musl AS base
 
@@ -12,6 +13,11 @@ RUN apt-get update && apt-get install -y \
 RUN curl -L https://musl.cc/aarch64-linux-musl-cross.tgz \
     | tar -xz -C /opt && \
     ln -s /opt/aarch64-linux-musl-cross/bin/* /usr/local/bin/
+
+# ---- i686 cross-toolchain (full tree) -----------------------------------
+RUN curl -L https://musl.cc/i686-linux-musl-cross.tgz \
+    | tar -xz -C /opt && \
+    ln -s /opt/i686-linux-musl-cross/bin/* /usr/local/bin/
 
 # ---- clone dav1d ---------------------------------------------------------
 RUN git clone --depth 1 https://code.videolan.org/videolan/dav1d.git /dav1d-src
@@ -80,10 +86,42 @@ RUN meson setup build-dir --cross-file=/cross.txt --prefix=$PREFIX \
     --default-library=static -Denable_tests=false -Denable_tools=false && \
     ninja -C build-dir && ninja -C build-dir install && rm -rf build-dir
 
+# --------------------------- i686 build -----------------------------------
+FROM base AS build-i686
+ARG TARGET=i686-unknown-linux-musl
+ARG CC=/opt/i686-linux-musl-cross/bin/i686-linux-musl-gcc
+ARG PREFIX=/usr/local/lib/$TARGET
+
+RUN printf "%s\n" \
+    "[host_machine]" \
+    "system = 'linux'" \
+    "cpu_family = 'x86'" \
+    "cpu = 'i686'" \
+    "endian = 'little'" \
+    "" \
+    "[binaries]" \
+    "c = 'CC_PLACEHOLDER'" \
+    "ar = 'AR_PLACEHOLDER'" \
+    "strip = 'STRIP_PLACEHOLDER'" \
+    "pkgconfig = 'pkg-config'" \
+    "" \
+    "[properties]" \
+    "needs_exe_wrapper = false" \
+    > /cross.txt && \
+    sed -i "s|CC_PLACEHOLDER|$CC|g;" /cross.txt && \
+    sed -i "s|AR_PLACEHOLDER|$(echo $CC | sed 's/gcc$/ar/')|g;" /cross.txt && \
+    sed -i "s|STRIP_PLACEHOLDER|$(echo $CC | sed 's/gcc$/strip/')|g;" /cross.txt
+
+WORKDIR /build
+COPY --from=base /dav1d-src .
+RUN meson setup build-dir --cross-file=/cross.txt --prefix=$PREFIX \
+    --default-library=static -Denable_tests=false -Denable_tools=false && \
+    ninja -C build-dir && ninja -C build-dir install && rm -rf build-dir
+
 # --------------------------- final builder (Arch) -------------------------
 FROM archlinux:latest AS rust-dav1d-builder
 
-# Overwrite default mirrorlist with reliable global mirrors to prevent rate-limiting/timeouts
+# Overwrite default mirrorlist
 RUN echo 'Server = https://cloudflaremirrors.com/archlinux/$repo/os/$arch' > /etc/pacman.d/mirrorlist && \
     echo 'Server = https://mirrors.kernel.org/archlinux/$repo/os/$arch' >> /etc/pacman.d/mirrorlist && \
     pacman -Syu --noconfirm && \
@@ -94,12 +132,14 @@ RUN curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable
 ENV PATH="/root/.cargo/bin:${PATH}"
 RUN rustup target add x86_64-unknown-linux-musl
 RUN rustup target add aarch64-unknown-linux-musl
+RUN rustup target add i686-unknown-linux-musl
 
 # dav1d libs
 COPY --from=build-x86_64  /usr/local/lib/x86_64-unknown-linux-musl   /x86_64-unknown-linux-musl
 COPY --from=build-aarch64 /usr/local/lib/aarch64-unknown-linux-musl  /aarch64-unknown-linux-musl
+COPY --from=build-i686    /usr/local/lib/i686-unknown-linux-musl     /i686-unknown-linux-musl
 
-# Fix dav1d.pc
+# Fix dav1d.pc for all architectures
 RUN sed -i \
     -e 's|^prefix=.*|prefix=/aarch64-unknown-linux-musl|' \
     -e 's|^libdir=.*|libdir=${prefix}/lib|' \
@@ -107,16 +147,22 @@ RUN sed -i \
     sed -i \
     -e 's|^prefix=.*|prefix=/x86_64-unknown-linux-musl|' \
     -e 's|^libdir=.*|libdir=${prefix}/lib|' \
-    /x86_64-unknown-linux-musl/lib/pkgconfig/dav1d.pc
+    /x86_64-unknown-linux-musl/lib/pkgconfig/dav1d.pc && \
+    sed -i \
+    -e 's|^prefix=.*|prefix=/i686-unknown-linux-musl|' \
+    -e 's|^libdir=.*|libdir=${prefix}/lib|' \
+    /i686-unknown-linux-musl/lib/pkgconfig/dav1d.pc
 
 # full toolchains
 COPY --from=base /usr/local/musl /usr/local/musl
 COPY --from=base /usr/local/bin/x86_64-unknown-linux-musl-* /usr/local/bin/
 COPY --from=base /opt/aarch64-linux-musl-cross /opt/aarch64-linux-musl-cross
+COPY --from=base /opt/i686-linux-musl-cross /opt/i686-linux-musl-cross
 
-# Fix x86_64 linker path
+# Fix linker paths
 RUN ln -sf /usr/local/musl/bin/x86_64-unknown-linux-musl-gcc /usr/local/bin/x86_64-unknown-linux-musl-gcc
 RUN ln -sf /opt/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc /usr/local/bin/aarch64-linux-musl-gcc
+RUN ln -sf /opt/i686-linux-musl-cross/bin/i686-linux-musl-gcc /usr/local/bin/i686-linux-musl-gcc
 
 # environment
 ENV \
@@ -138,6 +184,14 @@ ENV \
     PKG_CONFIG_SYSROOT_DIR_x86_64_unknown_linux_musl=/ \
     CARGO_ENCODED_RUSTFLAGS_x86_64_unknown_linux_musl="-L/usr/local/musl/lib -L/x86_64-unknown-linux-musl/lib" \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=/usr/local/bin/x86_64-unknown-linux-musl-gcc \
-    CC_x86_64_unknown_linux_musl=/usr/local/bin/x86_64-unknown-linux-musl-gcc
+    CC_x86_64_unknown_linux_musl=/usr/local/bin/x86_64-unknown-linux-musl-gcc \
+    \
+    # i686 (32-bit x86)
+    PKG_CONFIG_PATH_i686_unknown_linux_musl=/i686-unknown-linux-musl/lib/pkgconfig \
+    PKG_CONFIG_LIBDIR_i686_unknown_linux_musl=/i686-unknown-linux-musl/lib \
+    PKG_CONFIG_SYSROOT_DIR_i686_unknown_linux_musl=/ \
+    CARGO_ENCODED_RUSTFLAGS_i686_unknown_linux_musl="-L/opt/i686-linux-musl-cross/lib -L/i686-unknown-linux-musl/lib -C link-arg=--sysroot=/opt/i686-linux-musl-cross" \
+    CARGO_TARGET_I686_UNKNOWN_LINUX_MUSL_LINKER=/usr/local/bin/i686-linux-musl-gcc \
+    CC_i686_unknown_linux_musl=/usr/local/bin/i686-linux-musl-gcc
 
 WORKDIR /usr/src/app
