@@ -6,42 +6,87 @@ permissions:
 on:
   push:
     tags:
-      - "v[0-9]+.*" # Triggers on tags like v1.0.7
+      - "v[0-9]+.*"
+  workflow_dispatch:
 
 jobs:
   create-release:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout the repository
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
-      - name: Install Linux and Windows Cross Compilers
-        run: sudo apt-get install --yes --no-install-recommends musl-tools gcc-mingw-w64-x86-64-win32
+      - name: Build Docker Builder Image
+        run: docker build --target rust-dav1d-builder -t dav1d-musl-builder -f build-musl/Dockerfile .
 
-      - name: Install rustup targets
-        run: rustup target add x86_64-unknown-linux-musl x86_64-pc-windows-gnu
+      - name: Build Linux x86_64 (musl)
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/usr/src/app" \
+            -v cargo-cache:/root/.cargo \
+            -v rustup-cache:/root/.rustup \
+            -w /usr/src/app \
+            dav1d-musl-builder \
+            cargo build --release --target x86_64-unknown-linux-musl
 
-      - name: Build the executable
-        run: cargo build --release --target x86_64-unknown-linux-musl --target x86_64-pc-windows-gnu
+      - name: Build Linux aarch64 (musl)
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/usr/src/app" \
+            -v cargo-cache:/root/.cargo \
+            -v rustup-cache:/root/.rustup \
+            -w /usr/src/app \
+            dav1d-musl-builder \
+            cargo build --release --target aarch64-unknown-linux-musl
 
-      - name: Tar x86_64 binary
-        run: tar -czvf midetor-gnu-linux-x86_64.tar.gz -C target/x86_64-unknown-linux-musl/release midetor
+      - name: Build Linux i686 (musl for wasm)
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/usr/src/app" \
+            -v cargo-cache:/root/.cargo \
+            -v rustup-cache:/root/.rustup \
+            -w /usr/src/app \
+            dav1d-musl-builder \
+            sh -c "rustup target add i686-unknown-linux-musl && RUSTFLAGS='-C target-feature=+sse,+sse2,-sse3,-ssse3,-sse4.1,-sse4.2,-avx -C overflow-checks=false' cargo build --release --target i686-unknown-linux-musl"
 
-      - name: Zip windows binary
+      - name: Fix ownership of Docker-generated files
+        run: sudo chown -R $USER:$USER target/
+
+      - name: Install Windows Cross Compilers
+        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends gcc-mingw-w64-x86-64-win32
+
+      - name: Build Windows x86_64
+        run: |
+          rustup target add x86_64-pc-windows-gnu
+          cargo build --release --target x86_64-pc-windows-gnu
+
+      - name: Package Linux binaries (tar.gz)
+        run: |
+          tar -czvf midetor-gnu-linux-x86_64.tar.gz -C target/x86_64-unknown-linux-musl/release midetor
+          tar -czvf midetor-gnu-linux-aarch64.tar.gz -C target/aarch64-unknown-linux-musl/release midetor
+          tar -czvf midetor-gnu-linux-i686.tar.gz -C target/i686-unknown-linux-musl/release midetor
+
+      - name: Package Windows binary (zip)
         run: zip -j midetor-windows.zip target/x86_64-pc-windows-gnu/release/midetor.exe
 
       - name: Generate SHA256 checksums
         run: |
           shasum -a 256 midetor-gnu-linux-x86_64.tar.gz > midetor-gnu-linux-x86_64.tar.gz.sha256
+          shasum -a 256 midetor-gnu-linux-aarch64.tar.gz > midetor-gnu-linux-aarch64.tar.gz.sha256
+          shasum -a 256 midetor-gnu-linux-i686.tar.gz > midetor-gnu-linux-i686.tar.gz.sha256
           shasum -a 256 midetor-windows.zip > midetor-windows.zip.sha256
 
       - name: Upload release binaries
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           files: |
             midetor-gnu-linux-x86_64.tar.gz
-            midetor-windows.zip
             midetor-gnu-linux-x86_64.tar.gz.sha256
+            midetor-gnu-linux-aarch64.tar.gz
+            midetor-gnu-linux-aarch64.tar.gz.sha256
+            midetor-gnu-linux-i686.tar.gz
+            midetor-gnu-linux-i686.tar.gz.sha256
+            midetor-windows.zip
             midetor-windows.zip.sha256
