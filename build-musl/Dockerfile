@@ -92,8 +92,8 @@ RUN cp -r /dav1d-src . && meson setup build-dir --cross-file=/cross.txt --prefix
 # --------------------------- final builder (Arch) -------------------------
 FROM archlinux:latest AS rust-dav1d-builder
 
-# Sync keyring safely before installing packages
-RUN echo 'Server = https://cloudflaremirrors.com/archlinux/$repo/os/$arch' > /etc/pacman.d/mirrorlist && \
+# Sync keyring safely before installing packages (using official non-blocking mirrors)
+RUN echo 'Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch' > /etc/pacman.d/mirrorlist && \
     echo 'Server = https://mirrors.kernel.org/archlinux/$repo/os/$arch' >> /etc/pacman.d/mirrorlist && \
     pacman -Sy --noconfirm archlinux-keyring && \
     pacman -Su --noconfirm && \
