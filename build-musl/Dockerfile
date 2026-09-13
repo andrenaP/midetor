@@ -11,7 +11,7 @@ FROM messense/rust-musl-cross:x86_64-musl AS base
 
 # ---- build tools ---------------------------------------------------------
 RUN apt-get update && apt-get install -y \
-    nasm meson ninja-build git pkg-config curl \
+    nasm meson ninja-build git pkg-config curl musl \
     && rm -rf /var/lib/apt/lists/*
 
 # ---- aarch64 cross-toolchain (Copied securely from Docker Hub) -----------
