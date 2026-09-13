@@ -10,12 +10,12 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # ---- aarch64 cross-toolchain (full tree) --------------------------------
-RUN curl -L https://musl.cc/aarch64-linux-musl-cross.tgz \
+RUN curl --retry 5 --retry-all-errors --retry-delay 3 -L https://musl.cc/aarch64-linux-musl-cross.tgz \
     | tar -xz -C /opt && \
     ln -s /opt/aarch64-linux-musl-cross/bin/* /usr/local/bin/
 
 # ---- i686 cross-toolchain (full tree) -----------------------------------
-RUN curl -L https://musl.cc/i686-linux-musl-cross.tgz \
+RUN curl --retry 5 --retry-all-errors --retry-delay 3 -L https://musl.cc/i686-linux-musl-cross.tgz \
     | tar -xz -C /opt && \
     ln -s /opt/i686-linux-musl-cross/bin/* /usr/local/bin/
 
