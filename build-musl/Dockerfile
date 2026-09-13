@@ -5,12 +5,9 @@
 
 # --------------------------- x86_64 build ---------------------------------
 FROM messense/rust-musl-cross:x86_64-musl AS build-x86_64
+ENV PATH="/usr/local/musl/bin:${PATH}"
 RUN apt-get update && apt-get install -y nasm meson ninja-build git pkg-config && rm -rf /var/lib/apt/lists/*
 
-# Dynamically locate and export the toolchain for the final Arch stage
-RUN cp -a $(dirname $(dirname $(which x86_64-linux-musl-gcc))) /toolchain
-
-# Build dav1d
 RUN git clone --depth 1 https://code.videolan.org/videolan/dav1d.git /dav1d-src
 WORKDIR /build
 RUN printf "%s\n" \
@@ -35,9 +32,8 @@ RUN cp -r /dav1d-src . && meson setup build-dir --cross-file=/cross.txt --prefix
 
 # --------------------------- aarch64 build --------------------------------
 FROM messense/rust-musl-cross:aarch64-musl AS build-aarch64
+ENV PATH="/usr/local/musl/bin:${PATH}"
 RUN apt-get update && apt-get install -y nasm meson ninja-build git pkg-config && rm -rf /var/lib/apt/lists/*
-
-RUN cp -a $(dirname $(dirname $(which aarch64-linux-musl-gcc))) /toolchain
 
 RUN git clone --depth 1 https://code.videolan.org/videolan/dav1d.git /dav1d-src
 WORKDIR /build
@@ -63,9 +59,8 @@ RUN cp -r /dav1d-src . && meson setup build-dir --cross-file=/cross.txt --prefix
 
 # --------------------------- i686 build -----------------------------------
 FROM messense/rust-musl-cross:i686-musl AS build-i686
+ENV PATH="/usr/local/musl/bin:${PATH}"
 RUN apt-get update && apt-get install -y nasm meson ninja-build git pkg-config && rm -rf /var/lib/apt/lists/*
-
-RUN cp -a $(dirname $(dirname $(which i686-linux-musl-gcc))) /toolchain
 
 RUN git clone --depth 1 https://code.videolan.org/videolan/dav1d.git /dav1d-src
 WORKDIR /build
@@ -114,10 +109,10 @@ RUN sed -i -e 's|^prefix=.*|prefix=/aarch64-unknown-linux-musl|' -e 's|^libdir=.
     sed -i -e 's|^prefix=.*|prefix=/x86_64-unknown-linux-musl|' -e 's|^libdir=.*|libdir=${prefix}/lib|' /x86_64-unknown-linux-musl/lib/pkgconfig/dav1d.pc && \
     sed -i -e 's|^prefix=.*|prefix=/i686-unknown-linux-musl|' -e 's|^libdir=.*|libdir=${prefix}/lib|' /i686-unknown-linux-musl/lib/pkgconfig/dav1d.pc
 
-# Safely copy the exact extracted toolchains from the build stages
-COPY --from=build-x86_64  /toolchain /opt/x86_64-linux-musl-cross
-COPY --from=build-aarch64 /toolchain /opt/aarch64-linux-musl-cross
-COPY --from=build-i686    /toolchain /opt/i686-linux-musl-cross
+# Extract the toolchains straight out of /usr/local/musl from each build stage
+COPY --from=build-x86_64  /usr/local/musl /opt/x86_64-linux-musl-cross
+COPY --from=build-aarch64 /usr/local/musl /opt/aarch64-linux-musl-cross
+COPY --from=build-i686    /usr/local/musl /opt/i686-linux-musl-cross
 
 # Map toolchain binaries to PATH safely
 RUN ln -sf /opt/x86_64-linux-musl-cross/bin/x86_64-linux-musl-* /usr/local/bin/ && \
