@@ -7,12 +7,8 @@
 FROM messense/rust-musl-cross:x86_64-musl AS build-x86_64
 RUN apt-get update && apt-get install -y nasm meson ninja-build git pkg-config && rm -rf /var/lib/apt/lists/*
 
-# Bulletproof way to find the toolchain directory and copy it to /toolchain
-RUN GCC_PATH=$(find /usr/local -name "x86_64-linux-musl-gcc" | head -n 1) && \
-    cp -a $(dirname $(dirname $GCC_PATH)) /toolchain
-
 ARG TARGET=x86_64-unknown-linux-musl
-ARG CC=/toolchain/bin/x86_64-linux-musl-gcc
+ARG CC=/usr/local/musl/bin/x86_64-unknown-linux-musl-gcc
 ARG PREFIX=/usr/local/lib/$TARGET
 
 RUN printf "%s\n" \
@@ -45,12 +41,8 @@ RUN cp -a /dav1d-src/. . && meson setup build-dir --cross-file=/cross.txt --pref
 FROM messense/rust-musl-cross:aarch64-musl AS build-aarch64
 RUN apt-get update && apt-get install -y nasm meson ninja-build git pkg-config && rm -rf /var/lib/apt/lists/*
 
-# Bulletproof way to find the toolchain directory and copy it to /toolchain
-RUN GCC_PATH=$(find /usr/local -name "aarch64-linux-musl-gcc" | head -n 1) && \
-    cp -a $(dirname $(dirname $GCC_PATH)) /toolchain
-
 ARG TARGET=aarch64-unknown-linux-musl
-ARG CC=/toolchain/bin/aarch64-linux-musl-gcc
+ARG CC=/usr/local/musl/bin/aarch64-unknown-linux-musl-gcc
 ARG PREFIX=/usr/local/lib/$TARGET
 
 RUN printf "%s\n" \
@@ -83,12 +75,8 @@ RUN cp -a /dav1d-src/. . && meson setup build-dir --cross-file=/cross.txt --pref
 FROM messense/rust-musl-cross:i686-musl AS build-i686
 RUN apt-get update && apt-get install -y nasm meson ninja-build git pkg-config && rm -rf /var/lib/apt/lists/*
 
-# Bulletproof way to find the toolchain directory and copy it to /toolchain
-RUN GCC_PATH=$(find /usr/local -name "i686-linux-musl-gcc" | head -n 1) && \
-    cp -a $(dirname $(dirname $GCC_PATH)) /toolchain
-
 ARG TARGET=i686-unknown-linux-musl
-ARG CC=/toolchain/bin/i686-linux-musl-gcc
+ARG CC=/usr/local/musl/bin/i686-unknown-linux-musl-gcc
 ARG PREFIX=/usr/local/lib/$TARGET
 
 RUN printf "%s\n" \
@@ -120,7 +108,7 @@ RUN cp -a /dav1d-src/. . && meson setup build-dir --cross-file=/cross.txt --pref
 # --------------------------- final builder (Arch) -------------------------
 FROM archlinux:latest AS rust-dav1d-builder
 
-# Sync keyring safely before installing packages (using official non-blocking mirrors)
+# Sync keyring safely before installing packages
 RUN echo 'Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch' > /etc/pacman.d/mirrorlist && \
     echo 'Server = https://mirrors.kernel.org/archlinux/$repo/os/$arch' >> /etc/pacman.d/mirrorlist && \
     pacman -Sy --noconfirm archlinux-keyring && \
@@ -142,15 +130,15 @@ RUN sed -i -e 's|^prefix=.*|prefix=/aarch64-unknown-linux-musl|' -e 's|^libdir=.
     sed -i -e 's|^prefix=.*|prefix=/x86_64-unknown-linux-musl|' -e 's|^libdir=.*|libdir=${prefix}/lib|' /x86_64-unknown-linux-musl/lib/pkgconfig/dav1d.pc && \
     sed -i -e 's|^prefix=.*|prefix=/i686-unknown-linux-musl|' -e 's|^libdir=.*|libdir=${prefix}/lib|' /i686-unknown-linux-musl/lib/pkgconfig/dav1d.pc
 
-# Copy safely extracted toolchains from the uniform /toolchain directory
-COPY --from=build-x86_64  /toolchain /opt/x86_64-linux-musl-cross
-COPY --from=build-aarch64 /toolchain /opt/aarch64-linux-musl-cross
-COPY --from=build-i686    /toolchain /opt/i686-linux-musl-cross
+# Copy safely extracted toolchains to separate folders
+COPY --from=build-x86_64  /usr/local/musl /opt/x86_64-linux-musl-cross
+COPY --from=build-aarch64 /usr/local/musl /opt/aarch64-linux-musl-cross
+COPY --from=build-i686    /usr/local/musl /opt/i686-linux-musl-cross
 
 # Map toolchain binaries to PATH safely
-RUN ln -sf /opt/x86_64-linux-musl-cross/bin/x86_64-linux-musl-* /usr/local/bin/ && \
-    ln -sf /opt/aarch64-linux-musl-cross/bin/aarch64-linux-musl-* /usr/local/bin/ && \
-    ln -sf /opt/i686-linux-musl-cross/bin/i686-linux-musl-* /usr/local/bin/
+RUN ln -sf /opt/x86_64-linux-musl-cross/bin/x86_64-unknown-linux-musl-* /usr/local/bin/ && \
+    ln -sf /opt/aarch64-linux-musl-cross/bin/aarch64-unknown-linux-musl-* /usr/local/bin/ && \
+    ln -sf /opt/i686-linux-musl-cross/bin/i686-unknown-linux-musl-* /usr/local/bin/
 
 # environment
 ENV PKG_CONFIG=/usr/bin/pkg-config \
@@ -162,23 +150,23 @@ ENV PKG_CONFIG=/usr/bin/pkg-config \
     PKG_CONFIG_LIBDIR_aarch64_unknown_linux_musl=/aarch64-unknown-linux-musl/lib \
     PKG_CONFIG_SYSROOT_DIR_aarch64_unknown_linux_musl=/ \
     CARGO_ENCODED_RUSTFLAGS_aarch64_unknown_linux_musl="-L/opt/aarch64-linux-musl-cross/lib -L/aarch64-unknown-linux-musl/lib -C link-arg=--sysroot=/opt/aarch64-linux-musl-cross" \
-    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=/usr/local/bin/aarch64-linux-musl-gcc \
-    CC_aarch64_unknown_linux_musl=/usr/local/bin/aarch64-linux-musl-gcc \
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=/usr/local/bin/aarch64-unknown-linux-musl-gcc \
+    CC_aarch64_unknown_linux_musl=/usr/local/bin/aarch64-unknown-linux-musl-gcc \
     \
     # x86_64
     PKG_CONFIG_PATH_x86_64_unknown_linux_musl=/x86_64-unknown-linux-musl/lib/pkgconfig \
     PKG_CONFIG_LIBDIR_x86_64_unknown_linux_musl=/x86_64-unknown-linux-musl/lib \
     PKG_CONFIG_SYSROOT_DIR_x86_64_unknown_linux_musl=/ \
     CARGO_ENCODED_RUSTFLAGS_x86_64_unknown_linux_musl="-L/opt/x86_64-linux-musl-cross/lib -L/x86_64-unknown-linux-musl/lib -C link-arg=--sysroot=/opt/x86_64-linux-musl-cross" \
-    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=/usr/local/bin/x86_64-linux-musl-gcc \
-    CC_x86_64_unknown_linux_musl=/usr/local/bin/x86_64-linux-musl-gcc \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=/usr/local/bin/x86_64-unknown-linux-musl-gcc \
+    CC_x86_64_unknown_linux_musl=/usr/local/bin/x86_64-unknown-linux-musl-gcc \
     \
     # i686
     PKG_CONFIG_PATH_i686_unknown_linux_musl=/i686-unknown-linux-musl/lib/pkgconfig \
     PKG_CONFIG_LIBDIR_i686_unknown_linux_musl=/i686-unknown-linux-musl/lib \
     PKG_CONFIG_SYSROOT_DIR_i686_unknown_linux_musl=/ \
     CARGO_ENCODED_RUSTFLAGS_i686_unknown_linux_musl="-L/opt/i686-linux-musl-cross/lib -L/i686-unknown-linux-musl/lib -C link-arg=--sysroot=/opt/i686-linux-musl-cross" \
-    CARGO_TARGET_I686_UNKNOWN_LINUX_MUSL_LINKER=/usr/local/bin/i686-linux-musl-gcc \
-    CC_i686_unknown_linux_musl=/usr/local/bin/i686-linux-musl-gcc
+    CARGO_TARGET_I686_UNKNOWN_LINUX_MUSL_LINKER=/usr/local/bin/i686-unknown-linux-musl-gcc \
+    CC_i686_unknown_linux_musl=/usr/local/bin/i686-unknown-linux-musl-gcc
 
 WORKDIR /usr/src/app
