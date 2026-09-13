@@ -16,11 +16,11 @@ RUN apt-get update && apt-get install -y \
 
 # ---- aarch64 cross-toolchain (Copied securely from Docker Hub) -----------
 COPY --from=aarch64-tools /usr/local/musl /opt/aarch64-linux-musl-cross
-RUN ln -s /opt/aarch64-linux-musl-cross/bin/* /usr/local/bin/
+RUN ln -sf /opt/aarch64-linux-musl-cross/bin/* /usr/local/bin/
 
 # ---- i686 cross-toolchain (Copied securely from Docker Hub) --------------
 COPY --from=i686-tools /usr/local/musl /opt/i686-linux-musl-cross
-RUN ln -s /opt/i686-linux-musl-cross/bin/* /usr/local/bin/
+RUN ln -sf /opt/i686-linux-musl-cross/bin/* /usr/local/bin/
 
 # ---- clone dav1d ---------------------------------------------------------
 RUN git clone --depth 1 https://code.videolan.org/videolan/dav1d.git /dav1d-src
