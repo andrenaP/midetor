@@ -26,7 +26,7 @@ RUN printf "%s\n" \
     "[properties]" \
     "needs_exe_wrapper = false" > /cross.txt
 
-RUN cp -r /dav1d-src . && meson setup build-dir --cross-file=/cross.txt --prefix=/usr/local/lib/x86_64-unknown-linux-musl \
+RUN cp -a /dav1d-src/. . && meson setup build-dir --cross-file=/cross.txt --prefix=/usr/local/lib/x86_64-unknown-linux-musl \
     --default-library=static -Denable_tests=false -Denable_tools=false && \
     ninja -C build-dir && ninja -C build-dir install
 
