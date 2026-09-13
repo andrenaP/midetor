@@ -2,6 +2,11 @@
 # Multi-arch static dav1d + Rust builder (Arch Linux)
 # Added: i686-unknown-linux-musl (32-bit x86 for CheerpX / v86)
 # =============================================================================
+# 1. Pull toolchains from Docker Hub to bypass musl.cc network timeouts
+FROM messense/rust-musl-cross:aarch64-musl AS aarch64-tools
+FROM messense/rust-musl-cross:i686-musl AS i686-tools
+
+# 2. Main base image
 FROM messense/rust-musl-cross:x86_64-musl AS base
 
 # ---- build tools ---------------------------------------------------------
@@ -9,15 +14,13 @@ RUN apt-get update && apt-get install -y \
     nasm meson ninja-build git pkg-config curl \
     && rm -rf /var/lib/apt/lists/*
 
-# ---- aarch64 cross-toolchain (full tree) --------------------------------
-RUN curl --retry 5 --retry-all-errors --retry-delay 3 -L https://musl.cc/aarch64-linux-musl-cross.tgz \
-    | tar -xz -C /opt && \
-    ln -s /opt/aarch64-linux-musl-cross/bin/* /usr/local/bin/
+# ---- aarch64 cross-toolchain (Copied securely from Docker Hub) -----------
+COPY --from=aarch64-tools /usr/local/musl /opt/aarch64-linux-musl-cross
+RUN ln -s /opt/aarch64-linux-musl-cross/bin/* /usr/local/bin/
 
-# ---- i686 cross-toolchain (full tree) -----------------------------------
-RUN curl --retry 5 --retry-all-errors --retry-delay 3 -L https://musl.cc/i686-linux-musl-cross.tgz \
-    | tar -xz -C /opt && \
-    ln -s /opt/i686-linux-musl-cross/bin/* /usr/local/bin/
+# ---- i686 cross-toolchain (Copied securely from Docker Hub) --------------
+COPY --from=i686-tools /usr/local/musl /opt/i686-linux-musl-cross
+RUN ln -s /opt/i686-linux-musl-cross/bin/* /usr/local/bin/
 
 # ---- clone dav1d ---------------------------------------------------------
 RUN git clone --depth 1 https://code.videolan.org/videolan/dav1d.git /dav1d-src
