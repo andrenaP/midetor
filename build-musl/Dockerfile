@@ -127,7 +127,8 @@ FROM archlinux:latest AS rust-dav1d-builder
 # Overwrite default mirrorlist
 RUN echo 'Server = https://cloudflaremirrors.com/archlinux/$repo/os/$arch' > /etc/pacman.d/mirrorlist && \
     echo 'Server = https://mirrors.kernel.org/archlinux/$repo/os/$arch' >> /etc/pacman.d/mirrorlist && \
-    pacman -Syu --noconfirm && \
+    pacman -Sy --noconfirm archlinux-keyring && \
+    pacman -Su --noconfirm && \
     pacman -S --noconfirm base-devel pkgconf openssl git curl musl
 
 # rustup + musl targets
