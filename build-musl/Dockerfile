@@ -7,8 +7,11 @@
 FROM messense/rust-musl-cross:x86_64-musl AS build-x86_64
 RUN apt-get update && apt-get install -y nasm meson ninja-build git pkg-config && rm -rf /var/lib/apt/lists/*
 
+# Dynamically find the compiler path and copy its entire folder safely
+RUN cp -a $(dirname $(dirname $(command -v x86_64-linux-musl-gcc))) /toolchain
+
 ARG TARGET=x86_64-unknown-linux-musl
-ARG CC=/usr/local/musl/bin/x86_64-unknown-linux-musl-gcc
+ARG CC=x86_64-linux-musl-gcc
 ARG PREFIX=/usr/local/lib/$TARGET
 
 RUN printf "%s\n" \
@@ -41,8 +44,10 @@ RUN cp -a /dav1d-src/. . && meson setup build-dir --cross-file=/cross.txt --pref
 FROM messense/rust-musl-cross:aarch64-musl AS build-aarch64
 RUN apt-get update && apt-get install -y nasm meson ninja-build git pkg-config && rm -rf /var/lib/apt/lists/*
 
+RUN cp -a $(dirname $(dirname $(command -v aarch64-linux-musl-gcc))) /toolchain
+
 ARG TARGET=aarch64-unknown-linux-musl
-ARG CC=/usr/local/musl/bin/aarch64-linux-musl-gcc
+ARG CC=aarch64-linux-musl-gcc
 ARG PREFIX=/usr/local/lib/$TARGET
 
 RUN printf "%s\n" \
@@ -75,8 +80,10 @@ RUN cp -a /dav1d-src/. . && meson setup build-dir --cross-file=/cross.txt --pref
 FROM messense/rust-musl-cross:i686-musl AS build-i686
 RUN apt-get update && apt-get install -y nasm meson ninja-build git pkg-config && rm -rf /var/lib/apt/lists/*
 
+RUN cp -a $(dirname $(dirname $(command -v i686-linux-musl-gcc))) /toolchain
+
 ARG TARGET=i686-unknown-linux-musl
-ARG CC=/usr/local/musl/bin/i686-linux-musl-gcc
+ARG CC=i686-linux-musl-gcc
 ARG PREFIX=/usr/local/lib/$TARGET
 
 RUN printf "%s\n" \
@@ -130,13 +137,13 @@ RUN sed -i -e 's|^prefix=.*|prefix=/aarch64-unknown-linux-musl|' -e 's|^libdir=.
     sed -i -e 's|^prefix=.*|prefix=/x86_64-unknown-linux-musl|' -e 's|^libdir=.*|libdir=${prefix}/lib|' /x86_64-unknown-linux-musl/lib/pkgconfig/dav1d.pc && \
     sed -i -e 's|^prefix=.*|prefix=/i686-unknown-linux-musl|' -e 's|^libdir=.*|libdir=${prefix}/lib|' /i686-unknown-linux-musl/lib/pkgconfig/dav1d.pc
 
-# Extract the toolchains straight out of /usr/local/musl from each build stage
-COPY --from=build-x86_64  /usr/local/musl /usr/local/musl
-COPY --from=build-aarch64 /usr/local/musl /opt/aarch64-linux-musl-cross
-COPY --from=build-i686    /usr/local/musl /opt/i686-linux-musl-cross
+# Copy safely extracted toolchains
+COPY --from=build-x86_64  /toolchain /opt/x86_64-linux-musl-cross
+COPY --from=build-aarch64 /toolchain /opt/aarch64-linux-musl-cross
+COPY --from=build-i686    /toolchain /opt/i686-linux-musl-cross
 
 # Map toolchain binaries to PATH safely
-RUN ln -sf /usr/local/musl/bin/x86_64-unknown-linux-musl-* /usr/local/bin/ && \
+RUN ln -sf /opt/x86_64-linux-musl-cross/bin/x86_64-linux-musl-* /usr/local/bin/ && \
     ln -sf /opt/aarch64-linux-musl-cross/bin/aarch64-linux-musl-* /usr/local/bin/ && \
     ln -sf /opt/i686-linux-musl-cross/bin/i686-linux-musl-* /usr/local/bin/
 
@@ -157,9 +164,9 @@ ENV PKG_CONFIG=/usr/bin/pkg-config \
     PKG_CONFIG_PATH_x86_64_unknown_linux_musl=/x86_64-unknown-linux-musl/lib/pkgconfig \
     PKG_CONFIG_LIBDIR_x86_64_unknown_linux_musl=/x86_64-unknown-linux-musl/lib \
     PKG_CONFIG_SYSROOT_DIR_x86_64_unknown_linux_musl=/ \
-    CARGO_ENCODED_RUSTFLAGS_x86_64_unknown_linux_musl="-L/usr/local/musl/lib -L/x86_64-unknown-linux-musl/lib -C link-arg=--sysroot=/usr/local/musl" \
-    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=/usr/local/bin/x86_64-unknown-linux-musl-gcc \
-    CC_x86_64_unknown_linux_musl=/usr/local/bin/x86_64-unknown-linux-musl-gcc \
+    CARGO_ENCODED_RUSTFLAGS_x86_64_unknown_linux_musl="-L/opt/x86_64-linux-musl-cross/lib -L/x86_64-unknown-linux-musl/lib -C link-arg=--sysroot=/opt/x86_64-linux-musl-cross" \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=/usr/local/bin/x86_64-linux-musl-gcc \
+    CC_x86_64_unknown_linux_musl=/usr/local/bin/x86_64-linux-musl-gcc \
     \
     # i686
     PKG_CONFIG_PATH_i686_unknown_linux_musl=/i686-unknown-linux-musl/lib/pkgconfig \
