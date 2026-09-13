@@ -2,25 +2,24 @@
 # Multi-arch static dav1d + Rust builder (Arch Linux)
 # Added: i686-unknown-linux-musl (32-bit x86 for CheerpX / v86)
 # =============================================================================
-# 1. Pull toolchains from Docker Hub to bypass musl.cc network timeouts
-FROM messense/rust-musl-cross:aarch64-musl AS aarch64-tools
-FROM messense/rust-musl-cross:i686-musl AS i686-tools
-
-# 2. Main base image
 FROM messense/rust-musl-cross:x86_64-musl AS base
 
 # ---- build tools ---------------------------------------------------------
 RUN apt-get update && apt-get install -y \
-    nasm meson ninja-build git pkg-config curl musl \
+    nasm meson ninja-build git pkg-config curl \
     && rm -rf /var/lib/apt/lists/*
 
-# ---- aarch64 cross-toolchain (Copied securely from Docker Hub) -----------
-COPY --from=aarch64-tools /usr/local/musl /opt/aarch64-linux-musl-cross
-RUN ln -sf /opt/aarch64-linux-musl-cross/bin/* /usr/local/bin/
+# ---- aarch64 cross-toolchain (with reliable mirror fallback) -------------
+RUN { curl -fSL --connect-timeout 15 --retry 3 https://musl.cc/aarch64-linux-musl-cross.tgz || \
+      curl -fSL --connect-timeout 15 --retry 3 https://more.musl.cc/aarch64-linux-musl-cross.tgz; } \
+    | tar -xz -C /opt && \
+    ln -sf /opt/aarch64-linux-musl-cross/bin/* /usr/local/bin/
 
-# ---- i686 cross-toolchain (Copied securely from Docker Hub) --------------
-COPY --from=i686-tools /usr/local/musl /opt/i686-linux-musl-cross
-RUN ln -sf /opt/i686-linux-musl-cross/bin/* /usr/local/bin/
+# ---- i686 cross-toolchain (with reliable mirror fallback) ----------------
+RUN { curl -fSL --connect-timeout 15 --retry 3 https://musl.cc/i686-linux-musl-cross.tgz || \
+      curl -fSL --connect-timeout 15 --retry 3 https://more.musl.cc/i686-linux-musl-cross.tgz; } \
+    | tar -xz -C /opt && \
+    ln -sf /opt/i686-linux-musl-cross/bin/* /usr/local/bin/
 
 # ---- clone dav1d ---------------------------------------------------------
 RUN git clone --depth 1 https://code.videolan.org/videolan/dav1d.git /dav1d-src
@@ -124,7 +123,7 @@ RUN meson setup build-dir --cross-file=/cross.txt --prefix=$PREFIX \
 # --------------------------- final builder (Arch) -------------------------
 FROM archlinux:latest AS rust-dav1d-builder
 
-# Overwrite default mirrorlist
+# Overwrite default mirrorlist and safely sync keyring before installing packages
 RUN echo 'Server = https://cloudflaremirrors.com/archlinux/$repo/os/$arch' > /etc/pacman.d/mirrorlist && \
     echo 'Server = https://mirrors.kernel.org/archlinux/$repo/os/$arch' >> /etc/pacman.d/mirrorlist && \
     pacman -Sy --noconfirm archlinux-keyring && \
@@ -163,7 +162,7 @@ COPY --from=base /usr/local/bin/x86_64-unknown-linux-musl-* /usr/local/bin/
 COPY --from=base /opt/aarch64-linux-musl-cross /opt/aarch64-linux-musl-cross
 COPY --from=base /opt/i686-linux-musl-cross /opt/i686-linux-musl-cross
 
-# Fix linker paths
+# Fix linker paths (using symbolic force)
 RUN ln -sf /usr/local/musl/bin/x86_64-unknown-linux-musl-gcc /usr/local/bin/x86_64-unknown-linux-musl-gcc
 RUN ln -sf /opt/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc /usr/local/bin/aarch64-linux-musl-gcc
 RUN ln -sf /opt/i686-linux-musl-cross/bin/i686-linux-musl-gcc /usr/local/bin/i686-linux-musl-gcc
