@@ -7,11 +7,12 @@
 FROM messense/rust-musl-cross:x86_64-musl AS build-x86_64
 RUN apt-get update && apt-get install -y nasm meson ninja-build git pkg-config && rm -rf /var/lib/apt/lists/*
 
-# Dynamically find the compiler path and copy its entire folder safely
-RUN cp -a $(dirname $(dirname $(command -v x86_64-linux-musl-gcc))) /toolchain
+# Bulletproof way to find the toolchain directory and copy it to /toolchain
+RUN GCC_PATH=$(find /usr/local -name "x86_64-linux-musl-gcc" | head -n 1) && \
+    cp -a $(dirname $(dirname $GCC_PATH)) /toolchain
 
 ARG TARGET=x86_64-unknown-linux-musl
-ARG CC=x86_64-linux-musl-gcc
+ARG CC=/toolchain/bin/x86_64-linux-musl-gcc
 ARG PREFIX=/usr/local/lib/$TARGET
 
 RUN printf "%s\n" \
@@ -44,10 +45,12 @@ RUN cp -a /dav1d-src/. . && meson setup build-dir --cross-file=/cross.txt --pref
 FROM messense/rust-musl-cross:aarch64-musl AS build-aarch64
 RUN apt-get update && apt-get install -y nasm meson ninja-build git pkg-config && rm -rf /var/lib/apt/lists/*
 
-RUN cp -a $(dirname $(dirname $(command -v aarch64-linux-musl-gcc))) /toolchain
+# Bulletproof way to find the toolchain directory and copy it to /toolchain
+RUN GCC_PATH=$(find /usr/local -name "aarch64-linux-musl-gcc" | head -n 1) && \
+    cp -a $(dirname $(dirname $GCC_PATH)) /toolchain
 
 ARG TARGET=aarch64-unknown-linux-musl
-ARG CC=aarch64-linux-musl-gcc
+ARG CC=/toolchain/bin/aarch64-linux-musl-gcc
 ARG PREFIX=/usr/local/lib/$TARGET
 
 RUN printf "%s\n" \
@@ -80,10 +83,12 @@ RUN cp -a /dav1d-src/. . && meson setup build-dir --cross-file=/cross.txt --pref
 FROM messense/rust-musl-cross:i686-musl AS build-i686
 RUN apt-get update && apt-get install -y nasm meson ninja-build git pkg-config && rm -rf /var/lib/apt/lists/*
 
-RUN cp -a $(dirname $(dirname $(command -v i686-linux-musl-gcc))) /toolchain
+# Bulletproof way to find the toolchain directory and copy it to /toolchain
+RUN GCC_PATH=$(find /usr/local -name "i686-linux-musl-gcc" | head -n 1) && \
+    cp -a $(dirname $(dirname $GCC_PATH)) /toolchain
 
 ARG TARGET=i686-unknown-linux-musl
-ARG CC=i686-linux-musl-gcc
+ARG CC=/toolchain/bin/i686-linux-musl-gcc
 ARG PREFIX=/usr/local/lib/$TARGET
 
 RUN printf "%s\n" \
@@ -137,7 +142,7 @@ RUN sed -i -e 's|^prefix=.*|prefix=/aarch64-unknown-linux-musl|' -e 's|^libdir=.
     sed -i -e 's|^prefix=.*|prefix=/x86_64-unknown-linux-musl|' -e 's|^libdir=.*|libdir=${prefix}/lib|' /x86_64-unknown-linux-musl/lib/pkgconfig/dav1d.pc && \
     sed -i -e 's|^prefix=.*|prefix=/i686-unknown-linux-musl|' -e 's|^libdir=.*|libdir=${prefix}/lib|' /i686-unknown-linux-musl/lib/pkgconfig/dav1d.pc
 
-# Copy safely extracted toolchains
+# Copy safely extracted toolchains from the uniform /toolchain directory
 COPY --from=build-x86_64  /toolchain /opt/x86_64-linux-musl-cross
 COPY --from=build-aarch64 /toolchain /opt/aarch64-linux-musl-cross
 COPY --from=build-i686    /toolchain /opt/i686-linux-musl-cross
